@@ -1,0 +1,583 @@
+# =============================================================================
+# nav2_params.yaml — Nav2 configuration for OMNI robot
+# =============================================================================
+#
+# OMNI physical dimensions:
+#   Body: 600mm wide × 400mm deep × 880mm tall
+#   Footprint (half-widths): ±0.30m left/right, ±0.20m front/back
+#   Inflation radius: 0.55m (footprint diagonal 0.36m + 0.19m safety buffer)
+#   Max linear speed: 0.3 m/s  (top-heavy — keep it slow)
+#   Max angular speed: 0.8 rad/s
+#   Environment: indoor home — hallways, furniture, doorways
+#
+# TF tree:
+#   map → odom (published by slam_toolbox via slam_node)
+#   odom → base_link (published by motor_control_node)
+#   base_link → lidar_link (static transform in slam_launch.py, z=0.38m)
+#
+# cmd_vel remapping:
+#   controller_server normally publishes to /cmd_vel.
+#   The launch file remaps it to /cmd_vel_raw so safety_node can gate it.
+#   DO NOT change topic names here — the remapping is in nav_launch.py.
+#
+# =============================================================================
+
+
+# =============================================================================
+# BT Navigator — the top-level coordinator
+# =============================================================================
+# bt_navigator receives goal poses (from /goal_pose or the NavigateToPose
+# action server) and runs a behavior tree that calls planner_server and
+# controller_server to execute the navigation. It does NOT directly publish
+# velocity — it delegates that to controller_server.
+bt_navigator:
+  ros__parameters:
+    # global_frame: the fixed world frame — must match slam_toolbox's map frame
+    global_frame: map
+
+    # robot_base_frame: the moving robot frame — must match motor_control_node
+    robot_base_frame: base_link
+
+    # odom_topic: used by some BT nodes to estimate progress
+    odom_topic: /odom
+
+    # bt_loop_duration: how often the behavior tree ticks (ms)
+    # 10ms = 100Hz. Lower = more responsive, higher CPU cost.
+    bt_loop_duration: 10
+
+    # default_server_timeout: seconds to wait for action servers to respond
+    # before declaring failure. 20s is generous for a Pi 5.
+    default_server_timeout: 20
+
+    # wait_for_service_timeout: seconds to wait for lifecycle services
+    wait_for_service_timeout: 1000
+
+    # action_server_result_timeout: seconds to hold a completed action result
+    action_server_result_timeout: 900.0
+
+    # navigators: which navigator plugins to load
+    # NavigateToPose: single goal navigation (used by send_goal.py)
+    # NavigateThroughPoses: waypoint following (for future use)
+    navigators: ['navigate_to_pose', 'navigate_through_poses']
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator/NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator/NavigateThroughPosesNavigator"
+
+    # error_code_names: which error codes to report in feedback
+    error_code_names:
+      - compute_path_error_code
+      - follow_path_error_code
+
+
+# =============================================================================
+# Planner Server — global path planning
+# =============================================================================
+# planner_server takes a goal pose and the current map, and computes a
+# globally optimal path from the robot's current position to the goal.
+# It publishes the path on /plan (nav_msgs/Path). It does NOT move the robot.
+#
+# We use NavFn with A* — this is the simplest and most reliable planner for
+# indoor environments with a known occupancy grid map. It works well in
+# home environments (hallways, rooms, doorways).
+#
+# Alternatives:
+#   Smac Planner: more sophisticated, handles non-holonomic constraints,
+#                 but requires more tuning and is slower on Pi 5.
+#   THETA*: any-angle paths, smoother but more CPU intensive.
+# NavFn A* is the right choice for OMNI at this stage.
+planner_server:
+  ros__parameters:
+    # planner_plugins: list of planners to load. Each is a named plugin.
+    planner_plugins: ["GridBased"]
+
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+
+      # tolerance: how close to the goal (meters) counts as "reached"
+      # 0.5m is generous — good for furniture-filled rooms where exact
+      # positioning is not required. Tighten if you need precise docking.
+      tolerance: 0.5
+
+      # use_astar: true = A* (goal-directed, faster), false = Dijkstra
+      # A* is strongly preferred for single-goal navigation.
+      use_astar: true
+
+      # allow_unknown: true = plan through unexplored (grey) map cells
+      # Indoor SLAM often leaves some cells unknown at room edges.
+      # Allowing unknown means OMNI can still plan through partially mapped areas.
+      allow_unknown: true
+
+
+# =============================================================================
+# Controller Server — local path following
+# =============================================================================
+# controller_server takes the global path from planner_server and computes
+# velocity commands to follow it, while avoiding dynamic obstacles.
+# It publishes to /cmd_vel (remapped to /cmd_vel_raw in the launch file).
+#
+# We use DWB (Dynamic Window Approach Based) controller. DWB samples many
+# possible velocity trajectories, scores them against "critic" functions,
+# and picks the best one. It is the Nav2 default and well-suited for indoor
+# differential-drive robots like OMNI.
+controller_server:
+  ros__parameters:
+    # controller_frequency: how often to compute and publish velocity (Hz)
+    # 10 Hz is appropriate for a slow indoor robot. 20 Hz is the max
+    # the LD19 LiDAR can support anyway.
+    controller_frequency: 10.0
+
+    # These thresholds prevent publishing tiny velocities that the motors
+    # cannot actually execute (hardware deadband protection).
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+
+    # failure_tolerance: seconds of controller failure before declaring
+    # navigation failed. 0.3s is tight — increase if you see false failures.
+    failure_tolerance: 0.3
+
+    # progress_checker_plugins: monitors whether the robot is making progress
+    progress_checker_plugin: "progress_checker"
+    progress_checker:
+      plugin: "nav2_controller/SimpleProgressChecker"
+      # required_movement_radius: how far (m) the robot must move per check
+      required_movement_radius: 0.5
+      # movement_time_allowance: seconds allowed to move that radius before
+      # declaring the robot stuck. 10s is generous for a slow robot.
+      movement_time_allowance: 10.0
+
+    # goal_checker_plugins: decides when the robot has "arrived"
+    goal_checker_plugin: "goal_checker"
+    goal_checker:
+      plugin: "nav2_controller/StoppedGoalChecker"
+      # These tolerances define what counts as "at the goal"
+      # xy_goal_tolerance: distance (m) — must be within this of goal XY
+      xy_goal_tolerance: 0.25
+      # yaw_goal_tolerance: angle (radians) — must face within this of goal yaw
+      # 0.4 rad ≈ 23 degrees. Loose for a home robot; tighten for docking.
+      yaw_goal_tolerance: 0.4
+      # stateful: true = stop immediately when within tolerance
+      stateful: true
+
+    # controller_plugins: which controller algorithm to use
+    controller_plugins: ["FollowPath"]
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+
+      # ── Velocity limits for OMNI ──────────────────────────────────────────
+      # These are the hard limits. DWB will never command outside these bounds.
+      # OMNI is top-heavy so we keep speeds conservative.
+
+      # max_vel_x: maximum forward speed (m/s)
+      # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
+      max_vel_x: 0.3
+
+      # min_vel_x: minimum forward speed. Negative allows slow reverse.
+      # -0.1 m/s for gentle backup during recovery behaviors.
+      min_vel_x: -0.1
+
+      # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
+      max_vel_y: 0.0
+      min_vel_y: 0.0
+
+      # max_vel_theta: maximum rotation speed (rad/s)
+      # 0.8 rad/s ≈ 46°/s — slow enough for a wide body to turn safely
+      max_vel_theta: 0.8
+      min_vel_theta: 0.0
+
+      # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
+      max_speed_xy: 0.3
+      min_speed_xy: 0.0
+
+      # min_speed_theta: minimum rotation speed before DWB considers rotating
+      min_speed_theta: 0.0
+
+      # ── Acceleration limits ───────────────────────────────────────────────
+      # OMNI is top-heavy — gentle acceleration prevents tipping.
+
+      # acc_lim_x: maximum linear acceleration (m/s²)
+      # 0.5 m/s² gives a smooth start — reaches max speed in 0.6 seconds
+      acc_lim_x: 0.5
+
+      # acc_lim_y: no lateral acceleration (non-holonomic)
+      acc_lim_y: 0.0
+
+      # acc_lim_theta: maximum angular acceleration (rad/s²)
+      # 1.0 rad/s² is gentle — reaches max turn speed in 0.8 seconds
+      acc_lim_theta: 1.0
+
+      # decel_lim_x: maximum deceleration (negative = braking)
+      # Match acc_lim_x for symmetric stopping
+      decel_lim_x: -0.5
+      decel_lim_theta: -1.0
+
+      # ── DWB sampling ──────────────────────────────────────────────────────
+      # DWB generates sample trajectories by trying different velocities and
+      # simulating forward in time. More samples = better choices, more CPU.
+
+      # vx_samples: how many forward velocity values to try
+      # 10 is enough for a slow robot with 0.3 m/s max
+      vx_samples: 10
+
+      # vy_samples: no lateral motion, so 1 sample (always 0)
+      vy_samples: 1
+
+      # vtheta_samples: how many angular velocity values to try
+      # 20 gives good coverage of the 0–0.8 rad/s range
+      vtheta_samples: 20
+
+      # sim_time: how far ahead (seconds) to simulate each trajectory
+      # 1.7s at 0.3 m/s = ~0.5m look-ahead. Good for hallways.
+      sim_time: 1.7
+
+      # linear_granularity: simulation step size (m)
+      linear_granularity: 0.05
+
+      # angular_granularity: simulation angular step size (radians)
+      angular_granularity: 0.025
+
+      # transform_tolerance: maximum age (seconds) of TF transforms to accept
+      transform_tolerance: 0.2
+
+      # xy_goal_tolerance / yaw_goal_tolerance: same as goal_checker above
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.4
+
+      # ── DWB critics (scoring functions) ──────────────────────────────────
+      # Each critic scores a trajectory from 0 to 255. DWB picks the
+      # trajectory with the highest combined score. Critics penalize:
+      #   - getting close to obstacles
+      #   - oscillating back and forth
+      #   - deviating from the global path
+      #   - facing away from the path/goal
+      critics:
+        ["RotateToGoal", "Oscillation", "ObstacleFootprint",
+         "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+
+      # RotateToGoal: when close to the goal, rotate in place to face it
+      # before declaring arrival. Weight 32 = high priority.
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+      # Oscillation: penalizes switching directions repeatedly (getting stuck)
+      Oscillation.scale: 1.0
+
+      # ObstacleFootprint: uses the full rectangular footprint to check if a
+      # trajectory passes through any occupied costmap cells.
+      # This is more accurate than point-based obstacle checking.
+      ObstacleFootprint.scale: 0.025
+      ObstacleFootprint.max_scaling_factor: 0.2
+      ObstacleFootprint.scaling_speed: 0.25
+
+      # PathDist: penalizes trajectories that drift far from the global path
+      PathDist.scale: 32.0
+
+      # GoalDist: rewards trajectories that move toward the goal
+      GoalDist.scale: 24.0
+
+      # GoalAlign: rewards trajectories where the robot faces the goal direction
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.1
+
+      # PathAlign: rewards trajectories aligned with the global path heading
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.1
+
+
+# =============================================================================
+# Behavior Server — recovery behaviors
+# =============================================================================
+# When navigation gets stuck (obstacle blocking path, robot lost, etc.),
+# the behavior server runs recovery actions. These are triggered by the
+# behavior tree in bt_navigator.
+#
+# Recovery sequence (default BT): Spin → Backup → Wait → Spin → Backup → Fail
+behavior_server:
+  ros__parameters:
+    # These topics must match what the behavior plugins read from
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+
+    # cycle_frequency: how often to run the behavior control loop (Hz)
+    cycle_frequency: 10.0
+
+    # behavior_plugins: which recovery behaviors to load
+    behavior_plugins: ["spin", "backup", "wait"]
+
+    spin:
+      plugin: "nav2_behaviors/Spin"
+
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+
+    wait:
+      plugin: "nav2_behaviors/Wait"
+
+    # simulate_ahead_time: seconds to simulate before executing the behavior
+    # to check if it will hit an obstacle. 2.0s is the default.
+    simulate_ahead_time: 2.0
+
+    # Spin parameters: OMNI rotates in place to see new surroundings
+    # spin_dist: how far to rotate (radians) — 1.57 = 90 degrees
+    spin_dist: 1.57
+
+    # Backup parameters: OMNI moves backward a short distance
+    # backup_dist: how far to back up (meters) — 0.15m is very conservative
+    backup_dist: 0.15
+    # backup_speed: how fast to back up (m/s) — slow and safe
+    backup_speed: 0.025
+
+    # transform_tolerance: max TF age to accept during recovery
+    transform_tolerance: 0.1
+
+
+# =============================================================================
+# Smoother Server — path smoothing
+# =============================================================================
+# The smoother refines the global path from the planner to remove sharp
+# corners and reduce unnecessary turns. For OMNI (differential drive in
+# a home environment), smoothing improves comfort and reduces oscillation.
+smoother_server:
+  ros__parameters:
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother/SimpleSmoother"
+      # tolerance: how much the path can deviate from the original (m)
+      tolerance: 1.0e-10
+      # max_its: maximum smoothing iterations per call
+      max_its: 1000
+      # w_data: weight for keeping path close to original waypoints
+      w_data: 0.2
+      # w_smooth: weight for smoothness (higher = smoother but more deviation)
+      w_smooth: 0.3
+      # do_refinement: whether to iteratively refine after initial smooth
+      do_refinement: True
+
+
+# =============================================================================
+# Global Costmap — obstacle map for global path planning
+# =============================================================================
+# The global costmap covers the entire known map area. The planner uses it
+# to find paths that avoid walls and obstacles from the start position to goal.
+#
+# Layers:
+#   static_layer:   loads the SLAM-built occupancy grid map (/map)
+#   obstacle_layer: marks dynamic obstacles seen by the LiDAR (/scan)
+#   inflation_layer: inflates obstacles by a safety margin around the footprint
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # update_frequency: how often to update the costmap (Hz)
+      # 1 Hz is fine for the global costmap — it does not need to be reactive
+      update_frequency: 1.0
+
+      # publish_frequency: how often to publish the costmap for RViz (Hz)
+      publish_frequency: 1.0
+
+      # global_frame: the map frame — matches slam_toolbox output
+      global_frame: map
+
+      # robot_base_frame: the robot's center frame
+      robot_base_frame: base_link
+
+      # use_sim_time: must match the launch argument
+      use_sim_time: False
+
+      # robot_radius is NOT used — we define an explicit footprint polygon
+      # because OMNI's rectangular body (600mm × 400mm) is not circular.
+      # The footprint is the polygon of the robot's base in the XY plane.
+      # Coordinates are [x, y] pairs in meters, centered at base_link:
+      #   x = front(+)/back(-) = ±depth/2 = ±0.20m
+      #   y = left(+)/right(-) = ±width/2 = ±0.30m
+      footprint: "[[-0.20, -0.30], [-0.20, 0.30], [0.20, 0.30], [0.20, -0.30]]"
+
+      # resolution: costmap cell size (meters). Must match the SLAM map
+      # resolution (0.05m = 5cm cells) for consistent obstacle marking.
+      resolution: 0.05
+
+      # track_unknown_space: true = treat unexplored cells as potentially free
+      # (allows planning through unmapped areas during active SLAM)
+      track_unknown_space: true
+
+      # plugins: which costmap layers to load, in order
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        # map_subscribe_transient_local: true = use transient-local QoS to
+        # receive the last published /map even if we subscribe after it published
+        map_subscribe_transient_local: True
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        # enabled: allows disabling this layer for debugging
+        enabled: True
+        # observation_sources: named sensors that report obstacles
+        observation_sources: scan
+        scan:
+          # topic: where to read LaserScan data — lidar_node publishes here
+          topic: /scan
+          # max_obstacle_height: ignore points above this (avoids ceiling hits)
+          max_obstacle_height: 2.0
+          # clearing: true = LiDAR free-space beams clear previous obstacles
+          # This is important — without it, obstacles that moved stay forever
+          clearing: True
+          # marking: true = LiDAR hits mark new obstacles
+          marking: True
+          # data_type: LaserScan format
+          data_type: "LaserScan"
+          # raytrace_max_range: maximum range to use for clearing free space (m)
+          # LD19 max range is 12m but 5m is reliable indoors
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          # obstacle_max_range: maximum range to mark as obstacle (m)
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # cost_scaling_factor: how quickly the inflation cost falls off with
+        # distance from the obstacle. Higher = steeper dropoff = tighter paths.
+        # 3.0 gives a gentle gradient — planner will prefer center of hallways.
+        cost_scaling_factor: 3.0
+        # inflation_radius: distance (m) to inflate obstacles.
+        # = footprint_diagonal/2 + safety buffer = 0.36m + 0.19m = 0.55m
+        # This ensures the robot's body always clears obstacles by 0.19m.
+        # Increase if OMNI clips corners; decrease if paths become too tight.
+        inflation_radius: 0.55
+
+
+# =============================================================================
+# Local Costmap — obstacle map for local path following
+# =============================================================================
+# The local costmap is a small window around the robot, updated at high
+# frequency. The DWB controller uses it to avoid dynamic obstacles in real time.
+# It does NOT use the static map layer — it only sees what the LiDAR sees NOW.
+#
+# Layers:
+#   obstacle_layer: marks dynamic obstacles from current LiDAR scan
+#   inflation_layer: inflates them for safe footprint clearance
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # update_frequency: how often to update the local costmap (Hz)
+      # 5 Hz balances reactivity with Pi 5 CPU budget.
+      # The LiDAR publishes at 10 Hz so 5 Hz gives us fresh data each update.
+      update_frequency: 5.0
+
+      # publish_frequency: how often to publish for RViz
+      publish_frequency: 2.0
+
+      # global_frame: local costmap moves with odom frame (not map)
+      # Using odom avoids costmap jumps when slam_toolbox corrects the map.
+      global_frame: odom
+
+      # robot_base_frame: same as global costmap
+      robot_base_frame: base_link
+
+      use_sim_time: False
+
+      # rolling_window: true = the local costmap follows the robot
+      rolling_window: true
+
+      # width/height: size of the local costmap window (meters)
+      # 4m × 4m gives ~2m visibility in each direction — enough for indoor nav
+      # and appropriate for OMNI's 0.3 m/s max speed (covers 2+ seconds ahead)
+      width: 4
+      height: 4
+
+      # resolution: same as global costmap for consistent obstacle sizes
+      resolution: 0.05
+
+      # Same rectangular footprint as global costmap
+      footprint: "[[-0.20, -0.30], [-0.20, 0.30], [0.20, 0.30], [0.20, -0.30]]"
+
+      # No static_layer here — the local costmap is purely sensor-driven.
+      # This means it reacts to dynamic obstacles (people, chairs, pets)
+      # without being confused by the static map.
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.55
+
+
+# =============================================================================
+# Map Server — serves a pre-saved map for localization-only mode
+# =============================================================================
+# NOTE: map_server is NOT started by nav_launch.py when running with slam_node.
+# slam_toolbox publishes /map live during SLAM. map_server is only needed
+# if you want to navigate against a previously saved map without running SLAM.
+#
+# To use a saved map:
+#   1. Save the current map: ros2 run nav2_map_server map_saver_cli -f ~/my_map
+#   2. Create a separate localization launch that starts map_server + amcl
+#   3. Do NOT run slam_node at the same time
+#
+# This section is included for reference — the parameters are correct but
+# map_server is not in nav_launch.py's lifecycle_manager node_names list.
+map_server:
+  ros__parameters:
+    use_sim_time: False
+    # yaml_filename: path to the saved map YAML file
+    # Update this path when you save a map
+    yaml_filename: ""
+
+
+# =============================================================================
+# Lifecycle Manager — manages Nav2 node state transitions
+# =============================================================================
+# The lifecycle_manager is responsible for starting all Nav2 nodes and
+# transitioning them through the ROS2 lifecycle: unconfigured → configured
+# → active. If a node crashes, lifecycle_manager will shut down the rest.
+#
+# This is NOT the same as the OMNI nodes (motor_control, imu, etc.) which
+# are regular (non-lifecycle) nodes. Nav2 specifically requires lifecycle nodes
+# because startup order matters — you cannot start the controller before the
+# costmap is ready.
+lifecycle_manager:
+  ros__parameters:
+    use_sim_time: False
+
+    # autostart: true = immediately transition all nodes to active on launch.
+    # Set to false if you want to manually trigger activation (for debugging).
+    autostart: True
+
+    # node_names: the Nav2 nodes this lifecycle_manager controls.
+    # ORDER MATTERS: dependencies must come before the things that depend on them.
+    #   planner_server and controller_server depend on costmaps being ready.
+    #   bt_navigator depends on planner_server and controller_server being active.
+    node_names:
+      - planner_server
+      - smoother_server
+      - controller_server
+      - behavior_server
+      - bt_navigator
+
+    # bond_timeout: seconds before lifecycle_manager declares a node dead
+    # if it stops sending bond heartbeats. 4.0s is the Nav2 default.
+    bond_timeout: 4.0
+
+    # attempt_respawn_reconnection: if a node dies, try to reconnect to it
+    # if it respawns (e.g., if launched with --respawn option)
+    attempt_respawn_reconnection: True

@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>servo_node</name>
+  <version>0.1.0</version>
+  <description>OMNI dual PCA9685 servo control node — arms and head pan/tilt</description>
+  <maintainer email="omni@local">pi</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+</package>

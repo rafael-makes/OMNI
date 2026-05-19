@@ -1,0 +1,61 @@
+servos:
+  left_shoulder:
+    board: 0
+    channel: 0
+    neutral_pw: 1550
+    min_pw: 500
+    max_pw: 2500
+  left_elbow:
+    board: 0
+    channel: 1
+    neutral_pw: 1300
+    min_pw: 500
+    max_pw: 2500
+  left_wrist:
+    board: 0
+    channel: 2
+    neutral_pw: 1500
+    min_pw: 500
+    max_pw: 2500
+  left_gripper:
+    board: 0
+    channel: 3
+    neutral_pw: 1850
+    min_pw: 700
+    max_pw: 2300
+  head_pan:
+    board: 0
+    channel: 4
+    neutral_pw: 1550
+    min_pw: 500
+    max_pw: 2500
+  head_tilt:
+    board: 0
+    channel: 5
+    neutral_pw: 1500
+    min_pw: 700
+    max_pw: 2300
+  right_shoulder:
+    board: 1
+    channel: 0
+    neutral_pw: 1100
+    min_pw: 500
+    max_pw: 2500
+  right_elbow:
+    board: 1
+    channel: 1
+    neutral_pw: 1900
+    min_pw: 500
+    max_pw: 2500
+  right_wrist:
+    board: 1
+    channel: 2
+    neutral_pw: 1100
+    min_pw: 500
+    max_pw: 2500
+  right_gripper:
+    board: 1
+    channel: 3
+    neutral_pw: 1850
+    min_pw: 700
+    max_pw: 2300
