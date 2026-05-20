@@ -56,6 +56,10 @@ _PCM_DEV_RATE  = 44_100   # USB audio device native rate (must resample to this)
 _CHUNK_FRAMES  = 1_600    # 100ms at 16kHz — one send unit for Gemini
 _INT16_MAX     = 32_768.0
 
+# Number of amplitude bands published on /audio/levels.
+# chest_node maps each band to one column of the 16-wide LED matrix.
+_NUM_LEVELS    = 16
+
 # Pre-built silence chunk: 100ms of zeros at 16kHz, int16, mono = 3200 bytes.
 # Sent instead of real mic audio while the speaker is playing (echo suppression).
 _SILENCE_CHUNK = bytes(_CHUNK_FRAMES * 2)
@@ -67,7 +71,7 @@ class AudioHandler:
     Constructed by behavior_node.py and passed to GeminiBridge.
     """
 
-    def __init__(self, mic_device: int, speaker_device: int, logger, tcp_mic_port: int = 0):
+    def __init__(self, mic_device: int, speaker_device: int, logger, tcp_mic_port: int = 0, on_levels=None):
         """
         mic_device     — sounddevice index for USB mic (ROS2 param mic_device_index)
         speaker_device — sounddevice index for USB speaker (ROS2 param speaker_device_index)
@@ -99,6 +103,11 @@ class AudioHandler:
         # Used by in_suppression_window() so the wake word detector can ignore
         # audio that arrives shortly after OMNI finishes speaking.
         self._last_play_end_time = 0.0
+
+        # Optional callback invoked from the audio-play thread with a list of
+        # _NUM_LEVELS floats in [0.0, 1.0]. behavior_node passes _publish_levels
+        # here to drive /audio/levels for the chest LED matrix.
+        self._on_levels = on_levels
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -270,6 +279,8 @@ class AudioHandler:
                 device=self._speaker_device,
             ) as stream:
                 self._log.info('Speaker playback stream open')
+                _LEVELS_INTERVAL = 0.1   # 10 Hz
+                _last_levels_time = 0.0
                 while self._speaker_running:
                     try:
                         # Wait up to 0.5s for a chunk. If nothing arrives,
@@ -282,11 +293,19 @@ class AudioHandler:
                             self._last_play_end_time = time.monotonic()
                             self._muted.clear()
                             self._log.info('Speaker gate: OPEN (0.5s idle timeout)')
+                            if self._on_levels:
+                                self._on_levels([0.0] * _NUM_LEVELS)
+                            _last_levels_time = 0.0
                         continue
 
                     if not chunk:
                         self._log.info('_play_loop: dequeued empty chunk — skipping')
                         continue
+
+                    now = time.monotonic()
+                    if self._on_levels and now - _last_levels_time >= _LEVELS_INTERVAL:
+                        self._on_levels(self._compute_levels(chunk))
+                        _last_levels_time = now
 
                     resampled = self._resample(chunk)
                     stream.write(resampled)
@@ -300,6 +319,9 @@ class AudioHandler:
                         self._last_play_end_time = time.monotonic()
                         self._muted.clear()
                         self._log.info('Speaker gate: OPEN (queue empty after write)')
+                        if self._on_levels:
+                            self._on_levels([0.0] * _NUM_LEVELS)
+                        _last_levels_time = 0.0
 
         except Exception as exc:
             self._log.error(f'Speaker playback thread crashed: {exc}')
@@ -384,6 +406,21 @@ class AudioHandler:
         ReSpeaker mics are out of phase — averaging L+R cancels to near-zero."""
         samples = np.frombuffer(stereo_bytes, dtype=np.int16)
         return samples[0::2].tobytes()
+
+    @staticmethod
+    def _compute_levels(chunk: bytes) -> list:
+        """Split chunk into _NUM_LEVELS segments, return RMS amplitude per segment (0.0–1.0)."""
+        samples = np.frombuffer(chunk, dtype=np.int16)
+        if len(samples) == 0:
+            return [0.0] * _NUM_LEVELS
+        levels = []
+        for seg in np.array_split(samples, _NUM_LEVELS):
+            if len(seg) == 0:
+                levels.append(0.0)
+            else:
+                rms = float(np.sqrt(np.mean(seg.astype(np.float32) ** 2)))
+                levels.append(min(rms / _INT16_MAX, 1.0))
+        return levels
 
     @staticmethod
     def _resample(pcm_24k: bytes) -> bytes:

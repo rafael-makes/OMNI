@@ -44,13 +44,18 @@ def generate_launch_description():
     )
     wake_word_model_arg = DeclareLaunchArgument(
         'wake_word_model',
-        default_value='hey_mycroft',
+        default_value='omni',
         description='openwakeword model name (without .onnx extension)',
     )
     wake_word_threshold_arg = DeclareLaunchArgument(
         'wake_word_threshold',
         default_value='0.5',
         description='Wake word score threshold (0.0–1.0)',
+    )
+    wake_word_startup_suppress_arg = DeclareLaunchArgument(
+        'wake_word_startup_suppress',
+        default_value='1.5',
+        description='Seconds to suppress wake word scoring after detector restart (drains speaker bleed)',
     )
     conversation_timeout_arg = DeclareLaunchArgument(
         'conversation_timeout',
@@ -84,7 +89,8 @@ def generate_launch_description():
             'gemini_voice':          LaunchConfiguration('gemini_voice'),
             'config_file_path':      LaunchConfiguration('config_file_path'),
             'wake_word_model':       LaunchConfiguration('wake_word_model'),
-            'wake_word_threshold':   LaunchConfiguration('wake_word_threshold'),
+            'wake_word_threshold':         LaunchConfiguration('wake_word_threshold'),
+            'wake_word_startup_suppress':  LaunchConfiguration('wake_word_startup_suppress'),
             'conversation_timeout':  LaunchConfiguration('conversation_timeout'),
             'mic_device_index':      LaunchConfiguration('mic_device_index'),
             'speaker_device_index':  LaunchConfiguration('speaker_device_index'),
@@ -101,6 +107,7 @@ def generate_launch_description():
         config_file_arg,
         wake_word_model_arg,
         wake_word_threshold_arg,
+        wake_word_startup_suppress_arg,
         conversation_timeout_arg,
         mic_device_arg,
         speaker_device_arg,

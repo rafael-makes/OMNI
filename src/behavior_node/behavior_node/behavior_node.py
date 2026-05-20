@@ -64,8 +64,9 @@ class BehaviorNode(Node):
         self.declare_parameter('gemini_model',        'models/gemini-2.5-flash-native-audio-latest')
         self.declare_parameter('gemini_voice',        'Algieba')
         self.declare_parameter('config_file_path',    '~/omni_ws/src/behavior_node/config/omni_config.yaml')
-        self.declare_parameter('wake_word_model',     'hey_mycroft')
-        self.declare_parameter('wake_word_threshold', 0.5)
+        self.declare_parameter('wake_word_model',              'hey_mycroft')
+        self.declare_parameter('wake_word_threshold',          0.5)
+        self.declare_parameter('wake_word_startup_suppress',   1.5)
         self.declare_parameter('conversation_timeout', 30.0)
         self.declare_parameter('idle_return_timeout', 30.0)
         self.declare_parameter('mic_device_index',    0)
@@ -77,6 +78,7 @@ class BehaviorNode(Node):
         config_path     = os.path.expanduser(self.get_parameter('config_file_path').value)
         ww_model        = self.get_parameter('wake_word_model').value
         ww_threshold    = self.get_parameter('wake_word_threshold').value
+        ww_suppress     = self.get_parameter('wake_word_startup_suppress').value
         mic_dev         = self.get_parameter('mic_device_index').value
         spk_dev         = self.get_parameter('speaker_device_index').value
         tcp_mic_port    = self.get_parameter('tcp_mic_port').value
@@ -139,6 +141,7 @@ class BehaviorNode(Node):
         self._state_pub  = self.create_publisher(String,             '/robot_state',    10)
         self._speech_pub = self.create_publisher(String,             '/audio/speech',   10)
         self._servo_pub  = self.create_publisher(Float32MultiArray,  '/servo_commands', 10)
+        self._levels_pub = self.create_publisher(Float32MultiArray,  '/audio/levels',   10)
 
         # ── Subscribers ────────────────────────────────────────────────────────
         self.create_subscription(String,       '/safety/fault',   self._on_safety_fault,  10)
@@ -161,6 +164,7 @@ class BehaviorNode(Node):
             speaker_device=spk_dev,
             logger=self.get_logger(),
             tcp_mic_port=tcp_mic_port,
+            on_levels=self._publish_levels,
         )
         self._audio.start()
 
@@ -187,6 +191,7 @@ class BehaviorNode(Node):
             score_threshold=ww_threshold,
             logger=self.get_logger(),
             audio_handler=self._audio,
+            startup_suppress_secs=ww_suppress,
         )
         self._wake.start()
 
@@ -354,9 +359,20 @@ class BehaviorNode(Node):
         self.get_logger().debug(f'Map location update: {msg.data}')
 
     def _on_motor_status(self, msg: String):
-        # Motor health string — log warnings if not nominal
-        if msg.data.lower() not in ('ok', 'nominal', ''):
-            self.get_logger().warn(f'Motor status: {msg.data}')
+        import json
+        raw = msg.data.strip()
+        if not raw:
+            return
+        try:
+            # motor_control_node publishes JSON odometry telemetry at high frequency.
+            # Parse it and log at DEBUG so it never spams the console.
+            json.loads(raw)
+            self.get_logger().debug(f'Motor telemetry: {raw}')
+        except json.JSONDecodeError:
+            # Non-JSON messages are human-readable status strings.
+            # Only warn if they are not one of the known-nominal values.
+            if raw.lower() not in ('ok', 'nominal'):
+                self.get_logger().warn(f'Motor status: {raw}')
 
     def _on_wifi_config(self, msg: String):
         # Configuration updates from chest_node — log only, no behavior yet
@@ -436,6 +452,12 @@ class BehaviorNode(Node):
         msg      = String()
         msg.data = state
         self._state_pub.publish(msg)
+
+    def _publish_levels(self, levels: list):
+        """Called from audio-play thread; publish amplitude bands for chest LED matrix."""
+        msg      = Float32MultiArray()
+        msg.data = levels
+        self._levels_pub.publish(msg)
 
     # ── Config loader ──────────────────────────────────────────────────────────
 

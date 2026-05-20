@@ -64,29 +64,38 @@ class WakeWordDetector:
         score_threshold: float = 0.5,
         logger=None,
         audio_handler=None,
+        startup_suppress_secs: float = 1.5,
     ):
         """
-        callback        — called (no arguments) when wake word detected.
-                          Fired on the detector thread — behavior_node must
-                          handle this in a thread-safe way.
-        mic_device      — sounddevice index for the USB mic
-        model_name      — openwakeword model to load (default 'hey_mycroft').
-                          Must match one of the .onnx filenames in
-                          openwakeword/resources/models/ (without extension).
-        score_threshold — confidence score (0.0–1.0) above which we trigger.
-                          Lower = more sensitive but more false positives.
-        logger          — rclpy logger
-        audio_handler   — AudioHandler instance; if provided, detections are
-                          suppressed while the speaker is playing or within 2s
-                          of playback ending (prevents OMNI's own voice re-triggering).
+        callback               — called (no arguments) when wake word detected.
+                                 Fired on the detector thread — behavior_node must
+                                 handle this in a thread-safe way.
+        mic_device             — sounddevice index for the USB mic
+        model_name             — openwakeword model to load (default 'hey_mycroft').
+                                 Must match one of the .onnx filenames in
+                                 openwakeword/resources/models/ (without extension).
+        score_threshold        — confidence score (0.0–1.0) above which we trigger.
+                                 Lower = more sensitive but more false positives.
+        logger                 — rclpy logger
+        audio_handler          — AudioHandler instance; if provided, detections are
+                                 suppressed while the speaker is playing or within 2s
+                                 of playback ending (prevents OMNI's own voice re-triggering).
+        startup_suppress_secs  — seconds to consume mic audio without scoring after
+                                 each start() call. Drains speaker bleed from the mic
+                                 buffer so OMNI's own voice cannot re-trigger detection.
+                                 predict() still runs during this window so the model's
+                                 internal sliding-window state settles on real ambient
+                                 audio before scoring goes live. Default 1.5s.
         """
-        self._callback        = callback
-        self._mic_device      = mic_device
-        self._model_name      = model_name
-        self._score_threshold = score_threshold
-        self._log             = logger
-        self._audio           = audio_handler
-        self._running         = False
+        self._callback              = callback
+        self._mic_device            = mic_device
+        self._model_name            = model_name
+        self._score_threshold       = score_threshold
+        self._log                   = logger
+        self._audio                 = audio_handler
+        self._startup_suppress_secs = startup_suppress_secs
+        self._warmup_until          = 0.0   # absolute monotonic time set in start()
+        self._running               = False
 
         # Decide which detection path to use
         self._use_oww = self._try_load_oww()
@@ -95,7 +104,8 @@ class WakeWordDetector:
 
     def start(self):
         """Open the mic and begin listening. Returns immediately."""
-        self._running = True
+        self._running      = True
+        self._warmup_until = time.monotonic() + self._startup_suppress_secs
         target = self._oww_loop if self._use_oww else self._energy_loop
         self._thread = threading.Thread(
             target=target,
@@ -104,7 +114,10 @@ class WakeWordDetector:
         )
         self._thread.start()
         mode = f'openwakeword ({self._model_name})' if self._use_oww else 'energy threshold fallback'
-        self._log.info(f'Wake word detector started — mode: {mode}')
+        self._log.info(
+            f'Wake word detector started — mode: {mode}, '
+            f'startup suppress: {self._startup_suppress_secs}s'
+        )
 
     def stop(self):
         """Signal the detector thread to stop. Returns immediately."""
@@ -196,7 +209,8 @@ class WakeWordDetector:
         blocksize=1280 on the sounddevice stream guarantees every read()
         returns exactly 1280 samples. No accumulation buffer required.
         """
-        wake_detected = False
+        wake_detected  = False
+        warmup_logged  = False
         try:
             with sd.InputStream(
                 samplerate=_SAMPLE_RATE,
@@ -211,7 +225,17 @@ class WakeWordDetector:
                     frames, _ = stream.read(_CHUNK_SAMPLES)
                     audio_1d  = frames[:, 0]   # shape (1280,) int16
 
+                    # predict() runs during warmup so the model's internal sliding-window
+                    # state settles on real ambient audio. Score is read but not acted on.
                     preds = self._oww_model.predict(audio_1d)
+
+                    if time.monotonic() < self._warmup_until:
+                        continue
+
+                    if not warmup_logged:
+                        self._log.info('Wake word warmup complete — scoring active')
+                        warmup_logged = True
+
                     # Use the discovered prediction key (e.g. 'hey_mycroft_v0.1'),
                     # not the raw model_name string ('hey_mycroft')
                     score = preds.get(self._oww_key, 0.0)
@@ -258,6 +282,7 @@ class WakeWordDetector:
         """
         consecutive_loud = 0
         wake_detected    = False
+        warmup_logged    = False
         try:
             with sd.InputStream(
                 samplerate=_SAMPLE_RATE,
@@ -270,6 +295,13 @@ class WakeWordDetector:
                     frames, _ = stream.read(_CHUNK_SAMPLES)
                     audio_1d  = frames[:, 0].astype(np.float32)
                     rms       = float(np.sqrt(np.mean(audio_1d ** 2)))
+
+                    if time.monotonic() < self._warmup_until:
+                        continue
+
+                    if not warmup_logged:
+                        self._log.info('Wake word warmup complete — scoring active')
+                        warmup_logged = True
 
                     if rms >= _ENERGY_THRESHOLD:
                         consecutive_loud += 1

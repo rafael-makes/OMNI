@@ -92,7 +92,7 @@ planner_server:
     planner_plugins: ["GridBased"]
 
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
+      plugin: "nav2_navfn_planner::NavfnPlanner"
 
       # tolerance: how close to the goal (meters) counts as "reached"
       # 0.5m is generous — good for furniture-filled rooms where exact

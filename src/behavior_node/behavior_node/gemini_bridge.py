@@ -36,6 +36,7 @@ from google import genai
 from google.genai import types as genai_types
 
 from behavior_node.audio_handler import _PCM_IN_RATE
+from behavior_node.function_handlers import OMNI_TOOLS
 
 _RECONNECT_DELAY   = 5.0    # seconds to wait before reconnecting after a drop
 _STATES_BLOCK_AUDIO = {'NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'}
@@ -234,9 +235,7 @@ class GeminiBridge:
         config = genai_types.LiveConnectConfig(
             response_modalities=['AUDIO'],
             system_instruction=self._prompt,
-            # tools=OMNI_TOOLS — disabled while testing native audio model stability.
-            # Error 1008 suggests function calling is not supported on this model variant.
-            # Re-enable once the model supports it or switch to a different model.
+            tools=OMNI_TOOLS,
             # Request transcription of OMNI's audio output — shows in logs and
             # lets us publish /audio/text if needed in future.
             output_audio_transcription=genai_types.AudioTranscriptionConfig(),
@@ -398,7 +397,19 @@ class GeminiBridge:
         Three response types we handle:
           response.data        — raw audio PCM (24kHz int16 mono) → play on speaker
           response.tool_call   — Gemini wants to call a function → dispatch to handlers
-          response.server_content — transcription or end-of-turn marker (log only)
+          response.server_content — transcription, end-of-turn marker, or turn_complete
+
+        SPEAKING / LISTENING auto-transitions (do not rely on set_robot_state function call):
+          First audio chunk of a turn while state is LISTENING → set SPEAKING immediately,
+          before the chunk is enqueued on the speaker. This is reliable because it fires
+          on real data arrival, not on an optional function call from the model.
+
+          When Gemini's turn ends, _await_playback_and_set_listening() is spawned as an
+          asyncio task. It polls AudioHandler.is_playing() every 100ms and transitions
+          back to LISTENING once the speaker queue drains. Two signals can trigger this:
+            • server_content.turn_complete=True  — clean end of Gemini's turn
+            • receive() generator exhausting without turn_complete — barge-in / interruption
+          Both cases are handled; speaking_triggered guards against spawning duplicate tasks.
 
         IMPORTANT — double loop required (matches audio_node pattern):
           session.receive() is an async generator that exhausts after delivering
@@ -407,16 +418,18 @@ class GeminiBridge:
           first response and all subsequent turns (user speech → Gemini reply) are
           silently dropped. The outer while re-enters receive() for each new turn.
 
-        THREAD SAFETY: function handlers are run via run_in_executor() so that
-        rclpy calls inside them (publish, send_goal_async) execute in a thread
-        pool worker, not on the asyncio loop. This is correct — rclpy's publisher
-        and action client are internally thread-safe, so running from a pool worker
-        is safe. Direct calls from inside a coroutine would also technically work
-        for publish() but using run_in_executor is the safer, documented pattern.
+        THREAD SAFETY: _set_state() and function handlers are called via run_in_executor()
+        so that rclpy calls execute in a thread pool worker, not on the asyncio loop.
+        Direct reads of _current_state without the lock are safe in CPython — string
+        assignment is atomic under the GIL (same pattern as _session_with_reconnect).
         """
         self._node.get_logger().info('_recv_loop started — waiting for Gemini responses')
         _audio_chunk_count = 0
         while self._session_active:
+            # speaking_triggered resets each turn so each new Gemini response gets
+            # a fresh LISTENING→SPEAKING transition and its own playback watcher.
+            speaking_triggered = False
+
             # session.receive() is an async generator that exhausts after one
             # turn's responses — it does NOT stay open like a continuous stream.
             # The outer while re-enters receive() so subsequent turns are received.
@@ -446,14 +459,30 @@ class GeminiBridge:
                         f'Audio chunk #{_audio_chunk_count}: {len(response.data)} bytes received '
                         f'from Gemini → passing to play_audio()'
                     )
+
+                    # Auto-transition LISTENING → SPEAKING on the first audio chunk
+                    # of each turn. Done before play_audio() so state is correct
+                    # the moment the speaker starts. Only fires from LISTENING —
+                    # other states (ERROR, NAVIGATING) are left untouched.
+                    if not speaking_triggered and self._node._current_state == 'LISTENING':
+                        speaking_triggered = True
+                        await self._loop.run_in_executor(
+                            None, self._node._set_state, 'SPEAKING'
+                        )
+
                     self._audio.play_audio(response.data)
                     self._node.get_logger().info(
                         f'Audio chunk #{_audio_chunk_count}: play_audio() returned '
                         f'(enqueued for speaker)'
                     )
 
-                # ── Function call ─────────────────────────────────────────────
+                # ── Function calls ────────────────────────────────────────────
+                # All results from a single tool_call event must be batched into
+                # ONE LiveClientToolResponse. Sending separate messages per call
+                # causes error 1008 — Gemini treats the second message as a
+                # protocol violation because it already advanced past tool state.
                 if response.tool_call:
+                    fn_responses = []
                     for fc in response.tool_call.function_calls:
                         self._node.get_logger().info(
                             f'Gemini function call: {fc.name}({dict(fc.args)})'
@@ -462,31 +491,76 @@ class GeminiBridge:
                             None,
                             lambda n=fc.name, a=dict(fc.args): self._fn.handle(n, a),
                         )
-                        try:
-                            await session.send(
-                                input=genai_types.LiveClientToolResponse(
-                                    function_responses=[
-                                        genai_types.FunctionResponse(
-                                            id=fc.id,
-                                            name=fc.name,
-                                            response={'result': result},
-                                        )
-                                    ]
-                                )
+                        fn_responses.append(
+                            genai_types.FunctionResponse(
+                                id=fc.id,
+                                name=fc.name,
+                                response={'result': result},
                             )
-                            self._node.get_logger().debug(
-                                f'Tool response sent for {fc.name}: {result[:80]}...'
-                                if len(result) > 80 else f'Tool response sent for {fc.name}: {result}'
+                        )
+                        self._node.get_logger().debug(
+                            f'Function result queued for {fc.name}: '
+                            f'{result[:80]}{"..." if len(result) > 80 else ""}'
+                        )
+                    try:
+                        await session.send(
+                            input=genai_types.LiveClientToolResponse(
+                                function_responses=fn_responses
                             )
-                        except Exception as exc:
-                            self._node.get_logger().error(
-                                f'Failed to send tool response for {fc.name}: {exc}'
-                            )
+                        )
+                        self._node.get_logger().info(
+                            f'Tool response sent: '
+                            f'{[r.name for r in fn_responses]}'
+                        )
+                    except Exception as exc:
+                        self._node.get_logger().error(
+                            f'Failed to send tool response '
+                            f'{[r.name for r in fn_responses]}: {exc}'
+                        )
 
                 # ── Server content (transcription / end-of-turn) ──────────────
                 if response.server_content:
                     sc = response.server_content
+
+                    # turn_complete=True is Gemini's explicit signal that it has
+                    # finished generating audio for this turn. Spawn a watcher that
+                    # waits for the speaker queue to drain, then sets LISTENING.
+                    # Clear speaking_triggered so the post-loop fallback below does
+                    # not create a duplicate watcher.
+                    if getattr(sc, 'turn_complete', False) and speaking_triggered:
+                        self._loop.create_task(self._await_playback_and_set_listening())
+                        speaking_triggered = False
+
                     if hasattr(sc, 'output_transcription') and sc.output_transcription:
                         text = sc.output_transcription.text
                         if text:
                             self._node.get_logger().debug(f'Gemini said: {text}')
+
+            # receive() exhausted without turn_complete — barge-in or interruption.
+            # If we had started speaking, still need to drain the speaker queue.
+            if speaking_triggered:
+                self._loop.create_task(self._await_playback_and_set_listening())
+
+    async def _await_playback_and_set_listening(self):
+        """
+        Wait for AudioHandler to finish playing all enqueued audio, then
+        transition from SPEAKING back to LISTENING.
+
+        Spawned as an asyncio task (not awaited inline) so _recv_loop can
+        immediately re-enter session.receive() for the next turn while playback
+        is still draining. Polls is_playing() every 100ms — fine-grained enough
+        for a responsive mic-gate re-open without busy-looping.
+
+        Guards:
+          • Exits early if the session closes while waiting (close_session() called).
+          • Only transitions if state is still SPEAKING — function_handlers or a
+            safety fault may have already changed state, in which case we leave it alone.
+        """
+        while self._session_active and self._audio.is_playing():
+            await asyncio.sleep(0.1)
+
+        if not self._session_active:
+            return
+
+        if self._node._current_state == 'SPEAKING':
+            await self._loop.run_in_executor(None, self._node._set_state, 'LISTENING')
