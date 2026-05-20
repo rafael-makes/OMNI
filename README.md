@@ -1,6 +1,6 @@
 # OMNI
 
-OMNI is an autonomous indoor robot powered by a Raspberry Pi 5. It uses the Gemini Live API for real-time voice conversation, Nav2 for autonomous navigation, and SLAM for mapping. You can wake it up by saying "Hey Mycroft", have a conversation, and ask it to navigate to rooms, report its battery, or explore the house.
+OMNI is an autonomous indoor robot powered by a Raspberry Pi 5. It uses the Gemini Live API for real-time voice conversation, Nav2 for autonomous navigation, and SLAM for mapping. You can wake it up by saying "Omni", have a conversation, and ask it to navigate to rooms, report its battery, or explore the house.
 
 ---
 
