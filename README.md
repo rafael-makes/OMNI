@@ -59,13 +59,6 @@ source install/setup.bash
 
 ## Configuration
 
-### API key
-
-```bash
-echo 'export GEMINI_API_KEY=your_key_here' >> ~/.bashrc
-source ~/.bashrc
-```
-
 ### System prompt and locations
 
 Edit `src/behavior_node/config/omni_config.yaml` to change OMNI's personality, instructions, and named navigation locations.
