@@ -41,7 +41,7 @@ static const uint8_t MUX_RIGHT = 0x08;   // channel 3
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 static const uint32_t PID_INTERVAL_MS  = 10;   // 100 Hz PID
-static const uint32_t ODOM_INTERVAL_MS = 50;   // 20 Hz odometry output
+static const uint32_t ODOM_INTERVAL_MS = 53;
 static const uint32_t CMD_TIMEOUT_MS   = 500;  // stop if no command received
 
 // ── PID gains — FF dominates, PID only slowly trims steady-state error ────────
@@ -97,7 +97,7 @@ static void mux_select(uint8_t mask) {
     Wire.beginTransmission(PCA9546_ADDR);
     Wire.write(mask);
     Wire.endTransmission();
-    delay(1);   // required settling time — omitting this causes I2C read failures
+    delayMicroseconds(5);   // required settling time — omitting this causes I2C read failures
 }
 
 // ── AS5600 read — returns 0xFFFF on I2C failure ───────────────────────────────

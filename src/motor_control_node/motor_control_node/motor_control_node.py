@@ -21,6 +21,7 @@ import serial
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
 
 from tf2_ros import TransformBroadcaster
 
@@ -36,8 +37,13 @@ class MotorControlNode(Node):
         self.declare_parameter('wheel_separation', 0.300)
         self.declare_parameter('wheel_radius',     0.050)
         self.declare_parameter('cmd_vel_timeout',  0.5)
-        self.declare_parameter('odom_frame',       'odom')
-        self.declare_parameter('base_frame',       'base_link')
+        self.declare_parameter('odom_frame',         'odom')
+        self.declare_parameter('base_frame',         'base_link')
+        # Speed limits — clamp cmd_vel before kinematics so a runaway nav stack
+        # can't send commands the hardware can't track (max hardware ≈ 1.0 m/s).
+        # Conservative defaults for first-drive; raise in the launch file once tuned.
+        self.declare_parameter('max_linear_speed',   0.5)   # m/s
+        self.declare_parameter('max_angular_speed',  1.5)   # rad/s
 
         self._port    = self.get_parameter('serial_port').value
         self._baud    = self.get_parameter('baud_rate').value
@@ -46,6 +52,8 @@ class MotorControlNode(Node):
         self._timeout = self.get_parameter('cmd_vel_timeout').value
         self._odom_frame = self.get_parameter('odom_frame').value
         self._base_frame = self.get_parameter('base_frame').value
+        self._max_vx  = self.get_parameter('max_linear_speed').value
+        self._max_wz  = self.get_parameter('max_angular_speed').value
 
         # ── Serial ───────────────────────────────────────────────────────────
         self._ser: serial.Serial | None = None
@@ -62,6 +70,7 @@ class MotorControlNode(Node):
         self._odom_pub   = self.create_publisher(Odometry, '/odom', sensor_qos)
         self._status_pub = self.create_publisher(String,   '/motor_status',        10)
         self._stall_pub  = self.create_publisher(Bool,     '/motor/stall_detected', 10)
+        self.create_service(Trigger, '/motor/reset_odometry', self._reset_odom_cb)
         self._tf_broadcaster = TransformBroadcaster(self)
 
         self.create_subscription(Twist, '/cmd_vel', self._cmd_vel_cb, 10)
@@ -110,8 +119,8 @@ class MotorControlNode(Node):
     # ── /cmd_vel callback ─────────────────────────────────────────────────────
 
     def _cmd_vel_cb(self, msg: Twist):
-        vx = msg.linear.x
-        wz = msg.angular.z
+        vx = max(-self._max_vx, min(self._max_vx, msg.linear.x))
+        wz = max(-self._max_wz, min(self._max_wz, msg.angular.z))
 
         left_mps  = vx - wz * self._sep / 2.0
         right_mps = vx + wz * self._sep / 2.0
@@ -124,6 +133,12 @@ class MotorControlNode(Node):
     def _watchdog_cb(self):
         if time.monotonic() - self._last_cmd_time > self._timeout:
             self._serial_write('C,0.0000,0.0000\n')
+
+    def _reset_odom_cb(self, _req, response):
+        self._serial_write('R\n')
+        response.success = True
+        response.message = 'Odometry reset sent to Arduino'
+        return response
 
     # ── Serial read loop (background thread) ──────────────────────────────────
 
