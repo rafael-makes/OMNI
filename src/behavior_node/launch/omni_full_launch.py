@@ -279,6 +279,14 @@ def generate_launch_description():
         }],
     )
 
+    emotive_arm_node = Node(
+        package='emotive_arm_node',
+        executable='emotive_arm_node',
+        name='emotive_arm_node',
+        output='screen',
+        emulate_tty=True,
+    )
+
     # ── SLAM ───────────────────────────────────────────────────────────────────
     # Delegates entirely to slam_launch.py, which:
     #   - Starts async_slam_toolbox_node as a LifecycleNode
@@ -383,6 +391,7 @@ def generate_launch_description():
         eye_node,
         servo_node,
         chest_node,
+        emotive_arm_node,
         # SLAM (configure@3s, activate@8s — internal timers)
         slam_include,
         # Nav2 (t=12s — waits for SLAM to be active)
