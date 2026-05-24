@@ -40,11 +40,13 @@ import yaml
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import QoSPresetProfiles
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Float32MultiArray, String
+from vision_msgs.msg import Detection2DArray
 
 from behavior_node.audio_handler import AudioHandler
 from behavior_node.function_handlers import FunctionHandlers, VALID_STATES
@@ -69,6 +71,7 @@ class BehaviorNode(Node):
         self.declare_parameter('wake_word_startup_suppress',   1.5)
         self.declare_parameter('conversation_timeout', 30.0)
         self.declare_parameter('idle_return_timeout', 30.0)
+        self.declare_parameter('presence_timeout',    10.0)
         self.declare_parameter('mic_device_index',    0)
         self.declare_parameter('speaker_device_index', 0)
         self.declare_parameter('tcp_mic_port',        0)
@@ -82,7 +85,8 @@ class BehaviorNode(Node):
         mic_dev         = self.get_parameter('mic_device_index').value
         spk_dev         = self.get_parameter('speaker_device_index').value
         tcp_mic_port    = self.get_parameter('tcp_mic_port').value
-        self._conv_timeout = self.get_parameter('conversation_timeout').value
+        self._conv_timeout     = self.get_parameter('conversation_timeout').value
+        self._presence_timeout = self.get_parameter('presence_timeout').value
 
         # ── Gemini API key ─────────────────────────────────────────────────────
         # Loaded from environment — never hardcoded. Set in ~/.bashrc:
@@ -100,7 +104,8 @@ class BehaviorNode(Node):
         config        = self._load_config(config_path)
         omni_cfg      = config.get('omni', {})
         system_prompt = omni_cfg.get('system_prompt', '')
-        self._locations = omni_cfg.get('locations', {})   # used by navigate_to()
+        self._locations  = omni_cfg.get('locations', {})   # used by navigate_to()
+        self._config_path = config_path                    # used by save_location()
 
         if not system_prompt:
             self.get_logger().warn(
@@ -130,6 +135,17 @@ class BehaviorNode(Node):
         # CPython's GIL makes float assignment atomic, so no lock needed here.
         self._last_activity_time = time.monotonic()
 
+        # ── Presence tracking ──────────────────────────────────────────────────
+        # _last_person_seen: monotonic timestamp of the most recent camera frame
+        #   containing a person. Initialized to now so the first presence_timeout
+        #   window starts at boot, not at time zero.
+        # _presence_armed: True when the wake word detector should be running.
+        #   Both written only under CPython's GIL (atomic assignment) from the
+        #   ROS2 executor thread and from _set_state() — same pattern as
+        #   _last_activity_time.
+        self._last_person_seen = time.monotonic()
+        self._presence_armed   = True
+
         # ── Nav2 action client ─────────────────────────────────────────────────
         # Used by function_handlers._navigate_to() to send goals to bt_navigator.
         # _current_goal_handle is set in _nav_goal_response_callback() and cleared
@@ -150,6 +166,11 @@ class BehaviorNode(Node):
         self.create_subscription(String,       '/map/location',   self._on_map_location,  10)
         self.create_subscription(String,       '/motor_status',   self._on_motor_status,  10)
         self.create_subscription(String,       '/wifi_config',    self._on_wifi_config,   10)
+        # camera_node publishes with BEST_EFFORT sensor QoS — subscriber must match
+        _sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
+        self.create_subscription(
+            Detection2DArray, '/camera/detections', self._on_detections, _sensor_qos
+        )
 
         # ── Timers ─────────────────────────────────────────────────────────────
         # 10Hz state publisher — fast enough that any node coming online quickly
@@ -157,6 +178,9 @@ class BehaviorNode(Node):
         self.create_timer(0.1, self._publish_state)
         # Check conversation timeout every 5 seconds. Fine-grained enough at 30s timeout.
         self.create_timer(5.0, self._check_conversation_timeout)
+        # Check presence timeout every 1 second. Gives ~1s re-arm latency when a
+        # person reappears, which is imperceptible in normal use.
+        self.create_timer(1.0, self._check_presence_timeout)
 
         # ── Audio handler ──────────────────────────────────────────────────────
         self._audio = AudioHandler(
@@ -241,6 +265,11 @@ class BehaviorNode(Node):
         # and gets ALSA error -9985 (Device unavailable).
         if new_state == 'IDLE':
             self._last_activity_time = time.monotonic()
+            # Reset presence state so the wake word detector always runs for a
+            # full presence_timeout window after returning to IDLE, regardless of
+            # how long the robot was away from this state.
+            self._last_person_seen = time.monotonic()
+            self._presence_armed   = True
             self._audio.stop_capture()
             time.sleep(0.1)
             self._wake.start()
@@ -377,6 +406,57 @@ class BehaviorNode(Node):
     def _on_wifi_config(self, msg: String):
         # Configuration updates from chest_node — log only, no behavior yet
         self.get_logger().info(f'WiFi config update received: {msg.data}')
+
+    def _on_detections(self, msg: Detection2DArray):
+        """
+        Update presence timestamp whenever a person appears in camera frame.
+        Intentionally lightweight — all arm/disarm decisions happen in the
+        _check_presence_timeout timer so this callback never sleeps.
+        """
+        if any(
+            result.hypothesis.class_id.lower() == 'person'
+            for det in msg.detections
+            for result in det.results
+        ):
+            self._last_person_seen = time.monotonic()
+
+    def _check_presence_timeout(self):
+        """
+        1Hz timer — manages wake word arm/disarm based on person presence.
+        Only acts in IDLE; never interrupts an active conversation or navigation.
+
+        Armed → disarmed: no person detected for presence_timeout seconds.
+        Disarmed → armed: person seen more recently than presence_timeout ago.
+
+        The 200ms sleep before _wake.start() in the re-arm path gives the
+        previously stopped detector thread time to fully release the ALSA device
+        (thread exits within one 80ms chunk after _running is set False).
+        """
+        with self._state_lock:
+            state = self._current_state
+        if state != 'IDLE':
+            return
+
+        elapsed        = time.monotonic() - self._last_person_seen
+        person_present = elapsed < self._presence_timeout
+
+        if person_present and not self._presence_armed:
+            self.get_logger().info(
+                f'Person detected — re-arming wake word detector '
+                f'({elapsed:.1f}s since last detection)'
+            )
+            self._presence_armed = True
+            time.sleep(0.2)
+            self._wake.start()
+
+        elif not person_present and self._presence_armed:
+            self.get_logger().info(
+                f'No person detected for {elapsed:.1f}s — '
+                f'disarming wake word detector '
+                f'(presence_timeout={self._presence_timeout}s)'
+            )
+            self._presence_armed = False
+            self._wake.stop()
 
     # ── Nav2 action callbacks ──────────────────────────────────────────────────
 

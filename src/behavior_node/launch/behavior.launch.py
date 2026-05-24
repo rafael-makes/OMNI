@@ -77,6 +77,11 @@ def generate_launch_description():
         default_value='0',
         description='TCP port to accept stereo PCM from Pi Zero (0 = use local mic)',
     )
+    presence_timeout_arg = DeclareLaunchArgument(
+        'presence_timeout',
+        default_value='10.0',
+        description='Seconds without a person detection before disarming the wake word detector',
+    )
 
     # ── Node ──────────────────────────────────────────────────────────────────
     behavior_node = Node(
@@ -95,6 +100,7 @@ def generate_launch_description():
             'mic_device_index':      LaunchConfiguration('mic_device_index'),
             'speaker_device_index':  LaunchConfiguration('speaker_device_index'),
             'tcp_mic_port':          LaunchConfiguration('tcp_mic_port'),
+            'presence_timeout':      LaunchConfiguration('presence_timeout'),
         }],
         # GEMINI_API_KEY must be set in the environment before launching.
         # The node logs a clear error if it is missing.
@@ -112,5 +118,6 @@ def generate_launch_description():
         mic_device_arg,
         speaker_device_arg,
         tcp_mic_port_arg,
+        presence_timeout_arg,
         behavior_node,
     ])

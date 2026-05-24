@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'motor_control_node'
+package_name = 'head_tracking_node'
 
 setup(
     name=package_name,
@@ -14,12 +14,11 @@ setup(
     zip_safe=True,
     maintainer='pi',
     maintainer_email='omni@local',
-    description='OMNI differential drive — Arduino serial bridge, odometry, TF',
+    description='OMNI pan/tilt head tracking — P controller driven by /camera/detections',
     license='MIT',
     entry_points={
         'console_scripts': [
-            'motor_control_node = motor_control_node.motor_control_node:main',
-            'ps4_teleop = motor_control_node.ps4_teleop:main',
+            'head_tracking_node = head_tracking_node.head_tracking_node:main',
         ],
     },
 )

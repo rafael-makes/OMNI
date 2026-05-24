@@ -34,7 +34,7 @@ class MotorControlNode(Node):
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter('serial_port',     '/dev/arduino')
         self.declare_parameter('baud_rate',       115200)
-        self.declare_parameter('wheel_separation', 0.300)
+        self.declare_parameter('wheel_separation', 0.305)
         self.declare_parameter('wheel_radius',     0.050)
         self.declare_parameter('cmd_vel_timeout',  0.5)
         self.declare_parameter('odom_frame',         'odom')

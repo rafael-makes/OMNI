@@ -49,6 +49,7 @@ static const float KP = 1.0f;
 static const float KI = 0.5f;
 static const float KD = 0.0f;
 static const float INTEGRAL_MAX = 40.0f;
+static const float VEL_ALPHA    = 0.25f;
 
 // ── Motor PWM parameters ──────────────────────────────────────────────────────
 // MIN_PWM: below this the worm gears stall — output 0 (deadband), not MIN_PWM
@@ -76,6 +77,10 @@ struct WheelState {
 
 WheelState left_wheel  = {};
 WheelState right_wheel = {};
+
+// Cumulative encoder snapshots for odometry delta
+float prev_left_cumulative_rad  = 0.0f;
+float prev_right_cumulative_rad = 0.0f;
 
 // Odometry pose
 float odom_x   = 0.0f;
@@ -191,6 +196,35 @@ void setup() {
     last_pid_ms = now;
     last_odom_ms = now;
     last_cmd_ms  = now;
+
+    mux_select(MUX_LEFT);
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(0x0B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AS5600_ADDR, (uint8_t)1);
+    uint8_t status_l = Wire.read();
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(0x1A);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AS5600_ADDR, (uint8_t)1);
+    uint8_t agc_l = Wire.read();
+    Serial.print("LEFT  status: 0x"); Serial.print(status_l, HEX);
+    Serial.print("  AGC: "); Serial.println(agc_l);
+
+    mux_select(MUX_RIGHT);
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(0x0B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AS5600_ADDR, (uint8_t)1);
+    uint8_t status_r = Wire.read();
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(0x1A);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AS5600_ADDR, (uint8_t)1);
+    uint8_t agc_r = Wire.read();
+    Serial.print("RIGHT status: 0x"); Serial.print(status_r, HEX);
+    Serial.print("  AGC: "); Serial.println(agc_r);
+    mux_select(0x00);
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -233,8 +267,10 @@ void loop() {
             float l_rad = L_ENC_DIR * l_delta * (2.0f * M_PI / 4096.0f);
             left_wheel.cumulative_rad += l_rad;
             float l_vel = l_rad / dt;
-            // Reject implausible spikes (> 30 rad/s ≈ 2 m/s on these wheels)
-            if (fabs(l_vel) < 30.0f) left_wheel.actual_rads = l_vel;
+            // Reject implausible spikes (> 50 rad/s ≈ 2.5 m/s on these wheels)
+            if (fabs(l_vel) < 50.0f) {
+                left_wheel.actual_rads = (VEL_ALPHA * l_vel) + ((1.0f - VEL_ALPHA) * left_wheel.actual_rads);
+            }
         }
 
         if (ra != 0xFFFF) {
@@ -243,7 +279,9 @@ void loop() {
             float r_rad = R_ENC_DIR * r_delta * (2.0f * M_PI / 4096.0f);
             right_wheel.cumulative_rad += r_rad;
             float r_vel = r_rad / dt;
-            if (fabs(r_vel) < 30.0f) right_wheel.actual_rads = r_vel;
+            if (fabs(r_vel) < 50.0f) {
+                right_wheel.actual_rads = (VEL_ALPHA * r_vel) + ((1.0f - VEL_ALPHA) * right_wheel.actual_rads);
+            }
         }
 
         float l_out = pid_update(left_wheel, dt);
@@ -258,8 +296,14 @@ void loop() {
         float dt = (now - last_odom_ms) / 1000.0f;
         last_odom_ms = now;
 
-        float dl = left_wheel.actual_rads  * WHEEL_RADIUS_M * dt;
-        float dr = right_wheel.actual_rads * WHEEL_RADIUS_M * dt;
+        float current_left_rad  = left_wheel.cumulative_rad;
+        float current_right_rad = right_wheel.cumulative_rad;
+        float d_rad_l = current_left_rad  - prev_left_cumulative_rad;
+        float d_rad_r = current_right_rad - prev_right_cumulative_rad;
+        prev_left_cumulative_rad  = current_left_rad;
+        prev_right_cumulative_rad = current_right_rad;
+        float dl = d_rad_l * WHEEL_RADIUS_M;
+        float dr = d_rad_r * WHEEL_RADIUS_M;
 
         float ds  = (dl + dr) / 2.0f;
         float dth = (dr - dl) / WHEEL_SEP_M;

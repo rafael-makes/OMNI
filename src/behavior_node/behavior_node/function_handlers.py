@@ -19,8 +19,12 @@ are thread-safe — they schedule work on the ROS2 executor without blocking.
 """
 
 import math
+import os
+import tempfile
+import threading
 
-from geometry_msgs.msg import PoseStamped
+import yaml
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from google.genai import types as genai_types
 from nav2_msgs.action import NavigateToPose
 
@@ -113,6 +117,26 @@ OMNI_TOOLS = [
                 ),
             ),
 
+            genai_types.FunctionDeclaration(
+                name='save_location',
+                description=(
+                    'Save the current map position as a named location. '
+                    'Call this when the user asks OMNI to remember or save where it is, '
+                    'or to teach OMNI a named place. '
+                    'Requires Nav2 and AMCL localisation to be running.'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        'location_name': genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description='The name to assign to this location (e.g. "kitchen", "charging dock").',
+                        )
+                    },
+                    required=['location_name'],
+                ),
+            ),
+
         ]
     )
 ]
@@ -142,6 +166,7 @@ class FunctionHandlers:
             'stop_navigation':  self._stop_navigation,
             'report_status':    self._report_status,
             'explore_area':     self._explore_area,
+            'save_location':    self._save_location,
         }
         handler = handlers.get(function_name)
         if handler is None:
@@ -312,4 +337,131 @@ class FunctionHandlers:
             'mapping subroutines are not yet fully operational. I am setting my state to '
             'EXPLORING and standing by, but I shall require a navigation upgrade before I '
             'can truly venture forth independently. How terribly inconvenient.'
+        )
+
+    def _save_location(self, args: dict) -> str:
+        location_name = args.get('location_name', '').lower().strip()
+        if not location_name:
+            return (
+                "I'm afraid I require a name for the location. "
+                "Please provide a name and try again."
+            )
+
+        config_path = getattr(self._node, '_config_path', None)
+        if not config_path:
+            return (
+                "I'm afraid I cannot determine my configuration file path — "
+                "this is most irregular. The location cannot be saved."
+            )
+
+        # Create a one-shot subscription to /amcl_pose and wait up to 3 seconds.
+        # The callback runs on the ROS2 executor thread; we block here (thread-pool
+        # executor) on a threading.Event so the two threads coordinate safely.
+        pose_event  = threading.Event()
+        holder      = [None]  # mutable container so the nested callback can write to it
+
+        def _pose_cb(msg):
+            holder[0] = msg
+            pose_event.set()
+
+        sub = self._node.create_subscription(
+            PoseWithCovarianceStamped,
+            '/amcl_pose',
+            _pose_cb,
+            1,
+        )
+        try:
+            received = pose_event.wait(timeout=3.0)
+        finally:
+            self._node.destroy_subscription(sub)
+
+        if not received:
+            self._node.get_logger().warn(
+                'save_location: timed out waiting for /amcl_pose — '
+                'is Nav2 running and localised?'
+            )
+            return (
+                "I'm afraid my localisation system does not appear to be running — "
+                "no pose was received on /amcl_pose after three seconds. "
+                "Nav2 must be active and fully localised before I can save a location."
+            )
+
+        pose_msg = holder[0]
+
+        # pose.covariance is a flat 36-element row-major 6×6 matrix.
+        # Diagonal indices: x=0, y=7, yaw=35.  Threshold of 0.5 m²/rad².
+        cov     = pose_msg.pose.covariance
+        cov_x   = cov[0]
+        cov_y   = cov[7]
+        cov_yaw = cov[35]
+        _COV_THRESHOLD = 0.5
+        if max(cov_x, cov_y, cov_yaw) >= _COV_THRESHOLD:
+            self._node.get_logger().warn(
+                f'save_location: covariance too high — '
+                f'cov_x={cov_x:.3f}, cov_y={cov_y:.3f}, cov_yaw={cov_yaw:.3f}'
+            )
+            return (
+                "I must warn you — my localisation is currently rather uncertain, "
+                "with a covariance I find most alarming. "
+                "I cannot, in good conscience, save an unreliable position. "
+                "Please allow the localisation to settle and try again."
+            )
+
+        # Extract x, y, and yaw from the pose.
+        p       = pose_msg.pose.pose.position
+        ori     = pose_msg.pose.pose.orientation
+        x       = p.x
+        y       = p.y
+        yaw_rad = 2.0 * math.atan2(ori.z, ori.w)
+        yaw_deg = round(math.degrees(yaw_rad), 1)
+
+        # Load current config, inject the new location, write atomically.
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self._node.get_logger().error(f'save_location: failed to read config: {exc}')
+            return (
+                "I'm afraid there was an error reading my configuration file. "
+                "The location has not been saved — most unfortunate."
+            )
+
+        config.setdefault('omni', {}).setdefault('locations', {})
+        config['omni']['locations'][location_name] = [
+            round(x, 3),
+            round(y, 3),
+            yaw_deg,
+        ]
+
+        # Atomic write: write to a temp file in the same directory, then rename.
+        # os.replace() is atomic on Linux — a crash mid-write cannot corrupt the config.
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                dir=config_dir,
+                delete=False,
+                suffix='.yaml.tmp',
+            ) as tmp:
+                yaml.dump(config, tmp, default_flow_style=False, allow_unicode=True)
+                tmp_path = tmp.name
+            os.replace(tmp_path, config_path)
+        except Exception as exc:
+            self._node.get_logger().error(f'save_location: failed to write config: {exc}')
+            return (
+                "I'm afraid there was an error writing my configuration file. "
+                "The location has not been saved."
+            )
+
+        # Hot-reload so navigate_to() can use the new location immediately.
+        self._node._locations = config['omni']['locations']
+
+        self._node.get_logger().info(
+            f"Saved location '{location_name}': "
+            f"x={x:.3f}, y={y:.3f}, yaw={yaw_deg}°"
+        )
+        return (
+            f"Splendid! I have recorded '{location_name}' at "
+            f"x={x:.2f}, y={y:.2f}, heading {yaw_deg:.0f} degrees — "
+            f"a most satisfactory position, I must say."
         )

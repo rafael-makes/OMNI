@@ -1,18 +1,14 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>behavior_node</name>
+  <name>head_tracking_node</name>
   <version>0.1.0</version>
-  <description>OMNI central brain — state machine, Gemini Live, wake word</description>
+  <description>OMNI pan/tilt head tracking — P controller driven by /camera/detections</description>
   <maintainer email="omni@local">pi</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
-  <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>nav2_msgs</depend>
-  <depend>nav_msgs</depend>
   <depend>vision_msgs</depend>
 
   <buildtool_depend>ament_python</buildtool_depend>
