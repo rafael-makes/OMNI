@@ -3,9 +3,11 @@
 ps4_teleop.py — PS4 controller teleoperation node for OMNI robot.
 
 Controls:
-  Left  stick vertical   → linear.x  (forward / back)
-  Right stick horizontal → angular.z (turn left / right)
+  D-pad up / down        → linear.x  (forward / back)
+  D-pad left / right     → angular.z (turn left / right)
+  Diagonal d-pad         → move + turn simultaneously
   L2 trigger             → deadman switch (must be held to move)
+  R1                     → boost (2× speed while held)
 
 Publishes geometry_msgs/Twist to /cmd_vel at 10 Hz.
 """
@@ -21,30 +23,22 @@ except ImportError:
     print("ERROR: pygame is not installed.  Run:  pip3 install pygame")
     sys.exit(1)
 
-# ── Axis indices (pygame / ds4 via jstest) ────────────────────────────────────
-AXIS_LINEAR  = 1   # left  stick up/down  — forward/back
-AXIS_ANGULAR = 0   # left  stick left/right — turn
-AXIS_L2      = 2   # L2 trigger: rests at -32767, fully pressed = +32767
+# ── Axis / button indices (pygame DS4 Linux driver) ───────────────────────────
+AXIS_L2      = 2   # L2 trigger: rests at -1.0, fully pressed = +1.0
+BTN_R1       = 5   # R1 shoulder button — boost
 
-# ── Speed limits (conservative for first drive) ───────────────────────────────
-MAX_LINEAR_MPS  = 0.3   # m/s
-MAX_ANGULAR_RPS = 0.8   # rad/s
+# ── Speed limits ──────────────────────────────────────────────────────────────
+MAX_LINEAR_MPS  = 0.3   # m/s   normal
+MAX_ANGULAR_RPS = 0.8   # rad/s normal
+BOOST_FACTOR    = 2.0   # multiplier when R1 held (capped by motor_control_node)
 
 PUBLISH_HZ = 10
-
-
-def apply_deadband(value, deadband=0.08):
-    if abs(value) < deadband:
-        return 0.0
-    return (value - deadband * (1 if value > 0 else -1)) / (1.0 - deadband)
 
 
 class PS4Teleop(Node):
 
     def __init__(self):
         super().__init__('ps4_teleop')
-
-        self.declare_parameter('deadband', 0.08)
 
         self._pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._timer = self.create_timer(1.0 / PUBLISH_HZ, self._timer_cb)
@@ -53,18 +47,18 @@ class PS4Teleop(Node):
         self._deadman_was_held = False
         self._init_pygame()
 
-        db = self.get_parameter('deadband').value
         self.get_logger().info(
             "\n"
             "╔══════════════════════════════════════════╗\n"
             "║        OMNI PS4 Teleop — ready           ║\n"
             "╠══════════════════════════════════════════╣\n"
             "║  L2 (hold)       → deadman switch        ║\n"
-            "║  Left  stick ↕   → forward / back        ║\n"
-            "║  Right stick ↔   → turn left / right     ║\n"
+            "║  D-pad ↕         → forward / back        ║\n"
+            "║  D-pad ↔         → turn left / right     ║\n"
+            "║  D-pad diagonal  → arc (move + turn)     ║\n"
+            "║  R1 (hold)       → 2× speed boost        ║\n"
             f"║  Max linear  : {MAX_LINEAR_MPS:.1f} m/s               ║\n"
             f"║  Max angular : {MAX_ANGULAR_RPS:.1f} rad/s             ║\n"
-            f"║  Stick deadband: {db:.2f}                    ║\n"
             "║  Ctrl-C          → exit                  ║\n"
             "╚══════════════════════════════════════════╝"
         )
@@ -99,8 +93,20 @@ class PS4Teleop(Node):
             return max(-1.0, min(1.0, self._joy.get_axis(index)))
         return 0.0
 
+    def _get_button(self, index: int) -> bool:
+        """Return button state, False if button index missing."""
+        if index < self._joy.get_numbuttons():
+            return bool(self._joy.get_button(index))
+        return False
+
+    def _get_hat(self) -> tuple:
+        """Return d-pad hat (x, y). x: -1=left/+1=right. y: +1=up/-1=down."""
+        if self._joy.get_numhats() > 0:
+            return self._joy.get_hat(0)
+        return (0, 0)
+
     def _deadman_held(self) -> bool:
-        """L2 axis: rests at -1.0 (raw -32767), active when > 0."""
+        """L2 axis: rests at -1.0, active when pressed past centre (> 0)."""
         return self._get_axis(AXIS_L2) > 0.0
 
     def _publish_stop(self):
@@ -109,21 +115,20 @@ class PS4Teleop(Node):
     # ── 10 Hz publish callback ────────────────────────────────────────────────
 
     def _timer_cb(self):
-        # Pump pygame events so axis/button state stays current
+        # Pump pygame events so hat/button state stays current
         pygame.event.pump()
 
         deadman = self._deadman_held()
 
         if deadman:
-            db = self.get_parameter('deadband').value
-            # Left stick vertical: pygame up = negative → negate for ROS forward+
-            raw_linear  = apply_deadband(-self._get_axis(AXIS_LINEAR),  db)
-            # Left stick horizontal: pygame right = positive → negate for ROS left+
-            raw_angular = apply_deadband(-self._get_axis(AXIS_ANGULAR), db)
+            hat_x, hat_y = self._get_hat()
+            boost = BOOST_FACTOR if self._get_button(BTN_R1) else 1.0
 
+            # hat_y: +1=up → forward (+linear.x)
+            # hat_x: +1=right → right turn (-angular.z, ROS CCW-positive)
             msg = Twist()
-            msg.linear.x  = raw_linear  * MAX_LINEAR_MPS
-            msg.angular.z = raw_angular * MAX_ANGULAR_RPS
+            msg.linear.x  = float(hat_y)  * MAX_LINEAR_MPS  * boost
+            msg.angular.z = float(-hat_x) * MAX_ANGULAR_RPS * boost
             self._pub.publish(msg)
             self._deadman_was_held = True
 

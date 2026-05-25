@@ -8,7 +8,7 @@ Starts:
 
 Physical offsets (measure on hardware and update if needed):
   LiDAR sits on top of the carbon-fibre mast through the head.
-  z=0.38 m is an estimate — measure the actual height from floor to LiDAR scan plane.
+  z=0.825 m measured — floor to LiDAR scan plane.
   X/Y offsets are 0 — LiDAR is centred on the robot's vertical axis.
 """
 
@@ -39,13 +39,13 @@ def generate_launch_description():
     # ── LiDAR static TF ──────────────────────────────────────────────────────
     # LD19 is on top of the mast, centred over the robot.
     # frame_id=base_link  child_frame_id=lidar_link  (matches lidar_node default)
-    # x=0  y=0  z=0.38m  roll=0  pitch=0  yaw=0
-    # Update z= once you measure the actual scan plane height.
+    # x=0  y=0  z=0.825m  roll=0  pitch=0  yaw=0
+    # Measured: lidar scan plane is 825mm above the floor.
     lidar_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_lidar',
-        arguments=['0', '0', '0.38', '0', '0', '0',
+        arguments=['0', '0', '0.825', '0', '0', '0',
                    'base_link', 'lidar_link'],
         output='screen',
     )
