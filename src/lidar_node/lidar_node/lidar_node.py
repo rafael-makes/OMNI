@@ -68,21 +68,26 @@ class LidarNode(Node):
     def __init__(self):
         super().__init__('lidar_node')
 
-        self.declare_parameter('serial_port', '/dev/lidar')
-        self.declare_parameter('baud_rate',   230400)
-        self.declare_parameter('frame_id',    'lidar_link')
-        self.declare_parameter('range_min',   0.02)
-        self.declare_parameter('range_max',   12.0)
-        self.declare_parameter('scan_hz',     10.0)
-        self.declare_parameter('num_bins',    360)
+        self.declare_parameter('serial_port',  '/dev/lidar')
+        self.declare_parameter('baud_rate',    230400)
+        self.declare_parameter('frame_id',     'lidar_link')
+        self.declare_parameter('range_min',    0.02)
+        self.declare_parameter('range_max',    12.0)
+        self.declare_parameter('scan_hz',      10.0)
+        self.declare_parameter('num_bins',     360)
+        # LD19 motor spins clockwise (raw angles increase CW from above).
+        # ROS LaserScan convention is CCW-positive, so we mirror the angles
+        # to avoid a left-right flipped map. Set False if using a CCW lidar.
+        self.declare_parameter('reverse_scan', True)
 
-        self._port      = self.get_parameter('serial_port').value
-        self._baud      = self.get_parameter('baud_rate').value
-        self._frame_id  = self.get_parameter('frame_id').value
-        self._range_min = self.get_parameter('range_min').value
-        self._range_max = self.get_parameter('range_max').value
-        self._scan_hz   = self.get_parameter('scan_hz').value
-        self._num_bins  = self.get_parameter('num_bins').value
+        self._port         = self.get_parameter('serial_port').value
+        self._baud         = self.get_parameter('baud_rate').value
+        self._frame_id     = self.get_parameter('frame_id').value
+        self._range_min    = self.get_parameter('range_min').value
+        self._range_max    = self.get_parameter('range_max').value
+        self._scan_hz      = self.get_parameter('scan_hz').value
+        self._num_bins     = self.get_parameter('num_bins').value
+        self._reverse_scan = self.get_parameter('reverse_scan').value
 
         sensor_qos = QoSProfile(
             depth=10,
@@ -252,7 +257,9 @@ class LidarNode(Node):
             dist_m = dist_mm / 1000.0
             if dist_m < self._range_min or dist_m > self._range_max:
                 continue
-            bin_idx = int(angle_deg / angle_inc) % self._num_bins
+            # Mirror CW raw angles to CCW ROS convention when reverse_scan=True
+            mapped_deg = (360.0 - angle_deg) % 360.0 if self._reverse_scan else angle_deg
+            bin_idx = int(mapped_deg / angle_inc) % self._num_bins
             if dist_m < ranges_m[bin_idx]:
                 ranges_m[bin_idx]    = dist_m
                 intensities[bin_idx] = float(intensity)

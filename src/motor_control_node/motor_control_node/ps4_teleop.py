@@ -28,9 +28,19 @@ AXIS_L2      = 2   # L2 trigger: rests at -1.0, fully pressed = +1.0
 BTN_R1       = 5   # R1 shoulder button — boost
 
 # ── Speed limits ──────────────────────────────────────────────────────────────
-MAX_LINEAR_MPS  = 0.3   # m/s   normal
-MAX_ANGULAR_RPS = 0.8   # rad/s normal
-BOOST_FACTOR    = 2.0   # multiplier when R1 held (capped by motor_control_node)
+# MIN_PWM=85 on firmware means minimum driveable speeds are:
+#   linear  ≥ 0.35 m/s  (85/14.0 FF_GAIN × 0.053m wheel radius)
+#   angular ≥ 2.1 rad/s (each wheel needs ≥ 0.32 m/s tangential)
+MAX_LINEAR_MPS  = 0.4   # m/s   — comfortably above 0.35 m/s deadzone
+MAX_ANGULAR_RPS = 2.5   # rad/s — comfortably above 2.1 rad/s deadzone
+BOOST_FACTOR    = 1.5   # multiplier when R1 held
+
+# ── Velocity ramp ─────────────────────────────────────────────────────────────
+# Smooths direction changes — prevents jerk when reversing from stop.
+# The ramp eases commands through zero so the firmware PID and motors
+# transition gradually rather than snapping from one direction to the other.
+ACCEL_LINEAR_MPS2  = 2.0   # m/s²   — 0→0.4 m/s in 2 ticks (0.2 s)
+ACCEL_ANGULAR_RPS2 = 10.0  # rad/s² — 0→2.5 rad/s in ~1 tick (0.1 s)
 
 PUBLISH_HZ = 10
 
@@ -45,6 +55,8 @@ class PS4Teleop(Node):
 
         self._joy = None
         self._deadman_was_held = False
+        self._vx = 0.0   # ramped linear velocity currently being commanded
+        self._wz = 0.0   # ramped angular velocity currently being commanded
         self._init_pygame()
 
         self.get_logger().info(
@@ -58,7 +70,7 @@ class PS4Teleop(Node):
             "║  D-pad diagonal  → arc (move + turn)     ║\n"
             "║  R1 (hold)       → 2× speed boost        ║\n"
             f"║  Max linear  : {MAX_LINEAR_MPS:.1f} m/s               ║\n"
-            f"║  Max angular : {MAX_ANGULAR_RPS:.1f} rad/s             ║\n"
+            f"║  Max angular : {MAX_ANGULAR_RPS:.1f} rad/s           ║\n"
             "║  Ctrl-C          → exit                  ║\n"
             "╚══════════════════════════════════════════╝"
         )
@@ -110,7 +122,16 @@ class PS4Teleop(Node):
         return self._get_axis(AXIS_L2) > 0.0
 
     def _publish_stop(self):
+        self._vx = 0.0
+        self._wz = 0.0
         self._pub.publish(Twist())
+
+    def _ramp(self, current: float, target: float, max_step: float) -> float:
+        """Step current toward target by at most max_step."""
+        delta = target - current
+        if abs(delta) <= max_step:
+            return target
+        return current + max_step * (1.0 if delta > 0.0 else -1.0)
 
     # ── 10 Hz publish callback ────────────────────────────────────────────────
 
@@ -126,9 +147,16 @@ class PS4Teleop(Node):
 
             # hat_y: +1=up → forward (+linear.x)
             # hat_x: +1=right → right turn (-angular.z, ROS CCW-positive)
+            target_vx = float(hat_y)  * MAX_LINEAR_MPS  * boost
+            target_wz = float(-hat_x) * MAX_ANGULAR_RPS * boost
+
+            dt = 1.0 / PUBLISH_HZ
+            self._vx = self._ramp(self._vx, target_vx, ACCEL_LINEAR_MPS2  * dt)
+            self._wz = self._ramp(self._wz, target_wz, ACCEL_ANGULAR_RPS2 * dt)
+
             msg = Twist()
-            msg.linear.x  = float(hat_y)  * MAX_LINEAR_MPS  * boost
-            msg.angular.z = float(-hat_x) * MAX_ANGULAR_RPS * boost
+            msg.linear.x  = self._vx
+            msg.angular.z = self._wz
             self._pub.publish(msg)
             self._deadman_was_held = True
 
