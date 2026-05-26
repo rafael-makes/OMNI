@@ -74,3 +74,5 @@ slam_toolbox:
 
     # ── Pose graph serialization ──────────────────────────────────────────────
     paused_new_measurements: false
+    # Auto-serialize pose graph every 30s so a power cut doesn't lose the map
+    map_save_period: 30
