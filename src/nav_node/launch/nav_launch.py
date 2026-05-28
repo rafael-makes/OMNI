@@ -5,11 +5,7 @@ Brings up the full Nav2 stack configured for OMNI's hardware.
 Run AFTER slam_node is already running (it provides /map and the
 map→odom→base_link TF tree that Nav2 depends on).
 
-CRITICAL: controller_server is remapped so Nav2 publishes velocity
-commands to /cmd_vel_raw instead of /cmd_vel. This means all motion
-passes through safety_node before reaching the motors:
-
-  Nav2 → /cmd_vel_raw → safety_node → /cmd_vel → motor_control_node
+Nav2 publishes velocity commands directly to /cmd_vel → motor_control_node.
 
 Usage:
   ros2 launch nav_node nav_launch.py
@@ -18,7 +14,7 @@ Usage:
 Nodes started by this launch file:
   /bt_navigator         — behavior tree executor, accepts goal poses
   /planner_server       — global path planner (NavFn A*)
-  /controller_server    — local path follower (DWB), publishes /cmd_vel_raw
+  /controller_server    — local path follower (DWB), publishes /cmd_vel
   /behavior_server      — recovery behaviors (spin, backup, wait)
   /lifecycle_manager_navigation — manages all of the above
 """
@@ -88,12 +84,8 @@ def generate_launch_description():
         name='controller_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        # *** CRITICAL REMAPPING ***
-        # controller_server follows the global path and publishes velocity
-        # commands. By default it publishes to /cmd_vel. We remap it to
-        # /cmd_vel_raw so safety_node can intercept it before it reaches
-        # motor_control_node. Without this, Nav2 would bypass safety_node.
-        remappings=[('/cmd_vel', '/cmd_vel_raw')],
+        # controller_server publishes velocity directly to /cmd_vel
+        # → motor_control_node. No safety relay needed at this stage.
     )
 
     behavior_server = Node(
@@ -102,10 +94,7 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        # behavior_server runs recovery behaviors (spin, backup, wait).
-        # Backup moves the robot in reverse — it also publishes velocity.
-        # Remap its cmd_vel output too so backup goes through safety_node.
-        remappings=[('/cmd_vel', '/cmd_vel_raw')],
+        # behavior_server recovery behaviors also publish to /cmd_vel directly.
     )
 
     smoother_server = Node(
