@@ -453,12 +453,13 @@ global_costmap:
         # cost_scaling_factor: how quickly the inflation cost falls off with
         # distance from the obstacle. Higher = steeper dropoff = tighter paths.
         # 3.0 gives a gentle gradient — planner will prefer center of hallways.
-        cost_scaling_factor: 3.0
+        cost_scaling_factor: 5.0
         # inflation_radius: distance (m) to inflate obstacles.
-        # = footprint_diagonal/2 + safety buffer = 0.36m + 0.19m = 0.55m
-        # This ensures the robot's body always clears obstacles by 0.19m.
-        # Increase if OMNI clips corners; decrease if paths become too tight.
-        inflation_radius: 0.55
+        # OMNI is 0.60m wide. Typical doorways are ~0.85m wide → 0.125m
+        # clearance per side. 0.55m inflation flooded doorways completely,
+        # blocking navigation. Reduced to 0.20m so doorways stay passable.
+        # OMNI's footprint checker (not inflation) handles actual collision.
+        inflation_radius: 0.20
 
 
 # =============================================================================
@@ -528,8 +529,8 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.20
 
 
 # =============================================================================
