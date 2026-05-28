@@ -76,3 +76,16 @@ slam_toolbox:
     paused_new_measurements: false
     # Auto-serialize pose graph every 30s so a power cut doesn't lose the map
     map_save_period: 30
+
+    # AFTER MAPPING — run BOTH of these to save everything localization needs:
+    #
+    #   1. Save occupancy grid (PGM/YAML) for Nav2 map_server / visualization:
+    #      ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
+    #        "{name: {data: '/home/pi/omni_ws/maps/omni_home_map'}}"
+    #
+    #   2. Save pose graph (.posegraph + .data) for localization_slam_toolbox_node:
+    #      ros2 service call /slam_toolbox/serialize_map \
+    #        slam_toolbox/srv/SerializePoseGraph \
+    #        "{filename: '/home/pi/omni_ws/maps/omni_home_map'}"
+    #
+    #   Both are required. save_map alone is NOT enough for localization.
