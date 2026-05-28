@@ -41,8 +41,8 @@ static const float FF_GAIN_L  = 14.0f;
 static const float FF_GAIN_R  = 13.2f;
 
 // ── Encoder sign configurations ──────────────────────────────────────────────
-static const float L_ENC_DIR = -1.0f;
-static const float R_ENC_DIR =  1.0f;
+static const float L_ENC_DIR =  1.0f;   // flipped — encoder moved to wheel side
+static const float R_ENC_DIR = -1.0f;   // flipped — encoder moved to wheel side
 
 struct WheelState {
     float target_rads;
@@ -230,8 +230,8 @@ void loop() {
         float l_out = pid_update(left_wheel,  FF_GAIN_L, dt);
         float r_out = pid_update(right_wheel, FF_GAIN_R, dt);
 
-        drive_motor(L_PWM, L_DIR, l_out);
-        drive_motor(R_PWM, R_DIR, r_out);
+        drive_motor(L_PWM, L_DIR, -l_out);   // negated — new motors run opposite direction
+        drive_motor(R_PWM, R_DIR, -r_out);   // negated — new motors run opposite direction
     }
 
     // ── Displacement Odometry Engine (20 Hz) ───────────────────────────────────

@@ -20,6 +20,7 @@ setup(
         'console_scripts': [
             'motor_control_node = motor_control_node.motor_control_node:main',
             'ps4_teleop = motor_control_node.ps4_teleop:main',
+            'motor_direction_test = motor_control_node.motor_direction_test:main',
         ],
     },
 )
