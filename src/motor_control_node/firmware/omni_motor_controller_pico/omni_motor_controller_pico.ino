@@ -36,7 +36,7 @@ static const float KD = 0.0f;
 static const float INTEGRAL_MAX = 40.0f;
 static const float VEL_ALPHA    = 0.40f;   // faster tracking reduces startup integral wind-up
 
-static const int   MIN_PWM    = 50;   // 10kg high-torque motors — min driveable ~0.16 m/s
+static const int   MIN_PWM    = 35;   // 10kg high-torque motors — min driveable ~0.11 m/s, min angular ~0.75 rad/s
 static const float FF_GAIN_L  = 16.3f;   // new high-torque motors: left slightly faster, needs lower FF
 static const float FF_GAIN_R  = 16.5f;   // new high-torque motors: trimmed down from 16.8 — right ran 1% fast
 

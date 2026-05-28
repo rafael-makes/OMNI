@@ -8,9 +8,9 @@
 #   Inflation radius: 0.55m (footprint diagonal 0.36m + 0.19m safety buffer)
 #   Max linear speed: 0.3 m/s  (top-heavy — keep it slow for nav)
 #   Max angular speed: 1.2 rad/s
-#   Min driveable speeds (MIN_PWM=50, 10kg motors):
-#     linear:  ~0.16 m/s  (50/16.4 FF_GAIN × 0.053m radius)
-#     angular: ~1.07 rad/s (each wheel needs ≥ 0.16 m/s tangential)
+#   Min driveable speeds (MIN_PWM=35, 10kg motors):
+#     linear:  ~0.11 m/s  (35/16.4 FF_GAIN × 0.053m radius)
+#     angular: ~0.75 rad/s (each wheel needs ≥ 0.11 m/s tangential)
 #   DWB must not command below these floors or motors cut out.
 #   Environment: indoor home — hallways, furniture, doorways
 #
@@ -186,20 +186,21 @@ controller_server:
       min_vel_y: 0.0
 
       # max_vel_theta: maximum rotation speed (rad/s)
-      # 1.2 rad/s — above the MIN_PWM floor of ~1.07 rad/s
-      max_vel_theta: 1.2
+      # 1.5 rad/s — gives DWB a wide range (0.8→1.5) to avoid binary +/- oscillation
+      max_vel_theta: 1.5
       min_vel_theta: 0.0
 
       # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
       max_speed_xy: 0.3
 
       # min_speed_xy: minimum linear speed DWB will command (m/s)
-      # Set to MIN_PWM floor so DWB doesn't try speeds the motors can't execute
-      min_speed_xy: 0.17
+      # Set just above MIN_PWM=35 floor (~0.11 m/s) with small margin
+      min_speed_xy: 0.12
 
       # min_speed_theta: minimum rotation speed DWB will command (rad/s)
-      # Must be above MIN_PWM floor (~1.07 rad/s) or rotation stalls
-      min_speed_theta: 1.1
+      # MIN_PWM=35 angular floor ≈ 0.75 rad/s. 0.8 gives a small margin.
+      # Wide band (0.8→1.5) prevents DWB binary oscillation seen with 1.1→1.2.
+      min_speed_theta: 0.8
 
       # ── Acceleration limits ───────────────────────────────────────────────
       # OMNI is top-heavy — gentle acceleration prevents tipping.
@@ -264,13 +265,17 @@ controller_server:
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
 
       # RotateToGoal: when close to the goal, rotate in place to face it
-      # before declaring arrival. Weight 32 = high priority.
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
+      # before declaring arrival. Reduced scale (32→16) and slowing_factor
+      # (5→2) — high values caused aggressive spin-to-face that triggered
+      # oscillation. 16/2 is still enough to orient without spinning wildly.
+      RotateToGoal.scale: 16.0
+      RotateToGoal.slowing_factor: 2.0
       RotateToGoal.lookahead_time: -1.0
 
       # Oscillation: penalizes switching directions repeatedly (getting stuck)
-      Oscillation.scale: 1.0
+      # Raised 1.0→5.0 — stronger penalty discourages the +/- rotation
+      # switching that was observed when DWB had a narrow angular velocity band.
+      Oscillation.scale: 5.0
 
       # ObstacleFootprint: uses the full rectangular footprint to check if a
       # trajectory passes through any occupied costmap cells.
@@ -338,7 +343,7 @@ behavior_server:
     # Backup parameters: OMNI moves backward a short distance
     # backup_dist: how far to back up (meters)
     backup_dist: 0.15
-    # backup_speed: must be above MIN_PWM floor (~0.16 m/s) or motors cut out
+    # backup_speed: must be above MIN_PWM=35 floor (~0.11 m/s). 0.18 gives margin.
     backup_speed: 0.18
 
     # transform_tolerance: max TF age to accept during recovery

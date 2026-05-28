@@ -28,11 +28,11 @@ AXIS_L2      = 2   # L2 trigger: rests at -1.0, fully pressed = +1.0
 BTN_R1       = 5   # R1 shoulder button — boost
 
 # ── Speed limits ──────────────────────────────────────────────────────────────
-# 10kg high-torque motors with MIN_PWM=50:
-#   min linear  ≈ 0.16 m/s  (50/16.4 FF_GAIN × 0.053m wheel radius)
-#   min angular ≈ 1.05 rad/s
+# 10kg high-torque motors with MIN_PWM=35:
+#   min linear  ≈ 0.11 m/s  (35/16.4 FF_GAIN × 0.053m wheel radius)
+#   min angular ≈ 0.75 rad/s
 MAX_LINEAR_MPS  = 0.35  # m/s   — comfortable indoor speed
-MAX_ANGULAR_RPS = 1.5   # rad/s — precise turning, well above 0.65 rad/s floor
+MAX_ANGULAR_RPS = 1.5   # rad/s — precise turning, well above 0.75 rad/s floor
 BOOST_FACTOR    = 1.5   # multiplier when R1 held
 
 # ── Velocity ramp ─────────────────────────────────────────────────────────────
