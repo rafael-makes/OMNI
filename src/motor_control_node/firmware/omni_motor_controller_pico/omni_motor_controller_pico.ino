@@ -31,7 +31,7 @@ static const uint32_t CMD_TIMEOUT_MS   = 1000;  // Pi heartbeat at 50ms; 1s give
 
 // ── PID parameters ───────────────────────────────────────────────────────────
 static const float KP = 1.0f;
-static const float KI = 0.8f;
+static const float KI = 0.3f;   // reduced from 0.8 — FF is well-calibrated, less integral needed
 static const float KD = 0.0f;
 static const float INTEGRAL_MAX = 40.0f;
 static const float VEL_ALPHA    = 0.40f;   // faster tracking reduces startup integral wind-up
