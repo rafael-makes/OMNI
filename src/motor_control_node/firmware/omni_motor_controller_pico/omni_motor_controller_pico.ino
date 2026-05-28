@@ -37,8 +37,8 @@ static const float INTEGRAL_MAX = 40.0f;
 static const float VEL_ALPHA    = 0.25f;
 
 static const int   MIN_PWM    = 85;
-static const float FF_GAIN_L  = 14.0f;
-static const float FF_GAIN_R  = 13.2f;
+static const float FF_GAIN_L  = 16.3f;   // new high-torque motors: left slightly faster, needs lower FF
+static const float FF_GAIN_R  = 16.5f;   // new high-torque motors: trimmed down from 16.8 — right ran 1% fast
 
 // ── Encoder sign configurations ──────────────────────────────────────────────
 static const float L_ENC_DIR =  1.0f;   // flipped — encoder moved to wheel side
