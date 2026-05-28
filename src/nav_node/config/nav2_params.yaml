@@ -236,8 +236,8 @@ controller_server:
       vtheta_samples: 20
 
       # sim_time: how far ahead (seconds) to simulate each trajectory
-      # 1.7s at 0.3 m/s = ~0.5m look-ahead. Good for hallways.
-      sim_time: 1.7
+      # 1.2s at 0.3 m/s = ~0.36m look-ahead — more reactive, less CPU
+      sim_time: 1.2
 
       # linear_granularity: simulation step size (m)
       linear_granularity: 0.05
@@ -290,7 +290,10 @@ controller_server:
       GoalAlign.forward_point_distance: 0.1
 
       # PathAlign: rewards trajectories aligned with the global path heading
-      PathAlign.scale: 32.0
+      # Reduced from 32 — high value caused OMNI to stop and rotate to align
+      # before moving, making navigation stuttery. 16 still tracks the path
+      # but allows arcing toward it rather than stopping to face it first.
+      PathAlign.scale: 16.0
       PathAlign.forward_point_distance: 0.1
 
 
