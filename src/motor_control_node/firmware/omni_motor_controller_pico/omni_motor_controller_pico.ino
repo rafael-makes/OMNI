@@ -27,7 +27,7 @@ static const uint8_t MUX_RIGHT = 0x08;   // channel 3
 // ── Timing Intervals ──────────────────────────────────────────────────────────
 static const uint32_t PID_INTERVAL_MS  = 10;   // 100 Hz PID
 static const uint32_t ODOM_INTERVAL_MS = 53;   // ~20 Hz Odom Output
-static const uint32_t CMD_TIMEOUT_MS   = 500;
+static const uint32_t CMD_TIMEOUT_MS   = 1000;  // Pi heartbeat at 50ms; 1s gives 20x headroom
 
 // ── PID parameters ───────────────────────────────────────────────────────────
 static const float KP = 1.0f;

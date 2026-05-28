@@ -76,15 +76,20 @@ class MotorControlNode(Node):
         self.create_subscription(Twist, '/cmd_vel', self._cmd_vel_cb, 10)
 
         # ── State ─────────────────────────────────────────────────────────────
-        self._last_cmd_time = time.monotonic()
+        self._last_cmd_time  = time.monotonic()
+        self._last_left_mps  = 0.0
+        self._last_right_mps = 0.0
 
         # ── Background serial reader ──────────────────────────────────────────
         self._running = True
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
 
-        # Watchdog: stop motors if /cmd_vel goes silent
-        self.create_timer(0.1, self._watchdog_cb)
+        # 20 Hz serial heartbeat — always re-sends the last command so the Pico
+        # never sees a gap even when /cmd_vel jitters under CPU load.
+        # This replaces the old on-receipt-only write and prevents the 500ms
+        # Pico watchdog from firing and causing stutters / hard-turn restarts.
+        self.create_timer(0.05, self._serial_heartbeat_cb)
 
         self.get_logger().info(
             f'motor_control_node started — {self._port} @ {self._baud}'
@@ -121,18 +126,23 @@ class MotorControlNode(Node):
     def _cmd_vel_cb(self, msg: Twist):
         vx = max(-self._max_vx, min(self._max_vx, msg.linear.x))
         wz = max(-self._max_wz, min(self._max_wz, msg.angular.z))
+        # Store — the 20 Hz heartbeat timer sends these to serial
+        self._last_left_mps  = vx - wz * self._sep / 2.0
+        self._last_right_mps = vx + wz * self._sep / 2.0
+        self._last_cmd_time  = time.monotonic()
 
-        left_mps  = vx - wz * self._sep / 2.0
-        right_mps = vx + wz * self._sep / 2.0
+    # ── 20 Hz serial heartbeat ────────────────────────────────────────────────
+    # Sends the last known command every 50 ms regardless of /cmd_vel timing.
+    # Keeps the Pico's 500 ms watchdog fed under CPU load (SLAM, etc.) and
+    # prevents the stutter + hard-turn-on-restart that occurred during mapping.
 
-        self._serial_write(f'C,{left_mps:.4f},{right_mps:.4f}\n')
-        self._last_cmd_time = time.monotonic()
-
-    # ── Watchdog ──────────────────────────────────────────────────────────────
-
-    def _watchdog_cb(self):
+    def _serial_heartbeat_cb(self):
         if time.monotonic() - self._last_cmd_time > self._timeout:
             self._serial_write('C,0.0000,0.0000\n')
+        else:
+            self._serial_write(
+                f'C,{self._last_left_mps:.4f},{self._last_right_mps:.4f}\n'
+            )
 
     def _reset_odom_cb(self, _req, response):
         self._serial_write('R\n')
