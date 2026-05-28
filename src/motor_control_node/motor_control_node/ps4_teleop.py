@@ -28,19 +28,19 @@ AXIS_L2      = 2   # L2 trigger: rests at -1.0, fully pressed = +1.0
 BTN_R1       = 5   # R1 shoulder button — boost
 
 # ── Speed limits ──────────────────────────────────────────────────────────────
-# MIN_PWM=85 on firmware means minimum driveable speeds are:
-#   linear  ≥ 0.35 m/s  (85/14.0 FF_GAIN × 0.053m wheel radius)
-#   angular ≥ 2.1 rad/s (each wheel needs ≥ 0.32 m/s tangential)
-MAX_LINEAR_MPS  = 0.4   # m/s   — comfortably above 0.35 m/s deadzone
-MAX_ANGULAR_RPS = 2.5   # rad/s — comfortably above 2.1 rad/s deadzone
+# 10kg high-torque motors with MIN_PWM=50:
+#   min linear  ≈ 0.16 m/s  (50/16.4 FF_GAIN × 0.053m wheel radius)
+#   min angular ≈ 1.05 rad/s
+MAX_LINEAR_MPS  = 0.35  # m/s   — comfortable indoor speed
+MAX_ANGULAR_RPS = 1.5   # rad/s — precise turning, well above 0.65 rad/s floor
 BOOST_FACTOR    = 1.5   # multiplier when R1 held
 
 # ── Velocity ramp ─────────────────────────────────────────────────────────────
 # Smooths direction changes — prevents jerk when reversing from stop.
 # The ramp eases commands through zero so the firmware PID and motors
 # transition gradually rather than snapping from one direction to the other.
-ACCEL_LINEAR_MPS2  = 2.0   # m/s²   — 0→0.4 m/s in 2 ticks (0.2 s)
-ACCEL_ANGULAR_RPS2 = 10.0  # rad/s² — 0→2.5 rad/s in ~1 tick (0.1 s)
+ACCEL_LINEAR_MPS2  = 1.5   # m/s²   — 0→0.35 m/s in ~2 ticks (0.2 s)
+ACCEL_ANGULAR_RPS2 = 6.0   # rad/s² — 0→1.5 rad/s in ~2 ticks (0.2 s)
 
 PUBLISH_HZ = 10
 

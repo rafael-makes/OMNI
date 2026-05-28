@@ -43,7 +43,7 @@ class MotorControlNode(Node):
         # can't send commands the hardware can't track (max hardware ≈ 1.0 m/s).
         # Conservative defaults for first-drive; raise in the launch file once tuned.
         self.declare_parameter('max_linear_speed',   0.5)   # m/s
-        self.declare_parameter('max_angular_speed',  3.0)   # rad/s — min for rotation is ~2.1 rad/s due to MIN_PWM=85
+        self.declare_parameter('max_angular_speed',  2.0)   # rad/s — 10kg motors, MIN_PWM=50, floor ~1.05 rad/s
 
         self._port    = self.get_parameter('serial_port').value
         self._baud    = self.get_parameter('baud_rate').value
