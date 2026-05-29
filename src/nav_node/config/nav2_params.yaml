@@ -128,7 +128,7 @@ controller_server:
     # controller_frequency: how often to compute and publish velocity (Hz)
     # 10 Hz is appropriate for a slow indoor robot. 20 Hz is the max
     # the LD19 LiDAR can support anyway.
-    controller_frequency: 10.0
+    controller_frequency: 5.0
 
     # These thresholds prevent publishing tiny velocities that the motors
     # cannot actually execute (hardware deadband protection).
@@ -339,7 +339,7 @@ behavior_server:
 
     # Backup parameters: OMNI moves backward a short distance
     # backup_dist: how far to back up (meters)
-    backup_dist: 0.15
+    backup_dist: 0.30
     # backup_speed: must be above MIN_PWM=35 floor (~0.11 m/s). 0.18 gives margin.
     backup_speed: 0.18
 
