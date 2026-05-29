@@ -262,7 +262,7 @@ controller_server:
       #   - deviating from the global path
       #   - facing away from the path/goal
       critics:
-        ["Oscillation", "ObstacleFootprint",
+        ["Oscillation", "BaseObstacle",
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
 
       # RotateToGoal removed — we use free heading (yaw_goal_tolerance=360°).
@@ -274,12 +274,13 @@ controller_server:
       # switching that was observed when DWB had a narrow angular velocity band.
       Oscillation.scale: 5.0
 
-      # ObstacleFootprint: uses the full rectangular footprint to check if a
-      # trajectory passes through any occupied costmap cells.
-      # This is more accurate than point-based obstacle checking.
-      ObstacleFootprint.scale: 0.025
-      ObstacleFootprint.max_scaling_factor: 0.2
-      ObstacleFootprint.scaling_speed: 0.25
+      # BaseObstacle: checks costmap cost at the robot center point only.
+      # Replaced ObstacleFootprint (full polygon check) — the polygon check
+      # rejected all trajectories in rooms with scattered furniture because the
+      # 0.60m×0.40m footprint clipped nearby chair legs/desk edges at every step.
+      # The inflation layer (0.20m) already provides clearance from obstacles,
+      # so center-point cost checking is sufficient for safe navigation.
+      BaseObstacle.scale: 0.02
 
       # PathDist: penalizes trajectories that drift far from the global path
       PathDist.scale: 32.0
