@@ -262,16 +262,12 @@ controller_server:
       #   - deviating from the global path
       #   - facing away from the path/goal
       critics:
-        ["RotateToGoal", "Oscillation", "ObstacleFootprint",
+        ["Oscillation", "ObstacleFootprint",
          "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
 
-      # RotateToGoal: when close to the goal, rotate in place to face it
-      # before declaring arrival. Reduced scale (32→16) and slowing_factor
-      # (5→2) — high values caused aggressive spin-to-face that triggered
-      # oscillation. 16/2 is still enough to orient without spinning wildly.
-      RotateToGoal.scale: 16.0
-      RotateToGoal.slowing_factor: 2.0
-      RotateToGoal.lookahead_time: -1.0
+      # RotateToGoal removed — we use free heading (yaw_goal_tolerance=360°).
+      # Keeping it caused the robot to spin in place at the goal position,
+      # preventing StoppedGoalChecker from declaring success.
 
       # Oscillation: penalizes switching directions repeatedly (getting stuck)
       # Raised 1.0→5.0 — stronger penalty discourages the +/- rotation
