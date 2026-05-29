@@ -406,7 +406,7 @@ global_costmap:
       # Coordinates are [x, y] pairs in meters, centered at base_link:
       #   x = front(+)/back(-) = ±depth/2 = ±0.20m
       #   y = left(+)/right(-) = ±width/2 = ±0.30m
-      footprint: "[[-0.20, -0.30], [-0.20, 0.30], [0.20, 0.30], [0.20, -0.30]]"
+      footprint: "[[-0.20, -0.28], [-0.20, 0.28], [0.20, 0.28], [0.20, -0.28]]"
 
       # resolution: costmap cell size (meters). Must match the SLAM map
       # resolution (0.05m = 5cm cells) for consistent obstacle marking.
@@ -508,7 +508,7 @@ local_costmap:
       resolution: 0.05
 
       # Same rectangular footprint as global costmap
-      footprint: "[[-0.20, -0.30], [-0.20, 0.30], [0.20, 0.30], [0.20, -0.30]]"
+      footprint: "[[-0.20, -0.28], [-0.20, 0.28], [0.20, 0.28], [0.20, -0.28]]"
 
       # No static_layer here — the local costmap is purely sensor-driven.
       # This means it reacts to dynamic obstacles (people, chairs, pets)
