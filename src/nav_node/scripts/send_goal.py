@@ -8,12 +8,12 @@ Usage:
 Arguments:
     x             Goal X position in meters (map frame)
     y             Goal Y position in meters (map frame)
-    yaw_degrees   Goal heading in degrees (default: 0 = facing +X axis)
+    yaw_degrees   Goal heading in degrees (optional — omit for free heading)
 
 Examples:
-    python3 send_goal.py 1.0 0.0         # 1m forward, facing +X
-    python3 send_goal.py 1.0 0.5 90      # 1m forward, 0.5m left, facing +Y
-    python3 send_goal.py -0.5 0.0 180    # 0.5m backward, facing -X
+    python3 send_goal.py 2.0 0.0         # 2m forward, any final heading
+    python3 send_goal.py 1.0 0.5 90      # 1m forward, 0.5m left, face +Y
+    python3 send_goal.py -0.5 0.0 180    # 0.5m backward, face -X
 
 The goal is sent to Nav2's NavigateToPose action server.
 Nav2 will plan a path and drive OMNI to the goal pose.
@@ -56,8 +56,8 @@ class GoalSender(Node):
             'navigate_to_pose'
         )
 
-    def send_goal(self, x: float, y: float, yaw_deg: float = 0.0):
-        yaw_rad = math.radians(yaw_deg)
+    def send_goal(self, x: float, y: float, yaw_deg: float | None = None):
+        yaw_rad = math.radians(yaw_deg) if yaw_deg is not None else 0.0
         qx, qy, qz, qw = euler_to_quaternion(yaw_rad)
 
         # Build the goal pose in the map frame
@@ -85,8 +85,9 @@ class GoalSender(Node):
             )
             return False
 
+        yaw_str = f'{yaw_deg:.1f}°' if yaw_deg is not None else 'free'
         self.get_logger().info(
-            f'Sending goal: x={x:.2f}m  y={y:.2f}m  yaw={yaw_deg:.1f}°'
+            f'Sending goal: x={x:.2f}m  y={y:.2f}m  yaw={yaw_str}'
         )
 
         send_future = self._action_client.send_goal_async(
@@ -152,7 +153,7 @@ def main():
     try:
         x = float(sys.argv[1])
         y = float(sys.argv[2])
-        yaw_deg = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+        yaw_deg = float(sys.argv[3]) if len(sys.argv) > 3 else None
     except ValueError:
         print('ERROR: x, y, and yaw must be numbers')
         sys.exit(1)

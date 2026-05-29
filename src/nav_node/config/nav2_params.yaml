@@ -157,9 +157,10 @@ controller_server:
       # These tolerances define what counts as "at the goal"
       # xy_goal_tolerance: distance (m) — must be within this of goal XY
       xy_goal_tolerance: 0.25
-      # yaw_goal_tolerance: angle (radians) — must face within this of goal yaw
-      # 0.4 rad ≈ 23 degrees. Loose for a home robot; tighten for docking.
-      yaw_goal_tolerance: 0.4
+      # yaw_goal_tolerance: angle (radians) — must face within this of goal yaw.
+      # 6.28 rad = full circle = heading-free. OMNI arrives without spinning.
+      # Tighten (e.g. 0.2 rad) only when precise docking heading matters.
+      yaw_goal_tolerance: 6.28
       # stateful: true = stop immediately when within tolerance
       stateful: true
 
@@ -251,7 +252,7 @@ controller_server:
 
       # xy_goal_tolerance / yaw_goal_tolerance: same as goal_checker above
       xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.4
+      yaw_goal_tolerance: 6.28
 
       # ── DWB critics (scoring functions) ──────────────────────────────────
       # Each critic scores a trajectory from 0 to 255. DWB picks the
