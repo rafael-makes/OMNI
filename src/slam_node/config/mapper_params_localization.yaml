@@ -23,7 +23,7 @@ slam_toolbox:
     # ── Map persistence ──────────────────────────────────────────────────────
     # Serialize the pose graph to disk every N seconds (0 = disabled)
     map_file_name: /home/pi/omni_ws/maps/omni_home_map
-    map_start_at_dock: false
+    map_start_at_dock: true
 
     # ── Scan matching ────────────────────────────────────────────────────────
     # LD19: 10 Hz, 360°, ~5m range indoors
