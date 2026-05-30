@@ -178,9 +178,9 @@ controller_server:
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
       max_vel_x: 0.3
 
-      # min_vel_x: minimum forward speed. Negative allows gentle backup.
-      # Must be above MIN_PWM floor (~0.16 m/s) or motors cut out.
-      min_vel_x: -0.18
+      # min_vel_x: 0.0 forces OMNI to always rotate first then drive forward.
+      # Negative values allowed backward driving which looked unnatural.
+      min_vel_x: 0.0
 
       # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
       max_vel_y: 0.0
