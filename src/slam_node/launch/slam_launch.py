@@ -50,6 +50,39 @@ def generate_launch_description():
         output='screen',
     )
 
+    tof_tfs = [
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_left',
+             arguments=['0.065', '0.200', '0.065',
+                        '0', '0', '0.7071', '0.7071',
+                        'base_link', 'tof_left']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_front_left',
+             arguments=['0.200', '0.135', '0.065',
+                        '0', '0', '0', '1',
+                        'base_link', 'tof_front_left']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_front_right',
+             arguments=['0.200', '-0.135', '0.065',
+                        '0', '0', '0', '1',
+                        'base_link', 'tof_front_right']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_right',
+             arguments=['0.065', '-0.200', '0.065',
+                        '0', '0', '-0.7071', '0.7071',
+                        'base_link', 'tof_right']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_left_rear',
+             arguments=['-0.200', '0.135', '0.065',
+                        '0', '0', '1', '0',
+                        'base_link', 'tof_left_rear']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_right_rear',
+             arguments=['-0.200', '-0.135', '0.065',
+                        '0', '0', '1', '0',
+                        'base_link', 'tof_right_rear']),
+    ]
+
     # ── slam_toolbox async (LifecycleNode) ────────────────────────────────────
     slam_node = LifecycleNode(
         package='slam_toolbox',
@@ -121,6 +154,7 @@ def generate_launch_description():
             description='Path to slam_toolbox params YAML'),
         LogInfo(msg='OMNI slam_node starting — map→odom→base_link, LiDAR z=0.38m'),
         lidar_tf,
+        *tof_tfs,
         slam_node,
         configure_event,
         activate_event,

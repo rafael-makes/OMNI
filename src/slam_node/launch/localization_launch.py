@@ -41,6 +41,43 @@ def generate_launch_description():
         output='screen',
     )
 
+    # ToF sensor static transforms (base_link → tof_* frames)
+    # Robot base 400×400mm. Sensor height 65mm. x=forward, y=left.
+    # Quaternions: forward=(0,0,0,1), left=(0,0,0.7071,0.7071),
+    #              right=(0,0,-0.7071,0.7071), backward=(0,0,1,0)
+    tof_tfs = [
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_left',
+             arguments=['0.065', '0.200', '0.065',
+                        '0', '0', '0.7071', '0.7071',
+                        'base_link', 'tof_left']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_front_left',
+             arguments=['0.200', '0.135', '0.065',
+                        '0', '0', '0', '1',
+                        'base_link', 'tof_front_left']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_front_right',
+             arguments=['0.200', '-0.135', '0.065',
+                        '0', '0', '0', '1',
+                        'base_link', 'tof_front_right']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_right',
+             arguments=['0.065', '-0.200', '0.065',
+                        '0', '0', '-0.7071', '0.7071',
+                        'base_link', 'tof_right']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_left_rear',
+             arguments=['-0.200', '0.135', '0.065',
+                        '0', '0', '1', '0',
+                        'base_link', 'tof_left_rear']),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_tof_right_rear',
+             arguments=['-0.200', '-0.135', '0.065',
+                        '0', '0', '1', '0',
+                        'base_link', 'tof_right_rear']),
+    ]
+
     slam_node = LifecycleNode(
         package='slam_toolbox',
         executable='localization_slam_toolbox_node',
@@ -99,6 +136,7 @@ def generate_launch_description():
                               description='Path prefix of the saved pose graph'),
         LogInfo(msg=['OMNI localization starting — loading map: ', map_file]),
         lidar_tf,
+        *tof_tfs,
         slam_node,
         configure_event,
         activate_event,
