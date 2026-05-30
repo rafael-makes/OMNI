@@ -278,9 +278,10 @@ controller_server:
       # Replaced ObstacleFootprint (full polygon check) — the polygon check
       # rejected all trajectories in rooms with scattered furniture because the
       # 0.60m×0.40m footprint clipped nearby chair legs/desk edges at every step.
-      # The inflation layer (0.20m) already provides clearance from obstacles,
-      # so center-point cost checking is sufficient for safe navigation.
-      BaseObstacle.scale: 0.02
+      # Scale raised 0.02→0.08: with local inflation_radius=0.28m (arm extent),
+      # obstacles near arm tips now produce cost ~169 at robot center, and this
+      # scale makes that penalty meaningful in trajectory scoring.
+      BaseObstacle.scale: 0.08
 
       # PathDist: penalizes trajectories that drift far from the global path
       PathDist.scale: 32.0
@@ -400,14 +401,13 @@ global_costmap:
       # use_sim_time: must match the launch argument
       use_sim_time: False
 
-      # robot_radius is NOT used — we define an explicit footprint polygon
-      # because OMNI's rectangular body (600mm × 400mm) is not circular.
-      # The footprint is the polygon of the robot's base in the XY plane.
-      # Coordinates are [x, y] pairs in meters, centered at base_link:
-      #   x = front(+)/back(-) = ±depth/2 = ±0.20m
-      #   y = left(+)/right(-) = ±width/2 = ±0.30m
-      # Hexagonal footprint — arms at x=0 extend to ±0.28m, base corners at ±0.20m
-      footprint: "[[0.20, 0.20], [0.00, 0.28], [-0.20, 0.20], [-0.20, -0.20], [0.00, -0.28], [0.20, -0.20]]"
+      # Global costmap uses a small PLANNING radius (NOT the physical footprint).
+      # The physical body is 0.20m half-width but the SLAM-mapped walls appear
+      # several cells thick (LiDAR multi-scan overlap), so even 0.20m inflation
+      # makes doorways appear completely blocked. We use 0.15m so the planner
+      # can route through real doorways (~70cm+). The local costmap and DWB
+      # controller handle actual collision avoidance with the full footprint.
+      robot_radius: 0.15
 
       # resolution: costmap cell size (meters). Must match the SLAM map
       # resolution (0.05m = 5cm cells) for consistent obstacle marking.
@@ -454,16 +454,11 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # cost_scaling_factor: how quickly the inflation cost falls off with
-        # distance from the obstacle. Higher = steeper dropoff = tighter paths.
-        # 3.0 gives a gentle gradient — planner will prefer center of hallways.
         cost_scaling_factor: 5.0
-        # inflation_radius: distance (m) to inflate obstacles.
-        # OMNI is 0.60m wide. Typical doorways are ~0.85m wide → 0.125m
-        # clearance per side. 0.55m inflation flooded doorways completely,
-        # blocking navigation. Reduced to 0.20m so doorways stay passable.
-        # OMNI's footprint checker (not inflation) handles actual collision.
-        inflation_radius: 0.22
+        # Matches robot_radius: 0.15m — minimum safe inflation for the planning
+        # radius. Keeps doorway passages open in the global costmap.
+        # Local costmap uses 0.22m for actual proximity-to-wall avoidance.
+        inflation_radius: 0.15
 
 
 # =============================================================================
@@ -551,7 +546,11 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
-        inflation_radius: 0.22
+        # 0.28m = arm tip extent from center. Obstacles detected by the ToF
+        # sensors at the arm tips now produce cost ~169 at the robot center,
+        # making BaseObstacle.scale=0.08 penalise those trajectories.
+        # Previously 0.22m — too small for arm-proximity obstacles to show up.
+        inflation_radius: 0.28
 
 
 # =============================================================================
