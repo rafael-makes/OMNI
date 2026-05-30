@@ -463,7 +463,7 @@ global_costmap:
         # clearance per side. 0.55m inflation flooded doorways completely,
         # blocking navigation. Reduced to 0.20m so doorways stay passable.
         # OMNI's footprint checker (not inflation) handles actual collision.
-        inflation_radius: 0.20
+        inflation_radius: 0.22
 
 
 # =============================================================================
@@ -551,7 +551,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
-        inflation_radius: 0.20
+        inflation_radius: 0.22
 
 
 # =============================================================================
