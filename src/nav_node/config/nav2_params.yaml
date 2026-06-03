@@ -178,9 +178,11 @@ controller_server:
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
       max_vel_x: 0.3
 
-      # min_vel_x: 0.0 forces OMNI to always rotate first then drive forward.
-      # Negative values allowed backward driving which looked unnatural.
-      min_vel_x: 0.0
+      # min_vel_x: small positive value forces DWB to always arc (forward+turn)
+      # instead of spinning in place. Pure spin stalls the 10kg robot against
+      # floor friction — the wheels whine but the robot doesn't rotate.
+      # 0.05 m/s is low enough to still turn tightly but prevents pure spin.
+      min_vel_x: 0.05
 
       # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
       max_vel_y: 0.0
@@ -238,8 +240,9 @@ controller_server:
       vtheta_samples: 20
 
       # sim_time: how far ahead (seconds) to simulate each trajectory
-      # 1.2s at 0.3 m/s = ~0.36m look-ahead — more reactive, less CPU
-      sim_time: 1.2
+      # 0.8s: reduced from 1.2s to prevent DWB from seeing the goal through
+      # the wall and arcing diagonally toward it (doorway corner-cutting).
+      sim_time: 0.8
 
       # linear_granularity: simulation step size (m)
       linear_granularity: 0.05
@@ -284,13 +287,17 @@ controller_server:
       BaseObstacle.scale: 0.08
 
       # PathDist: penalizes trajectories that drift far from the global path
-      PathDist.scale: 32.0
+      # Raised 32→48: stronger pull keeps robot in doorway corridor instead
+      # of cutting diagonally toward the goal.
+      PathDist.scale: 48.0
 
       # GoalDist: rewards trajectories that move toward the goal
       GoalDist.scale: 24.0
 
       # GoalAlign: rewards trajectories where the robot faces the goal direction
-      GoalAlign.scale: 24.0
+      # Reduced 24→10: was the main driver of diagonal corner-cutting —
+      # robot would face the goal through the wall and arc toward it.
+      GoalAlign.scale: 10.0
       GoalAlign.forward_point_distance: 0.1
 
       # PathAlign: rewards trajectories aligned with the global path heading
@@ -366,8 +373,9 @@ smoother_server:
       max_its: 1000
       # w_data: weight for keeping path close to original waypoints
       w_data: 0.2
-      # w_smooth: weight for smoothness (higher = smoother but more deviation)
-      w_smooth: 0.3
+      # w_smooth: raised 0.3→0.5 — smoother path transitions reduce the jolt
+      # when a new global plan is handed to the controller.
+      w_smooth: 0.5
       # do_refinement: whether to iteratively refine after initial smooth
       do_refinement: True
 
@@ -385,12 +393,12 @@ smoother_server:
 global_costmap:
   global_costmap:
     ros__parameters:
-      # update_frequency: how often to update the costmap (Hz)
-      # 1 Hz is fine for the global costmap — it does not need to be reactive
-      update_frequency: 1.0
+      # update_frequency: reduced 1.0→0.5 Hz — replanning every 2s instead of
+      # every 1s reduces mid-path jolts when the controller gets a new path.
+      update_frequency: 0.5
 
-      # publish_frequency: how often to publish the costmap for RViz (Hz)
-      publish_frequency: 1.0
+      # publish_frequency: match update rate
+      publish_frequency: 0.5
 
       # global_frame: the map frame — matches slam_toolbox output
       global_frame: map
@@ -503,9 +511,11 @@ local_costmap:
       # resolution: same as global costmap for consistent obstacle sizes
       resolution: 0.05
 
-      # Same rectangular footprint as global costmap
-      # Hexagonal footprint — arms at x=0 extend to ±0.28m, base corners at ±0.20m
-      footprint: "[[0.20, 0.20], [0.00, 0.28], [-0.20, 0.20], [-0.20, -0.20], [0.00, -0.28], [0.20, -0.20]]"
+      # Rectangular footprint covering arms bent at 90°:
+      #   Body: ±0.20m front/back, ±0.30m left/right (600mm wide × 400mm deep)
+      #   Arms: add 150mm forward from body front → front extent = 0.20 + 0.15 = 0.35m
+      #   Arms are at shoulder width (±0.30m) so no extra lateral extent needed.
+      footprint: "[[0.35, 0.30], [0.35, -0.30], [-0.20, -0.30], [-0.20, 0.30]]"
 
       # No static_layer here — the local costmap is purely sensor-driven.
       # This means it reacts to dynamic obstacles (people, chairs, pets)
@@ -546,11 +556,9 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
-        # 0.28m = arm tip extent from center. Obstacles detected by the ToF
-        # sensors at the arm tips now produce cost ~169 at the robot center,
-        # making BaseObstacle.scale=0.08 penalise those trajectories.
-        # Previously 0.22m — too small for arm-proximity obstacles to show up.
-        inflation_radius: 0.28
+        # 0.20m safety buffer around the footprint edge. The footprint already
+        # covers the arm tips at x=0.35m, so inflation adds clearance beyond that.
+        inflation_radius: 0.20
 
 
 # =============================================================================
