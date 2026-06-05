@@ -1,0 +1,170 @@
+# =============================================================================
+# ekf_params.yaml — robot_localization EKF configuration for OMNI robot
+# =============================================================================
+#
+# Fuses wheel odometry (/odom) with IMU (/imu/data) to produce a corrected
+# pose estimate on /odometry/filtered, and publishes the odom→base_link TF.
+#
+# State vector: [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az]
+#               indices: 0  1   2   3     4    5    6   7   8    9      10    11   12  13  14
+#
+# For each sensor, the "config" array has 15 booleans selecting which state
+# variables to fuse from that sensor. Only fuse what the sensor measures well.
+#
+# OMNI is a ground robot (planar motion only):
+#   - Wheel odometry gives: x, y, yaw, vx, vyaw  (2D pose + velocities)
+#   - IMU gives: yaw (orientation), vyaw (angular velocity z)
+#   - We do NOT fuse IMU linear acceleration — BNO085 GAME_ROTATION_VECTOR
+#     mode is orientation only. Accelerometers on a wheeled robot pick up
+#     vibration and floor bumps and make position estimates worse.
+#
+# TF: robot_localization publishes odom→base_link.
+#     motor_control_node must have publish_tf:=false to avoid conflict.
+
+ekf_filter_node:
+  ros__parameters:
+
+    # Frequency to run the EKF prediction step (Hz).
+    # Reduced to 5Hz — Pi 5 was only achieving 2.5Hz at 10Hz setting.
+    # 5Hz = 200ms per cycle, well within Pi 5 budget alongside all other nodes.
+    frequency: 5.0
+
+    # sensor_timeout: if a sensor goes silent for this many seconds,
+    # the EKF continues predicting without it (dead reckoning).
+    sensor_timeout: 0.1
+
+    # two_d_mode: true = ignore z, roll, pitch entirely.
+    # OMNI is a ground robot — enforce planar motion.
+    two_d_mode: true
+
+    # transform_time_offset: seconds to add to TF timestamps.
+    # 0 is correct — we're not simulating.
+    transform_time_offset: 0.0
+
+    # transform_timeout: seconds to wait for a TF before giving up.
+    transform_timeout: 0.1
+
+    # print_diagnostics: publish /diagnostics so you can monitor EKF health.
+    print_diagnostics: true
+
+    # debug: set true to get verbose console output (very noisy — dev only)
+    debug: false
+
+    # Frames
+    map_frame:    map
+    odom_frame:   odom
+    base_link_frame: base_link
+    world_frame:  odom   # EKF estimates odom→base_link (not map→base_link)
+
+    # publish_tf: true = EKF publishes odom→base_link TF.
+    # motor_control_node must have publish_tf:=false when this is true.
+    publish_tf: true
+
+    # publish_acceleration: not needed for navigation
+    publish_acceleration: false
+
+    # ==========================================================================
+    # Sensor 0: Wheel Odometry (/odom)
+    # ==========================================================================
+    # We fuse: x position, y position, yaw, vx (forward speed), vyaw (turn rate)
+    # We skip: z, roll, pitch (planar robot), vy (non-holonomic, always ~0),
+    #          linear accelerations (not in nav_msgs/Odometry twist)
+    #
+    # State vector positions fused (true = use this, false = ignore):
+    #  x      y      z      roll   pitch  yaw    vx     vy     vz
+    #  vroll  vpitch vyaw   ax     ay     az
+    odom0: /odom
+    odom0_config: [true,  true,  false,
+                   false, false, true,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
+
+    # odom0_differential: false = use absolute pose from odometry directly.
+    # true would use pose deltas instead — only needed if your odom frame drifts
+    # relative to a global reference. For wheel odometry, false is correct.
+    odom0_differential: false
+
+    # odom0_relative: false = poses are in the odom frame (absolute since startup).
+    odom0_relative: false
+
+    # odom0_queue_size: how many odom messages to buffer
+    odom0_queue_size: 10
+
+    # ==========================================================================
+    # Sensor 1: IMU (/imu/data) — BNO085 GAME_ROTATION_VECTOR
+    # ==========================================================================
+    # We fuse: yaw (orientation z), vyaw (angular velocity z)
+    # We skip: x, y, z positions (IMU doesn't know position)
+    #          roll, pitch (two_d_mode anyway)
+    #          vx, vy, vz linear velocities (not directly measured)
+    #          linear accelerations (vibration noise on wheeled robot)
+    #
+    # Fusing IMU yaw rate (vyaw) is the main benefit — it's much more accurate
+    # than wheel odometry during turns, especially on slippery floors.
+    imu0: /imu/data
+    imu0_config: [false, false, false,
+                  false, false, true,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+
+    # imu0_differential: false = use absolute orientation from BNO085.
+    # The BNO085 GAME_ROTATION_VECTOR gives absolute orientation (within a session),
+    # not relative deltas — so differential must be false.
+    imu0_differential: false
+
+    # imu0_relative: true = treat the first IMU reading as zero heading.
+    # This is correct for GAME_ROTATION_VECTOR indoors — heading is arbitrary
+    # at startup and we want the robot to start with yaw=0 in odom frame.
+    imu0_relative: true
+
+    # imu0_remove_gravitational_acceleration: true = subtract gravity from
+    # accelerometer readings. Not needed since we're not fusing acceleration.
+    imu0_remove_gravitational_acceleration: true
+
+    imu0_queue_size: 10
+
+    # ==========================================================================
+    # Process noise covariance (Q matrix)
+    # ==========================================================================
+    # How much we trust the motion model between sensor updates.
+    # Higher = model is less trusted = sensor corrections have more influence.
+    # Format: 15×15 flattened row-major. Non-zero diagonals only for:
+    #   x(0), y(7), yaw(35), vx(42), vyaw(77)
+    process_noise_covariance: [0.05,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.05,  0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.06,  0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.03,  0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.03,  0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.06,  0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.025,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.025, 0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.04,  0.0,   0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.01,  0.0,   0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.01,  0.0,   0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.02,  0.0,   0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,   0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.01,  0.0,
+                               0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,    0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.0,   0.015]
+
+    # ==========================================================================
+    # Initial estimate covariance (P0 matrix)
+    # ==========================================================================
+    # Uncertainty in the initial state. High values = EKF is uncertain at startup
+    # and will trust sensor measurements more until it converges.
+    initial_estimate_covariance: [1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9]

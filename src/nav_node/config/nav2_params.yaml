@@ -41,7 +41,7 @@ bt_navigator:
     # robot_base_frame: the moving robot frame — must match motor_control_node
     robot_base_frame: base_link
 
-    # odom_topic: used by some BT nodes to estimate progress
+    # odom_topic: wheel odometry direct — EKF disabled (too slow on Pi 5)
     odom_topic: /odom
 
     # bt_loop_duration: how often the behavior tree ticks (ms)
@@ -66,6 +66,9 @@ bt_navigator:
       plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
     navigate_through_poses:
       plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+
+    # Use simpler BT — no spin/backup recovery (stall_recovery_node handles that)
+    default_nav_to_pose_bt_xml: "/home/pi/omni_ws/install/nav2_bt_navigator/share/nav2_bt_navigator/behavior_trees/navigate_w_replanning_only_if_path_becomes_invalid.xml"
 
     # error_code_names: which error codes to report in feedback
     error_code_names:
@@ -137,8 +140,9 @@ controller_server:
     min_theta_velocity_threshold: 0.001
 
     # failure_tolerance: seconds of controller failure before declaring
-    # navigation failed. 0.3s is tight — increase if you see false failures.
-    failure_tolerance: 0.3
+    # navigation failed. At 5Hz, 0.3s = only 1 attempt before abort.
+    # 3.0s gives ~15 control cycles to find a valid trajectory before giving up.
+    failure_tolerance: 3.0
 
     # progress_checker_plugins: monitors whether the robot is making progress
     progress_checker_plugin: "progress_checker"
@@ -146,9 +150,10 @@ controller_server:
       plugin: "nav2_controller::SimpleProgressChecker"
       # required_movement_radius: how far (m) the robot must move per check
       required_movement_radius: 0.5
-      # movement_time_allowance: seconds allowed to move that radius before
-      # declaring the robot stuck. 10s is generous for a slow robot.
-      movement_time_allowance: 10.0
+      # movement_time_allowance: raised 10→25s so stall_recovery_node has time
+      # to complete its backup+rotate+re-plan cycle (takes ~3s) before the
+      # progress checker declares failure. Multiple recovery attempts need ~9s.
+      movement_time_allowance: 25.0
 
     # goal_checker_plugins: decides when the robot has "arrived"
     goal_checker_plugin: "goal_checker"
@@ -178,11 +183,11 @@ controller_server:
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
       max_vel_x: 0.3
 
-      # min_vel_x: small positive value forces DWB to always arc (forward+turn)
-      # instead of spinning in place. Pure spin stalls the 10kg robot against
-      # floor friction — the wheels whine but the robot doesn't rotate.
-      # 0.05 m/s is low enough to still turn tightly but prevents pure spin.
-      min_vel_x: 0.05
+      # min_vel_x: raised 0.05→0.15 to match MIN_PWM=50 floor.
+      # MIN_PWM=50 → min wheel speed ~0.163 m/s. Inner wheel during arc =
+      # min_vel_x - angular * track/2. At 0.15 m/s linear the inner wheel
+      # stays above the deadband for moderate turns.
+      min_vel_x: 0.15
 
       # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
       max_vel_y: 0.0
@@ -196,14 +201,12 @@ controller_server:
       # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
       max_speed_xy: 0.3
 
-      # min_speed_xy: minimum linear speed DWB will command (m/s)
-      # Set just above MIN_PWM=35 floor (~0.11 m/s) with small margin
-      min_speed_xy: 0.12
+      # min_speed_xy: raised to match MIN_PWM=50 floor (~0.163 m/s)
+      min_speed_xy: 0.17
 
-      # min_speed_theta: minimum rotation speed DWB will command (rad/s)
-      # MIN_PWM=35 angular floor ≈ 0.75 rad/s. 0.8 gives a small margin.
-      # Wide band (0.8→1.5) prevents DWB binary oscillation seen with 1.1→1.2.
-      min_speed_theta: 0.8
+      # min_speed_theta: MIN_PWM=50 → each wheel ~0.163 m/s → angular floor
+      # = 0.163 / (track/2) = 0.163 / 0.1525 = 1.07 rad/s. 1.1 gives margin.
+      min_speed_theta: 1.1
 
       # ── Acceleration limits ───────────────────────────────────────────────
       # OMNI is top-heavy — gentle acceleration prevents tipping.
@@ -326,7 +329,8 @@ behavior_server:
     # cycle_frequency: how often to run the behavior control loop (Hz)
     cycle_frequency: 10.0
 
-    # behavior_plugins: which recovery behaviors to load
+    # behavior_plugins: spin kept so default BT XML can find the action server,
+    # but bt_navigator uses a custom BT without spin (see default_nav_to_pose_bt_xml).
     behavior_plugins: ["spin", "backup", "wait"]
 
     spin:
@@ -393,12 +397,11 @@ smoother_server:
 global_costmap:
   global_costmap:
     ros__parameters:
-      # update_frequency: reduced 1.0→0.5 Hz — replanning every 2s instead of
-      # every 1s reduces mid-path jolts when the controller gets a new path.
-      update_frequency: 0.5
+      # update_frequency: 1.0 Hz — 0.5Hz was too slow, caused planner timeouts
+      update_frequency: 1.0
 
       # publish_frequency: match update rate
-      publish_frequency: 0.5
+      publish_frequency: 1.0
 
       # global_frame: the map frame — matches slam_toolbox output
       global_frame: map
@@ -462,11 +465,15 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 5.0
-        # Matches robot_radius: 0.15m — minimum safe inflation for the planning
-        # radius. Keeps doorway passages open in the global costmap.
-        # Local costmap uses 0.22m for actual proximity-to-wall avoidance.
-        inflation_radius: 0.15
+        # cost_scaling_factor: lowered 5.0→2.5 — broader cost gradient around
+        # walls pushes the planned path further from doorframe corners,
+        # forcing the planner to arc through the doorway center.
+        cost_scaling_factor: 2.5
+        # inflation_radius: raised 0.15→0.30m — creates a wide cost field around
+        # walls so NavFn routes the path through the CENTER of doorways rather
+        # than cutting the corner. Doorway is 745mm so 0.30m inflation still
+        # leaves a 145mm corridor for the 0.15m robot_radius to plan through.
+        inflation_radius: 0.30
 
 
 # =============================================================================
@@ -512,11 +519,17 @@ local_costmap:
       resolution: 0.05
 
       # Rectangular footprint covering arms bent at 90°:
-      #   Body: ±0.20m front/back, ±0.30m left/right (600mm wide × 400mm deep)
-      #   Arms: add 150mm forward from body front → front extent = 0.20 + 0.15 = 0.35m
-      #   Arms are at shoulder width (±0.30m) so no extra lateral extent needed.
-      footprint: "[[0.35, 0.30], [0.35, -0.30], [-0.20, -0.30], [-0.20, 0.30]]"
+      #   Body: 600mm wide × 400mm deep
+      #   Front: 0.20m body + 0.15m arms = 0.35m
+      #   Rear: reduced to 0.05m — robot can safely back to within 50mm of a wall.
+      #   With inflation_radius=0.15m, total rear clearance = 0.05+0.15 = 0.20m from base_link.
+      #   This lets the robot back out of hallways and tight spots before turning.
+      footprint: "[[0.35, 0.30], [0.35, -0.30], [-0.05, -0.30], [-0.05, 0.30]]"
 
+      # No static_layer here — the local costmap is purely sensor-driven.
+      # This means it reacts to dynamic obstacles (people, chairs, pets)
+      # without being confused by the static map.
+      #
       # No static_layer here — the local costmap is purely sensor-driven.
       # This means it reacts to dynamic obstacles (people, chairs, pets)
       # without being confused by the static map.
@@ -541,24 +554,21 @@ local_costmap:
         plugin: "nav2_costmap_2d::RangeSensorLayer"
         topics: ["/tof/left", "/tof/front_left", "/tof/front_right",
                  "/tof/right", "/tof/left_rear", "/tof/right_rear"]
-        # phi: angular tolerance (radians) — VL53L0X FOV is 25°, use 0.5 rad (~29°)
         phi: 0.5
-        # inflate_cone: expand the sensor cone for marking. 1.0 = exact FOV.
         inflate_cone: 1.0
-        # no_readings_timeout: 0 = never expire readings (sensors always running)
         no_readings_timeout: 0.0
-        # clear_threshold / mark_threshold: costmap probability thresholds
         clear_threshold: 0.2
         mark_threshold: 0.8
-        # clear_on_max_reading: true = a max-range reading means the path is clear
         clear_on_max_reading: true
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 5.0
-        # 0.20m safety buffer around the footprint edge. The footprint already
-        # covers the arm tips at x=0.35m, so inflation adds clearance beyond that.
-        inflation_radius: 0.20
+        cost_scaling_factor: 3.5
+        # Reduced 0.20→0.15m: 0.20m was too aggressive — when the robot was
+        # near a wall (common after entering a room), inflation marked ALL
+        # trajectories lethal, causing instant goal failure. 0.15m still provides
+        # clearance but leaves enough free space for DWB to sample valid paths.
+        inflation_radius: 0.15
 
 
 # =============================================================================

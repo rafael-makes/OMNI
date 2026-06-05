@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>stall_recovery_node</name>
+  <version>0.1.0</version>
+  <description>OMNI stall recovery — detects motor stalls and repositions via Nav2</description>
+  <maintainer email="omni@local">pi</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

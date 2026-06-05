@@ -59,6 +59,17 @@ static const int   MIN_PWM  = 60;
 //   Wheel radius corrected to 50mm — same encoder-to-PWM ratio, gain unchanged
 static const float FF_GAIN  = 12.0f;
 
+// ── Stall detection ───────────────────────────────────────────────────────────
+// A stall is declared when the motor is commanded above MIN_PWM but the encoder
+// reports near-zero velocity for STALL_COUNT consecutive PID cycles (100Hz).
+// 30 cycles = 300ms — long enough to ignore brief slowdowns, short enough to
+// detect a genuine mechanical stall before the motors overheat.
+static const float   STALL_VEL_THRESHOLD = 0.3f;  // rad/s — below this = not moving
+static const uint8_t STALL_COUNT_THRESHOLD = 30;   // PID cycles before declaring stall
+static uint8_t left_stall_count  = 0;
+static uint8_t right_stall_count = 0;
+static bool    stall_detected    = false;
+
 // ── Encoder sign convention (validated May 2025) ──────────────────────────────
 // M1 left : forward = negative counts → negate to get forward-positive frame
 // M2 right: forward = positive counts → no change

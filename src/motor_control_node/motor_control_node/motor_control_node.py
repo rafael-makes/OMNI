@@ -44,14 +44,17 @@ class MotorControlNode(Node):
         # Conservative defaults for first-drive; raise in the launch file once tuned.
         self.declare_parameter('max_linear_speed',   0.5)   # m/s
         self.declare_parameter('max_angular_speed',  2.0)   # rad/s — 10kg motors, MIN_PWM=35, floor ~0.75 rad/s
+        # publish_tf: set false when robot_localization EKF takes over odom→base_link
+        self.declare_parameter('publish_tf', True)
 
         self._port    = self.get_parameter('serial_port').value
         self._baud    = self.get_parameter('baud_rate').value
         self._sep     = self.get_parameter('wheel_separation').value
         self._radius  = self.get_parameter('wheel_radius').value
         self._timeout = self.get_parameter('cmd_vel_timeout').value
-        self._odom_frame = self.get_parameter('odom_frame').value
-        self._base_frame = self.get_parameter('base_frame').value
+        self._odom_frame  = self.get_parameter('odom_frame').value
+        self._base_frame  = self.get_parameter('base_frame').value
+        self._publish_tf  = self.get_parameter('publish_tf').value
         self._max_vx  = self.get_parameter('max_linear_speed').value
         self._max_wz  = self.get_parameter('max_angular_speed').value
 
@@ -67,8 +70,8 @@ class MotorControlNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        self._odom_pub   = self.create_publisher(Odometry, '/odom', sensor_qos)
-        self._status_pub = self.create_publisher(String,   '/motor_status',        10)
+        self._odom_pub   = self.create_publisher(Odometry, '/odom',                 sensor_qos)
+        self._status_pub = self.create_publisher(String,   '/motor_status',         10)
         self._stall_pub  = self.create_publisher(Bool,     '/motor/stall_detected', 10)
         self.create_service(Trigger, '/motor/reset_odometry', self._reset_odom_cb)
         self._tf_broadcaster = TransformBroadcaster(self)
@@ -178,28 +181,34 @@ class MotorControlNode(Node):
 
     def _parse_odom(self, line: str):
         parts = line.split(',')
-        if len(parts) != 8:
+        # Accept 8 fields (legacy, no stall) or 9 fields (with stall flag)
+        if len(parts) not in (8, 9):
             return
 
         try:
-            x, y, th, vx, vth, lv, rv = (float(p) for p in parts[1:])
+            x, y, th, vx, vth, lv, rv = (float(p) for p in parts[1:8])
+            stall = int(parts[8]) if len(parts) == 9 else 0
         except ValueError:
             return
 
+        # Publish stall if detected
+        if stall:
+            self._stall_pub.publish(Bool(data=True))
+
         now = self.get_clock().now().to_msg()
 
-        # TF: odom → base_link
-        tf = TransformStamped()
-        tf.header.stamp = now
-        tf.header.frame_id = self._odom_frame
-        tf.child_frame_id  = self._base_frame
-        tf.transform.translation.x = x
-        tf.transform.translation.y = y
-        tf.transform.translation.z = 0.0
-        # Quaternion from yaw
-        tf.transform.rotation.z = math.sin(th / 2.0)
-        tf.transform.rotation.w = math.cos(th / 2.0)
-        self._tf_broadcaster.sendTransform(tf)
+        # TF: odom → base_link (disabled when robot_localization EKF is running)
+        if self._publish_tf:
+            tf = TransformStamped()
+            tf.header.stamp = now
+            tf.header.frame_id = self._odom_frame
+            tf.child_frame_id  = self._base_frame
+            tf.transform.translation.x = x
+            tf.transform.translation.y = y
+            tf.transform.translation.z = 0.0
+            tf.transform.rotation.z = math.sin(th / 2.0)
+            tf.transform.rotation.w = math.cos(th / 2.0)
+            self._tf_broadcaster.sendTransform(tf)
 
         # Odometry message
         odom = Odometry()

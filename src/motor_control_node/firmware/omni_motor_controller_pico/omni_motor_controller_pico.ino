@@ -36,13 +36,22 @@ static const float KD = 0.0f;
 static const float INTEGRAL_MAX = 40.0f;
 static const float VEL_ALPHA    = 0.40f;   // faster tracking reduces startup integral wind-up
 
-static const int   MIN_PWM    = 35;   // 10kg high-torque motors — min driveable ~0.11 m/s, min angular ~0.75 rad/s
+static const int   MIN_PWM    = 50;   // raised 35→50: eliminates stall whine on inner wheel during arcing turns
 static const float FF_GAIN_L  = 16.3f;   // new high-torque motors: left slightly faster, needs lower FF
 static const float FF_GAIN_R  = 16.5f;   // new high-torque motors: trimmed down from 16.8 — right ran 1% fast
 
 // ── Encoder sign configurations ──────────────────────────────────────────────
 static const float L_ENC_DIR =  1.0f;   // flipped — encoder moved to wheel side
 static const float R_ENC_DIR = -1.0f;   // flipped — encoder moved to wheel side
+
+// ── Stall detection ───────────────────────────────────────────────────────────
+// Stall = motor commanded above MIN_PWM but encoder reports near-zero velocity
+// for STALL_COUNT_THRESHOLD consecutive PID cycles (10ms each = 300ms total).
+static const float   STALL_VEL_THRESHOLD   = 0.3f;  // rad/s — below this = not moving
+static const uint8_t STALL_COUNT_THRESHOLD = 30;     // 30 × 10ms = 300ms before declaring stall
+static uint8_t left_stall_count  = 0;
+static uint8_t right_stall_count = 0;
+static bool    stall_active       = false;
 
 struct WheelState {
     float target_rads;
@@ -232,6 +241,28 @@ void loop() {
 
         drive_motor(L_PWM, L_DIR, -l_out);   // negated — new motors run opposite direction
         drive_motor(R_PWM, R_DIR, -r_out);   // negated — new motors run opposite direction
+
+        // ── Stall detection ───────────────────────────────────────────────────
+        // MIN_PWM / FF_GAIN = minimum speed threshold in rad/s that would produce
+        // a PWM above the deadband. Below this target, don't flag as stall.
+        float min_rads = (float)MIN_PWM / FF_GAIN_L;
+
+        if (fabs(left_wheel.target_rads) > min_rads &&
+            fabs(left_wheel.actual_rads) < STALL_VEL_THRESHOLD) {
+            if (left_stall_count < STALL_COUNT_THRESHOLD) left_stall_count++;
+        } else {
+            left_stall_count = 0;
+        }
+
+        if (fabs(right_wheel.target_rads) > min_rads &&
+            fabs(right_wheel.actual_rads) < STALL_VEL_THRESHOLD) {
+            if (right_stall_count < STALL_COUNT_THRESHOLD) right_stall_count++;
+        } else {
+            right_stall_count = 0;
+        }
+
+        stall_active = (left_stall_count  >= STALL_COUNT_THRESHOLD ||
+                        right_stall_count >= STALL_COUNT_THRESHOLD);
     }
 
     // ── Displacement Odometry Engine (20 Hz) ───────────────────────────────────
@@ -271,6 +302,7 @@ void loop() {
         Serial.print(odom_vx,  4); Serial.print(",");
         Serial.print(odom_vth, 4); Serial.print(",");
         Serial.print(left_wheel.actual_rads  * WHEEL_RADIUS_M, 4); Serial.print(",");
-        Serial.println(right_wheel.actual_rads * WHEEL_RADIUS_M, 4);
+        Serial.print(right_wheel.actual_rads * WHEEL_RADIUS_M, 4); Serial.print(",");
+        Serial.println(stall_active ? 1 : 0);  // 8th field: stall flag
     }
 }
