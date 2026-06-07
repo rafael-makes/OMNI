@@ -79,6 +79,11 @@ class GeminiBridge:
         # so a crash-reconnect cycle doesn't re-greet mid-conversation.
         self._greeting_sent = False
 
+        # When set, replaces the normal greeting on the next session open.
+        # Used by _on_safety_fault so the fault is the first thing Gemini sees,
+        # with no race between open_session() and inject_context().
+        self._pending_prompt: str | None = None
+
         self._running = False
 
     # ── Lifecycle — called from the ROS2 thread ────────────────────────────────
@@ -99,11 +104,16 @@ class GeminiBridge:
         self._loop_thread.start()
         self._node.get_logger().info('GeminiBridge asyncio loop started')
 
-    def open_session(self):
+    def open_session(self, initial_prompt: str | None = None):
         """
         Schedule a new Gemini Live session on the asyncio loop.
         Returns immediately — the session opens asynchronously.
         Safe to call from the ROS2 thread.
+
+        initial_prompt — if set, replaces the normal wake-word greeting with this
+        text on the next session open. Used by _on_safety_fault so the fault is
+        the very first thing Gemini sees, eliminating the race between scheduling
+        open_session() and calling inject_context() a moment later.
         """
         def _schedule():
             # Guard: only block if the session is both task-running AND logically active.
@@ -116,7 +126,8 @@ class GeminiBridge:
                     'open_session() called but a session task is already running — ignoring'
                 )
                 return
-            self._greeting_sent = False   # new wake-word event → fresh greeting
+            self._greeting_sent  = False        # new wake-word event → fresh greeting
+            self._pending_prompt = initial_prompt  # None clears any leftover fault prompt
             self._session_task = self._loop.create_task(self._session_with_reconnect())
 
         self._loop.call_soon_threadsafe(_schedule)
@@ -261,18 +272,21 @@ class GeminiBridge:
             self._node.get_logger().info('Gemini Live session open — audio streaming active')
 
             try:
-                # Proactive greeting on first wake-word activation.
-                # session.send(end_of_turn=True) tells Gemini to respond immediately
-                # with audio. The _greeting_sent flag prevents re-greeting on reconnects.
+                # First message on session open — either a fault alert or the normal
+                # wake-word greeting. _pending_prompt is set by open_session() when
+                # a fault arrives so the alert fires the instant the session is ready,
+                # with no race against inject_context(). Cleared after sending.
                 if not self._greeting_sent:
-                    await session.send(
-                        input=(
+                    if self._pending_prompt:
+                        opening = self._pending_prompt
+                        self._pending_prompt = None
+                    else:
+                        opening = (
                             f'The user just activated you with the wake word. '
                             f'Say a single brief {period} greeting in character — '
                             f'one sentence only — then stop and wait for their request.'
-                        ),
-                        end_of_turn=True,
-                    )
+                        )
+                    await session.send(input=opening, end_of_turn=True)
                     self._greeting_sent = True
 
                 # gather() runs both coroutines concurrently on this event loop.

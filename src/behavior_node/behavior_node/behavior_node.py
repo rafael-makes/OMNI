@@ -253,6 +253,11 @@ class BehaviorNode(Node):
 
         self.get_logger().info(f'State: {old_state} → {new_state}')
 
+        # Clear the fault record when leaving ERROR so report_status() and any
+        # subsequent inject_context calls don't keep referencing a resolved fault.
+        if old_state == 'ERROR' and new_state != 'ERROR':
+            self._last_fault = None
+
         # Close the Gemini stream when the robot is busy driving.
         # The bridge handles reconnect logic when we return to IDLE.
         if new_state in _STATES_CLOSE_STREAM:
@@ -362,12 +367,15 @@ class BehaviorNode(Node):
             time.sleep(0.1)             # 100ms for ALSA to release device 0
             self._audio.start_capture() # now safe to open the mic
 
-        # Open the Gemini stream so OMNI can react in character
-        self._bridge.open_session()
-        # Inject the fault description — system prompt rule fires on [SYSTEM ALERT] prefix
-        self._bridge.inject_context(
-            f'Safety fault detected: {fault_text}. '
-            f'Inform the user immediately in character.'
+        # Pass the fault as initial_prompt so it is the very first thing Gemini
+        # sees when the session opens — no race with inject_context().
+        # [SYSTEM ALERT] prefix triggers the system-prompt urgency rule.
+        self._bridge.open_session(
+            initial_prompt=(
+                f'[SYSTEM ALERT] Safety fault detected: {fault_text}. '
+                f'Announce this fault immediately, in character — alarmed, urgent, '
+                f'C-3PO-ish. Do not wait for the user to ask.'
+            )
         )
 
     # ── Sensor subscribers ─────────────────────────────────────────────────────

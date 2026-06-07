@@ -148,12 +148,12 @@ controller_server:
     progress_checker_plugin: "progress_checker"
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      # required_movement_radius: how far (m) the robot must move per check
-      required_movement_radius: 0.5
-      # movement_time_allowance: raised 10→25s so stall_recovery_node has time
-      # to complete its backup+rotate+re-plan cycle (takes ~3s) before the
-      # progress checker declares failure. Multiple recovery attempts need ~9s.
-      movement_time_allowance: 25.0
+      # required_movement_radius: lowered 0.5→0.3m — slow progress through tight
+      # spots and doorways still counts, prevents false "stuck" declarations.
+      required_movement_radius: 0.3
+      # movement_time_allowance: raised to 45s — accounts for stall recovery cycles
+      # (~3s each), TF gap events, and slow progress through narrow passages.
+      movement_time_allowance: 45.0
 
     # goal_checker_plugins: decides when the robot has "arrived"
     goal_checker_plugin: "goal_checker"
@@ -269,11 +269,16 @@ controller_server:
       #   - facing away from the path/goal
       critics:
         ["Oscillation", "BaseObstacle",
-         "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+         "PathAlign", "PathDist", "GoalDist"]
 
-      # RotateToGoal removed — we use free heading (yaw_goal_tolerance=360°).
-      # Keeping it caused the robot to spin in place at the goal position,
-      # preventing StoppedGoalChecker from declaring success.
+      # RotateToGoal removed — free heading (yaw_goal_tolerance=360°).
+      # GoalAlign removed — caused 1-2 full rotations at goal arrival trying
+      #   to face yaw=0 (default goal heading). No meaningful goal orientation
+      #   with free-heading nav.
+      # PathAlign restored at reduced scale — was removed when EKF heading
+      #   mismatch caused spinning at path start. With raw wheel odometry the
+      #   heading is consistent with the map so PathAlign should behave.
+      #   Reduced 16→8 to soften the alignment pull without causing pre-spin.
 
       # Oscillation: penalizes switching directions repeatedly (getting stuck)
       # Raised 1.0→5.0 — stronger penalty discourages the +/- rotation
@@ -297,18 +302,9 @@ controller_server:
       # GoalDist: rewards trajectories that move toward the goal
       GoalDist.scale: 24.0
 
-      # GoalAlign: rewards trajectories where the robot faces the goal direction
-      # Reduced 24→10: was the main driver of diagonal corner-cutting —
-      # robot would face the goal through the wall and arc toward it.
-      GoalAlign.scale: 10.0
-      GoalAlign.forward_point_distance: 0.1
-
-      # PathAlign: rewards trajectories aligned with the global path heading
-      # Reduced from 32 — high value caused OMNI to stop and rotate to align
-      # before moving, making navigation stuttery. 16 still tracks the path
-      # but allows arcing toward it rather than stopping to face it first.
-      PathAlign.scale: 16.0
+      PathAlign.scale: 8.0
       PathAlign.forward_point_distance: 0.1
+
 
 
 # =============================================================================
@@ -465,15 +461,13 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # cost_scaling_factor: lowered 5.0→2.5 — broader cost gradient around
-        # walls pushes the planned path further from doorframe corners,
-        # forcing the planner to arc through the doorway center.
+        # cost_scaling_factor: 2.5 — broad cost gradient pushes path toward
+        # doorway center without making the passage too narrow for NavFn.
         cost_scaling_factor: 2.5
-        # inflation_radius: raised 0.15→0.30m — creates a wide cost field around
-        # walls so NavFn routes the path through the CENTER of doorways rather
-        # than cutting the corner. Doorway is 745mm so 0.30m inflation still
-        # leaves a 145mm corridor for the 0.15m robot_radius to plan through.
-        inflation_radius: 0.30
+        # inflation_radius: 0.22m — balances doorway center routing vs passability.
+        # 745mm doorway: 745 - 2×220 = 305mm navigable corridor (needs 150mm min).
+        # 0.30m was too large — doorway appeared only 145mm wide, blocking all plans.
+        inflation_radius: 0.22
 
 
 # =============================================================================

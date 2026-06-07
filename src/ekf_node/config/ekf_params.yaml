@@ -25,9 +25,10 @@ ekf_filter_node:
   ros__parameters:
 
     # Frequency to run the EKF prediction step (Hz).
-    # Reduced to 5Hz — Pi 5 was only achieving 2.5Hz at 10Hz setting.
-    # 5Hz = 200ms per cycle, well within Pi 5 budget alongside all other nodes.
-    frequency: 5.0
+    # Previously reduced to 5Hz after observing 2.5Hz at 10Hz — root cause was
+    # 1e-9 P0 matrix causing near-singular Kalman gain inversions at startup.
+    # With P0 fixed, 20Hz should be achievable on Pi 5.
+    frequency: 20.0
 
     # sensor_timeout: if a sensor goes silent for this many seconds,
     # the EKF continues predicting without it (dead reckoning).
@@ -41,8 +42,13 @@ ekf_filter_node:
     # 0 is correct — we're not simulating.
     transform_time_offset: 0.0
 
-    # transform_timeout: seconds to wait for a TF before giving up.
-    transform_timeout: 0.1
+    # transform_timeout: 0.0 = non-blocking TF lookup.
+    # robot_localization calls lookupTransform on a single-threaded executor with
+    # no dedicated TF thread. Any non-zero timeout causes a blocking wait that
+    # compounds across multiple lookups — 4 × 0.1s = 0.4s/cycle = 2.478Hz cap.
+    # With 0.0, if the transform isn't immediately available it's skipped rather
+    # than blocking. TFs from motor_control_node and imu_node are always fresh.
+    transform_timeout: 0.0
 
     # print_diagnostics: publish /diagnostics so you can monitor EKF health.
     print_diagnostics: true
@@ -151,20 +157,33 @@ ekf_filter_node:
     # ==========================================================================
     # Initial estimate covariance (P0 matrix)
     # ==========================================================================
-    # Uncertainty in the initial state. High values = EKF is uncertain at startup
-    # and will trust sensor measurements more until it converges.
-    initial_estimate_covariance: [1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
-                                  0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+    # Uncertainty in the initial state. 1e-9 everywhere was the original bug —
+    # near-zero P0 means "I am certain about my starting state", which causes
+    # near-singular Kalman gain matrix inversions on the first sensor update,
+    # blowing up CPU time and stalling the filter.
+    # Values here reflect genuine startup uncertainty for a ground robot:
+    #   x, y (0,1):     1e-3 m²    — know roughly where we started
+    #   z (2):          1e-9       — locked by two_d_mode, doesn't matter
+    #   roll,pitch(3,4):1e-9       — locked by two_d_mode, doesn't matter
+    #   yaw (5):        1e-3 rad²  — IMU gives heading, modest uncertainty
+    #   vx (6):         1e-2 m²/s² — robot starts stationary but velocity unknown
+    #   vy (7):         1e-9       — non-holonomic, always ~0
+    #   vz (8):         1e-9       — locked by two_d_mode
+    #   vroll,vpitch(9,10): 1e-9   — locked by two_d_mode
+    #   vyaw (11):      1e-2 rad²/s² — turn rate uncertain at startup
+    #   ax,ay,az(12-14):1e-9       — not fused, doesn't matter
+    initial_estimate_covariance: [1.0e-3, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    1.0e-3, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
-                                  0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
-                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-3, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-2, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,    0.0,
-                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,    0.0,
+                                  0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-2, 0.0,    0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,    0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9, 0.0,
                                   0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    0.0,    1.0e-9]

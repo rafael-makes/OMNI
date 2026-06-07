@@ -204,13 +204,18 @@ class SafetyNode(Node):
         # 1. Update auto-clearing faults based on latest sensor readings.
         #    Latching faults (stall, estop) are only cleared by _clear_fault_cb.
 
-        # Watchdog: if nav_node has been silent, we have no idea what it intends.
-        # Treat silence as a fault until it speaks again.
+        # Watchdog: only relevant when motion was actively commanded.
+        # If the last received command was zero (or nothing ever arrived), the
+        # robot is legitimately idle — silence is expected and is not a fault.
         elapsed = time.monotonic() - self._last_cmd_time
-        if elapsed > self._watchdog_sec:
+        last = self._latest_cmd_vel_raw
+        last_was_moving = (
+            last.linear.x != 0.0 or last.linear.y != 0.0 or last.angular.z != 0.0
+        )
+        if last_was_moving and elapsed > self._watchdog_sec:
             if not self.fault_watchdog:
                 self.fault_watchdog = True
-                self._publish_fault(f'fault_watchdog: no /cmd_vel_raw for {elapsed:.2f}s')
+                self._publish_fault(f'fault_watchdog: no /cmd_vel_raw for {elapsed:.2f}s after non-zero command')
         else:
             self.fault_watchdog = False
 

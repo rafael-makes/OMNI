@@ -84,8 +84,7 @@ def generate_launch_description():
         name='controller_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        # controller_server publishes velocity directly to /cmd_vel
-        # → motor_control_node. No safety relay needed at this stage.
+        remappings=[('cmd_vel', 'cmd_vel_raw')],
     )
 
     behavior_server = Node(
@@ -94,7 +93,7 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=[params_file, {'use_sim_time': use_sim_time}],
-        # behavior_server recovery behaviors also publish to /cmd_vel directly.
+        remappings=[('cmd_vel', 'cmd_vel_raw')],
     )
 
     smoother_server = Node(

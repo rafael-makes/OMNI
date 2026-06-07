@@ -366,7 +366,7 @@ class FunctionHandlers:
 
         sub = self._node.create_subscription(
             PoseWithCovarianceStamped,
-            '/amcl_pose',
+            '/pose',
             _pose_cb,
             1,
         )
@@ -377,13 +377,13 @@ class FunctionHandlers:
 
         if not received:
             self._node.get_logger().warn(
-                'save_location: timed out waiting for /amcl_pose — '
-                'is Nav2 running and localised?'
+                'save_location: timed out waiting for /pose — '
+                'is slam_toolbox running in localization mode?'
             )
             return (
                 "I'm afraid my localisation system does not appear to be running — "
-                "no pose was received on /amcl_pose after three seconds. "
-                "Nav2 must be active and fully localised before I can save a location."
+                "no pose was received from slam_toolbox after three seconds. "
+                "The slam node must be active and localised before I can save a location."
             )
 
         pose_msg = holder[0]

@@ -70,10 +70,10 @@ def generate_launch_description():
     )
 
     # SLAM
-    slam_params_arg = DeclareLaunchArgument(
-        'slam_params_file',
-        default_value=os.path.join(slam_pkg, 'config', 'mapper_params_online_async.yaml'),
-        description='Path to slam_toolbox mapper_params_online_async.yaml',
+    slam_map_arg = DeclareLaunchArgument(
+        'map_file',
+        default_value='/home/pi/omni_ws/maps/omni_home_map',
+        description='Path prefix of the saved pose graph (no extension)',
     )
 
     # Nav2
@@ -118,7 +118,7 @@ def generate_launch_description():
     )
     wake_word_model_arg = DeclareLaunchArgument(
         'wake_word_model',
-        default_value='hey_mycroft',
+        default_value='omni',
         description='openwakeword model name, without .onnx extension',
     )
     wake_word_threshold_arg = DeclareLaunchArgument(
@@ -279,24 +279,40 @@ def generate_launch_description():
         }],
     )
 
-    # ── SLAM ───────────────────────────────────────────────────────────────────
-    # Delegates entirely to slam_launch.py, which:
-    #   - Starts async_slam_toolbox_node as a LifecycleNode
-    #   - Starts base_link → lidar_link static TF publisher
+    # ── SLAM — localization mode ───────────────────────────────────────────────
+    # Loads the saved pose graph and localises within the existing map.
+    # Does not modify the map. Delegates to localization_launch.py which:
+    #   - Starts localization_slam_toolbox_node as a LifecycleNode
+    #   - Starts base_link → lidar_link + all ToF static TF publishers
     #   - Sends configure at t=3s, activate at t=8s via internal TimerActions
-    # use_lifecycle_manager=false keeps slam_toolbox self-managed, separate from
-    # Nav2's lifecycle_manager (which does not include slam_toolbox in node_names).
 
     slam_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(slam_pkg, 'launch', 'slam_launch.py')
+            os.path.join(slam_pkg, 'launch', 'localization_launch.py')
         ),
         launch_arguments=[
             ('use_sim_time',          LaunchConfiguration('use_sim_time')),
-            ('slam_params_file',      LaunchConfiguration('slam_params_file')),
+            ('map_file',              LaunchConfiguration('map_file')),
             ('autostart',             'true'),
             ('use_lifecycle_manager', 'false'),
         ],
+    )
+
+    # ── Foxglove bridge ────────────────────────────────────────────────────────
+    foxglove_node = Node(
+        package='foxglove_bridge',
+        executable='foxglove_bridge',
+        name='foxglove_bridge',
+        output='screen',
+    )
+
+    # ── Stall recovery ─────────────────────────────────────────────────────────
+    stall_recovery_node = Node(
+        package='stall_recovery_node',
+        executable='stall_recovery_node',
+        name='stall_recovery_node',
+        output='screen',
+        emulate_tty=True,
     )
 
     # ── Nav2 stack (delayed) ───────────────────────────────────────────────────
@@ -350,7 +366,7 @@ def generate_launch_description():
     return LaunchDescription([
         # Arguments
         use_sim_time_arg,
-        slam_params_arg,
+        slam_map_arg,
         nav_params_arg,
         motor_port_arg,
         lidar_port_arg,
@@ -367,7 +383,7 @@ def generate_launch_description():
         speaker_index_arg,
         tcp_mic_arg,
         # Static TF
-        LogInfo(msg='[omni_full] Starting OMNI full stack'),
+        LogInfo(msg='[omni_full] Starting OMNI full stack — localization mode'),
         imu_tf,
         camera_tf,
         # Sensors (t=0)
@@ -383,10 +399,13 @@ def generate_launch_description():
         eye_node,
         servo_node,
         chest_node,
-        # SLAM (configure@3s, activate@8s — internal timers)
+        # SLAM localization (configure@3s, activate@8s — internal timers)
         slam_include,
         # Nav2 (t=12s — waits for SLAM to be active)
         nav_delayed,
         # Brain (t=0 — wake word active immediately)
         behavior_node,
+        # Tools
+        foxglove_node,
+        stall_recovery_node,
     ])
