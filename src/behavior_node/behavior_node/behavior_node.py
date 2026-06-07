@@ -161,6 +161,7 @@ class BehaviorNode(Node):
 
         # ── Subscribers ────────────────────────────────────────────────────────
         self.create_subscription(String,       '/safety/fault',   self._on_safety_fault,  10)
+        self.create_subscription(String,       '/safety/status',  self._on_safety_status,  10)
         self.create_subscription(BatteryState, '/battery/status', self._on_battery_status, 10)
         self.create_subscription(OccupancyGrid,'/map/coverage',   self._on_map_coverage,  10)
         self.create_subscription(String,       '/map/location',   self._on_map_location,  10)
@@ -377,6 +378,18 @@ class BehaviorNode(Node):
                 f'C-3PO-ish. Do not wait for the user to ask.'
             )
         )
+
+    def _on_safety_status(self, msg: String):
+        """
+        Fires at 1 Hz from safety_node. If safety returns to OK while behavior_node
+        is in ERROR, auto-recover to IDLE so OMNI responds to the wake word again.
+        """
+        if self._current_state == 'ERROR' and msg.data.startswith('OK'):
+            self.get_logger().info('Safety cleared — auto-recovering from ERROR to IDLE')
+            self._bridge.close_session()
+            self._audio.stop_capture()
+            self._set_state('IDLE')
+            self._wake.start()
 
     # ── Sensor subscribers ─────────────────────────────────────────────────────
 

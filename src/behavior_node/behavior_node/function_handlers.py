@@ -23,14 +23,20 @@ import os
 import tempfile
 import threading
 
+import rclpy
+import rclpy.duration
+import rclpy.time
 import yaml
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from google.genai import types as genai_types
 from nav2_msgs.action import NavigateToPose
+from tf2_ros import Buffer, TransformListener
 
 # ── Valid robot states ─────────────────────────────────────────────────────────
 # Kept here as the single source of truth — imported by behavior_node.py too.
-VALID_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'}
+# NAVIGATING is intentionally excluded — navigation state is set automatically
+# by navigate_to(). Gemini must never call set_robot_state('NAVIGATING') directly.
+VALID_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'EXPLORING', 'DOCKING', 'ERROR'}
 
 # ── Tool declarations ──────────────────────────────────────────────────────────
 # Passed to Gemini's LiveConnectConfig when the session opens.
@@ -43,9 +49,9 @@ OMNI_TOOLS = [
             genai_types.FunctionDeclaration(
                 name='set_robot_state',
                 description=(
-                    'Change OMNI\'s operating state. Call this to signal what '
-                    'OMNI is currently doing — SPEAKING when talking, LISTENING '
-                    'when waiting for input, IDLE when conversation ends.'
+                    'Change OMNI\'s operating state. Use IDLE when conversation ends, '
+                    'SPEAKING when talking, LISTENING when waiting for input. '
+                    'NEVER use this to start navigation — call navigate_to() instead.'
                 ),
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
@@ -54,7 +60,8 @@ OMNI_TOOLS = [
                             type=genai_types.Type.STRING,
                             description=(
                                 f'One of: {", ".join(sorted(VALID_STATES))}. '
-                                'Use IDLE when the conversation is fully finished.'
+                                'Use IDLE when the conversation is fully finished. '
+                                'Do NOT use NAVIGATING here — call navigate_to() for navigation.'
                             ),
                         )
                     },
@@ -153,6 +160,8 @@ class FunctionHandlers:
                rather than copying values so handlers always see current state.
         """
         self._node = node
+        self._tf_buffer   = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, node)
 
     def handle(self, function_name: str, args: dict) -> str:
         """
@@ -354,64 +363,28 @@ class FunctionHandlers:
                 "this is most irregular. The location cannot be saved."
             )
 
-        # Create a one-shot subscription to /amcl_pose and wait up to 3 seconds.
-        # The callback runs on the ROS2 executor thread; we block here (thread-pool
-        # executor) on a threading.Event so the two threads coordinate safely.
-        pose_event  = threading.Event()
-        holder      = [None]  # mutable container so the nested callback can write to it
-
-        def _pose_cb(msg):
-            holder[0] = msg
-            pose_event.set()
-
-        sub = self._node.create_subscription(
-            PoseWithCovarianceStamped,
-            '/pose',
-            _pose_cb,
-            1,
-        )
+        # Look up current pose from the TF tree: map → base_link.
+        # This is always available as long as slam_toolbox and motor_control_node
+        # are running — no dependency on /pose being published.
         try:
-            received = pose_event.wait(timeout=3.0)
-        finally:
-            self._node.destroy_subscription(sub)
-
-        if not received:
-            self._node.get_logger().warn(
-                'save_location: timed out waiting for /pose — '
-                'is slam_toolbox running in localization mode?'
+            tf = self._tf_buffer.lookup_transform(
+                'map', 'base_link',
+                rclpy.time.Time(),          # latest available
+                timeout=rclpy.duration.Duration(seconds=3.0),
             )
+        except Exception as exc:
+            self._node.get_logger().warn(f'save_location: TF lookup failed: {exc}')
             return (
                 "I'm afraid my localisation system does not appear to be running — "
-                "no pose was received from slam_toolbox after three seconds. "
+                "the map-to-base transform is unavailable. "
                 "The slam node must be active and localised before I can save a location."
             )
 
-        pose_msg = holder[0]
-
-        # pose.covariance is a flat 36-element row-major 6×6 matrix.
-        # Diagonal indices: x=0, y=7, yaw=35.  Threshold of 0.5 m²/rad².
-        cov     = pose_msg.pose.covariance
-        cov_x   = cov[0]
-        cov_y   = cov[7]
-        cov_yaw = cov[35]
-        _COV_THRESHOLD = 0.5
-        if max(cov_x, cov_y, cov_yaw) >= _COV_THRESHOLD:
-            self._node.get_logger().warn(
-                f'save_location: covariance too high — '
-                f'cov_x={cov_x:.3f}, cov_y={cov_y:.3f}, cov_yaw={cov_yaw:.3f}'
-            )
-            return (
-                "I must warn you — my localisation is currently rather uncertain, "
-                "with a covariance I find most alarming. "
-                "I cannot, in good conscience, save an unreliable position. "
-                "Please allow the localisation to settle and try again."
-            )
-
-        # Extract x, y, and yaw from the pose.
-        p       = pose_msg.pose.pose.position
-        ori     = pose_msg.pose.pose.orientation
-        x       = p.x
-        y       = p.y
+        # Extract x, y, and yaw from the transform.
+        t       = tf.transform.translation
+        ori     = tf.transform.rotation
+        x       = t.x
+        y       = t.y
         yaw_rad = 2.0 * math.atan2(ori.z, ori.w)
         yaw_deg = round(math.degrees(yaw_rad), 1)
 

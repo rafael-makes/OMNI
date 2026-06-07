@@ -141,13 +141,16 @@ class SafetyNode(Node):
             self.get_logger().warn(f'Voltage callback error: {e}')
 
     def _stall_cb(self, msg: Bool):
-        # Stall is a LATCHING fault — once detected, a human must clear it.
-        # Reason: a stall often means something is physically jammed or broken.
-        # We want a human to inspect before the robot moves again.
+        # Stall auto-clears when the motor reports no longer stalled.
+        # Latching was too aggressive — low battery causes false stalls during
+        # normal Nav2 navigation, leaving the robot unrecoverable without SSH.
         try:
             if msg.data and not self.fault_stall:
                 self.fault_stall = True
-                self._publish_fault('fault_stall: motor stall detected — send "stall" or "all" to /safety/clear_fault to reset')
+                self._publish_fault('fault_stall: motor stall detected — will auto-clear when stall resolves')
+            elif not msg.data and self.fault_stall:
+                self.fault_stall = False
+                self.get_logger().info('fault_stall auto-cleared — motor no longer stalled')
         except Exception as e:
             self.get_logger().warn(f'Stall callback error: {e}')
 
