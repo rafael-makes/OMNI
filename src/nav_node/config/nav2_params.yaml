@@ -375,9 +375,9 @@ smoother_server:
       max_its: 1000
       # w_data: weight for keeping path close to original waypoints
       w_data: 0.2
-      # w_smooth: raised 0.3→0.5 — smoother path transitions reduce the jolt
-      # when a new global plan is handed to the controller.
-      w_smooth: 0.5
+      # w_smooth: raised 0.5→0.8 — aggressively smooths sharp corners in the
+      # global path so DWB gets gradual arc targets instead of tight bends.
+      w_smooth: 0.8
       # do_refinement: whether to iteratively refine after initial smooth
       do_refinement: True
 
@@ -465,12 +465,12 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         # cost_scaling_factor: 2.5 — broad cost gradient pushes path toward
         # doorway center without making the passage too narrow for NavFn.
-        # cost_scaling_factor: 1.5 — broader gradient routes NavFn through hallway
-        # centers instead of cutting corners close to walls.
-        cost_scaling_factor: 1.5
-        # inflation_radius: 0.15m — slightly larger than 0.12m to push path center
-        # away from walls, helping OMNI set up wide before turns.
-        inflation_radius: 0.15
+        # cost_scaling_factor: 1.0 — very broad gradient, pushes NavFn path well
+        # away from walls and corner edges for centered hallway routing.
+        cost_scaling_factor: 1.0
+        # inflation_radius: 0.25m — large enough to push path to hallway center.
+        # NavFn treats inflated cells as costly so it routes around the "fat" corner.
+        inflation_radius: 0.25
 
 
 # =============================================================================
