@@ -113,7 +113,7 @@ def generate_launch_description():
     )
     config_file_arg = DeclareLaunchArgument(
         'config_file_path',
-        default_value=os.path.join(behavior_pkg, 'config', 'omni_config.yaml'),
+        default_value='/home/pi/omni_config.yaml',
         description='Absolute path to omni_config.yaml (system prompt + locations)',
     )
     wake_word_model_arg = DeclareLaunchArgument(
