@@ -183,11 +183,12 @@ controller_server:
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
       max_vel_x: 0.3
 
-      # min_vel_x: raised 0.05→0.15 to match MIN_PWM=50 floor.
-      # MIN_PWM=50 → min wheel speed ~0.163 m/s. Inner wheel during arc =
-      # min_vel_x - angular * track/2. At 0.15 m/s linear the inner wheel
-      # stays above the deadband for moderate turns.
-      min_vel_x: 0.15
+      # min_vel_x: negative value allows reversing.
+      # -0.15 m/s gives DWB a backup option when forward paths are blocked.
+      # MIN_PWM floor still applies — motor_control_node clips anything below
+      # its deadband, so very slow reverse commands may not move the robot,
+      # but allowing negative values lets DWB choose to back up in tight spots.
+      min_vel_x: -0.15
 
       # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
       max_vel_y: 0.0
