@@ -421,14 +421,21 @@ class BehaviorNode(Node):
     def _on_safety_status(self, msg: String):
         """
         Fires at 1 Hz from safety_node. If safety returns to OK while behavior_node
-        is in ERROR, auto-recover to IDLE so OMNI responds to the wake word again.
+        is stuck in a fault-related state (ERROR or SPEAKING from fault announcement),
+        auto-recover to IDLE so OMNI responds to the wake word again.
         """
-        if self._current_state == 'ERROR' and msg.data.startswith('OK'):
-            self.get_logger().info('Safety cleared — auto-recovering from ERROR to IDLE')
-            self._bridge.close_session()
-            self._audio.stop_capture()
-            self._set_state('IDLE')
-            self._wake.start()
+        if msg.data.startswith('OK') and self._current_state in ('ERROR', 'SPEAKING'):
+            # Only auto-recover if the fault has been cleared — don't interrupt
+            # a normal conversation that happens to coincide with safety OK.
+            if self._last_fault is not None:
+                self.get_logger().info(
+                    f'Safety cleared — auto-recovering from {self._current_state} to IDLE'
+                )
+                self._bridge.close_session()
+                self._audio.stop_capture()
+                self._last_fault = None
+                self._set_state('IDLE')
+                self._wake.start()
 
     # ── Sensor subscribers ─────────────────────────────────────────────────────
 

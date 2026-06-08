@@ -181,7 +181,7 @@ controller_server:
 
       # max_vel_x: maximum forward speed (m/s)
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
-      max_vel_x: 0.3
+      max_vel_x: 0.4
 
       # min_vel_x: negative value allows reversing.
       # -0.15 m/s gives DWB a backup option when forward paths are blocked.
@@ -200,10 +200,10 @@ controller_server:
       min_vel_theta: 0.0
 
       # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
-      max_speed_xy: 0.3
+      max_speed_xy: 0.4
 
       # min_speed_xy: raised to match MIN_PWM=50 floor (~0.163 m/s)
-      min_speed_xy: 0.17
+      min_speed_xy: 0.20
 
       # min_speed_theta: MIN_PWM=50 → each wheel ~0.163 m/s → angular floor
       # = 0.163 / (track/2) = 0.163 / 0.1525 = 1.07 rad/s. 1.1 gives margin.
