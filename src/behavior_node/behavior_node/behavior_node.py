@@ -156,10 +156,11 @@ class BehaviorNode(Node):
         self._current_goal_handle = None   # ClientGoalHandle, or None if not navigating
 
         # ── Publishers ─────────────────────────────────────────────────────────
-        self._state_pub  = self.create_publisher(String,             '/robot_state',    10)
-        self._speech_pub = self.create_publisher(String,             '/audio/speech',   10)
-        self._servo_pub  = self.create_publisher(Float32MultiArray,  '/servo_commands', 10)
-        self._levels_pub = self.create_publisher(Float32MultiArray,  '/audio/levels',   10)
+        self._state_pub       = self.create_publisher(String,             '/robot_state',         10)
+        self._speech_pub      = self.create_publisher(String,             '/audio/speech',        10)
+        self._servo_pub       = self.create_publisher(Float32MultiArray,  '/servo_commands',      10)
+        self._levels_pub      = self.create_publisher(Float32MultiArray,  '/audio/levels',        10)
+        self._clear_fault_pub = self.create_publisher(String,             '/safety/clear_fault',  10)
 
         # ── Subscribers ────────────────────────────────────────────────────────
         self.create_subscription(String,       '/safety/fault',   self._on_safety_fault,  10)
@@ -338,9 +339,9 @@ class BehaviorNode(Node):
 
         elapsed = time.monotonic() - entered
 
-        if state == 'NAVIGATING' and elapsed > 120.0:
-            # Navigation taking more than 2 minutes with no state transition —
-            # goal callbacks are likely lost. Cancel and recover.
+        if state == 'NAVIGATING' and elapsed > 180.0:
+            # Navigation taking more than 3 minutes with no state transition —
+            # Nav2 goal result callback likely lost. Cancel and recover.
             self.get_logger().warn(
                 f'Watchdog: stuck in NAVIGATING for {elapsed:.0f}s — cancelling and returning to IDLE'
             )
@@ -348,10 +349,9 @@ class BehaviorNode(Node):
                 self._current_goal_handle.cancel_goal_async()
                 self._current_goal_handle = None
             self._set_state('IDLE')
-            self._wake.start()
 
-        elif state == 'SPEAKING' and elapsed > 60.0:
-            # Speaking for more than 60s — Gemini stream likely died.
+        elif state == 'SPEAKING' and elapsed > 45.0:
+            # Speaking for more than 45s — Gemini stream likely died without a clean close.
             self.get_logger().warn(
                 f'Watchdog: stuck in SPEAKING for {elapsed:.0f}s — closing session and returning to IDLE'
             )
@@ -359,12 +359,11 @@ class BehaviorNode(Node):
             self._audio.stop_capture()
             self._fault_active = False
             self._set_state('IDLE')
-            self._wake.start()
 
-        elif state == 'ERROR' and elapsed > 35.0:
-            # ERROR for more than 35s — fault session timed out without recovery.
-            # Safety may still be faulted but we restore the wake word so the user
-            # can at least talk to OMNI and ask it to clear the fault.
+        elif state == 'ERROR' and elapsed > 25.0:
+            # ERROR for more than 25s — fault session timed out without recovery.
+            # Safety may still be faulted but restore the wake word so the user
+            # can talk to OMNI and ask it to clear the fault.
             self.get_logger().warn(
                 f'Watchdog: stuck in ERROR for {elapsed:.0f}s — restoring wake word'
             )
@@ -372,7 +371,6 @@ class BehaviorNode(Node):
             self._audio.stop_capture()
             self._fault_active = False
             self._set_state('IDLE')
-            self._wake.start()
 
     # ── Wake word callback ─────────────────────────────────────────────────────
 
@@ -455,8 +453,7 @@ class BehaviorNode(Node):
                 self._audio.stop_capture()
                 self._fault_active = False
                 self._last_fault   = None
-                self._set_state('IDLE')
-                self._wake.start()
+                self._set_state('IDLE')   # _set_state('IDLE') starts the wake word internally
 
     # ── Sensor subscribers ─────────────────────────────────────────────────────
 
@@ -594,13 +591,19 @@ class BehaviorNode(Node):
                 'could not find a path. One sentence only.'
             )
 
-        self._set_state('IDLE')
-
         if prompt:
-            self._wake.stop()
-            time.sleep(0.1)
+            # Transition to LISTENING so conversation_timeout handles session cleanup.
+            # Do NOT go through IDLE first — that would start the wake word detector
+            # and immediately need to stop it again (race condition + ALSA conflict).
+            # In NAVIGATING state: mic was not running, wake word was not running.
+            # Just start capture, set LISTENING, open session. Timeout closes cleanly.
             self._audio.start_capture()
+            self._reset_conversation_timeout()
+            self._set_state('LISTENING')
             self._bridge.open_session(initial_prompt=prompt)
+        else:
+            # Cancelled — return to IDLE directly (wake word resumes)
+            self._set_state('IDLE')
 
     def _nav_feedback_callback(self, feedback_msg):
         """Receives periodic distance-remaining feedback from bt_navigator."""

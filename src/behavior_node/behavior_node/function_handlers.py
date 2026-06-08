@@ -33,10 +33,13 @@ from nav2_msgs.action import NavigateToPose
 from tf2_ros import Buffer, TransformListener
 
 # ── Valid robot states ─────────────────────────────────────────────────────────
-# Kept here as the single source of truth — imported by behavior_node.py too.
-# NAVIGATING is intentionally excluded — navigation state is set automatically
-# by navigate_to(). Gemini must never call set_robot_state('NAVIGATING') directly.
-VALID_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'EXPLORING', 'DOCKING', 'ERROR'}
+# ALL states that _set_state() will accept. Imported by behavior_node.py.
+# NAVIGATING is included here so internal code can set it (e.g. navigate_to()).
+VALID_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'}
+
+# States Gemini is allowed to request via set_robot_state().
+# NAVIGATING is intentionally excluded — navigation is started by navigate_to() only.
+_GEMINI_SETTABLE_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'EXPLORING', 'DOCKING', 'ERROR'}
 
 # ── Tool declarations ──────────────────────────────────────────────────────────
 # Passed to Gemini's LiveConnectConfig when the session opens.
@@ -59,7 +62,7 @@ OMNI_TOOLS = [
                         'state': genai_types.Schema(
                             type=genai_types.Type.STRING,
                             description=(
-                                f'One of: {", ".join(sorted(VALID_STATES))}. '
+                                f'One of: {", ".join(sorted(_GEMINI_SETTABLE_STATES))}. '
                                 'Use IDLE when the conversation is fully finished. '
                                 'Do NOT use NAVIGATING here — call navigate_to() for navigation.'
                             ),
@@ -144,6 +147,25 @@ OMNI_TOOLS = [
                 ),
             ),
 
+            genai_types.FunctionDeclaration(
+                name='clear_fault',
+                description=(
+                    'Clear an active safety fault. Call this when the user asks OMNI to clear '
+                    'a fault, reset an error, or try again after a stall or stop. '
+                    'Valid fault types: "stall" (motor stall), "estop" (emergency stop), "all" (clear everything).'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        'fault_type': genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description='Which fault to clear: "stall", "estop", or "all".',
+                        )
+                    },
+                    required=['fault_type'],
+                ),
+            ),
+
         ]
     )
 ]
@@ -176,6 +198,7 @@ class FunctionHandlers:
             'report_status':    self._report_status,
             'explore_area':     self._explore_area,
             'save_location':    self._save_location,
+            'clear_fault':      self._clear_fault,
         }
         handler = handlers.get(function_name)
         if handler is None:
@@ -190,8 +213,13 @@ class FunctionHandlers:
 
     def _set_robot_state(self, args: dict) -> str:
         state = args.get('state', '').upper()
-        if state not in VALID_STATES:
-            self._node.get_logger().warn(f'Gemini requested invalid state: {state!r}')
+        if state not in _GEMINI_SETTABLE_STATES:
+            self._node.get_logger().warn(f'Gemini requested invalid/forbidden state: {state!r}')
+            if state == 'NAVIGATING':
+                return (
+                    "I must not set the NAVIGATING state directly. "
+                    "Call navigate_to() with a location name to begin navigation."
+                )
             return (
                 f"I must inform you that '{state}' is not a recognised operating state. "
                 f"I shall remain in my current configuration."
@@ -438,3 +466,34 @@ class FunctionHandlers:
             f"x={x:.2f}, y={y:.2f}, heading {yaw_deg:.0f} degrees — "
             f"a most satisfactory position, I must say."
         )
+
+    def _clear_fault(self, args: dict) -> str:
+        fault_type = args.get('fault_type', 'all').lower().strip()
+        valid = {'stall', 'estop', 'all'}
+        if fault_type not in valid:
+            return (
+                f"I'm afraid '{fault_type}' is not a recognised fault type. "
+                f"I can clear 'stall', 'estop', or 'all'."
+            )
+
+        from std_msgs.msg import String as StringMsg
+        msg = StringMsg()
+        msg.data = fault_type
+        self._node._clear_fault_pub.publish(msg)
+        self._node.get_logger().info(f'clear_fault: publishing "{fault_type}" to /safety/clear_fault')
+
+        if fault_type == 'stall':
+            return (
+                "I have transmitted a stall fault reset to the safety system. "
+                "The motors should resume normal operation momentarily — fingers crossed, as it were."
+            )
+        elif fault_type == 'estop':
+            return (
+                "I have reset the emergency stop. "
+                "I must warn you — please ensure the area is clear before I resume movement."
+            )
+        else:
+            return (
+                "All active safety faults have been cleared. "
+                "I am standing by for your next instruction — how refreshing."
+            )
