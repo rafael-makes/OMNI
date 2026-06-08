@@ -40,13 +40,15 @@ class SafetyNode(Node):
         self.declare_parameter('critical_voltage',     10.5)  # 3S LiPo absolute floor (3.5V/cell)
         self.declare_parameter('warning_voltage',      11.1)  # 3S LiPo low warning (3.7V/cell)
         self.declare_parameter('watchdog_timeout_sec',  0.5)  # silence on /cmd_vel_raw → fault
+        self.declare_parameter('stall_clear_timeout_sec', 2.0) # seconds after last stall msg before auto-clear
         self.declare_parameter('min_proximity_m',       0.15) # 15 cm proximity stop
 
         self._max_tilt      = self.get_parameter('max_tilt_degrees').value
         self._crit_voltage  = self.get_parameter('critical_voltage').value
         self._warn_voltage  = self.get_parameter('warning_voltage').value
-        self._watchdog_sec  = self.get_parameter('watchdog_timeout_sec').value
-        self._min_proximity = self.get_parameter('min_proximity_m').value
+        self._watchdog_sec      = self.get_parameter('watchdog_timeout_sec').value
+        self._stall_clear_sec   = self.get_parameter('stall_clear_timeout_sec').value
+        self._min_proximity     = self.get_parameter('min_proximity_m').value
 
         # ── Fault state ───────────────────────────────────────────────────────
         # Each fault is its own named bool — easy to read, easy to log, no
@@ -65,6 +67,7 @@ class SafetyNode(Node):
         # ── Shared state updated by subscriber callbacks ───────────────────────
         self._latest_cmd_vel_raw = Twist()          # last velocity command from nav
         self._last_cmd_time      = time.monotonic() # timestamp of last /cmd_vel_raw msg
+        self._last_stall_time    = 0.0              # timestamp of last stall True message
         self._current_voltage    = 0.0              # latest BMS pack voltage
         self._current_tilt_deg   = 0.0              # latest tilt in degrees
 
@@ -141,16 +144,15 @@ class SafetyNode(Node):
             self.get_logger().warn(f'Voltage callback error: {e}')
 
     def _stall_cb(self, msg: Bool):
-        # Stall auto-clears when the motor reports no longer stalled.
-        # Latching was too aggressive — low battery causes false stalls during
-        # normal Nav2 navigation, leaving the robot unrecoverable without SSH.
+        # Pico publishes True when stalling but never publishes False to clear.
+        # Auto-clear uses a timestamp: if no new stall message arrives within
+        # stall_clear_timeout_sec, the fault clears itself in _safety_check_cb.
         try:
-            if msg.data and not self.fault_stall:
-                self.fault_stall = True
-                self._publish_fault('fault_stall: motor stall detected — will auto-clear when stall resolves')
-            elif not msg.data and self.fault_stall:
-                self.fault_stall = False
-                self.get_logger().info('fault_stall auto-cleared — motor no longer stalled')
+            if msg.data:
+                if not self.fault_stall:
+                    self.fault_stall = True
+                    self._publish_fault('fault_stall: motor stall detected — will auto-clear if stall stops')
+                self._last_stall_time = time.monotonic()
         except Exception as e:
             self.get_logger().warn(f'Stall callback error: {e}')
 
@@ -221,6 +223,14 @@ class SafetyNode(Node):
                 self._publish_fault(f'fault_watchdog: no /cmd_vel_raw for {elapsed:.2f}s after non-zero command')
         else:
             self.fault_watchdog = False
+
+        # Stall auto-clear: Pico only publishes True, never False.
+        # If no stall message has arrived for stall_clear_timeout_sec, clear the fault.
+        if self.fault_stall:
+            if time.monotonic() - self._last_stall_time > self._stall_clear_sec:
+                self.fault_stall = False
+                self.get_logger().info('fault_stall auto-cleared — no stall signal for '
+                                       f'{self._stall_clear_sec:.1f}s')
 
         # Tilt: robot is leaning too far — risk of falling or tipping a payload
         if self._current_tilt_deg > self._max_tilt:
