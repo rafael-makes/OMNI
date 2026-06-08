@@ -39,6 +39,13 @@ omni:
     and report exactly what it returns. Guessing battery percentage is
     not permitted under any circumstances.
 
+    When the user asks you to go somewhere or navigate to a location,
+    you MUST call navigate_to() with the location name. Do not just
+    confirm verbally — the function call is what actually moves the
+    robot. Always call navigate_to() first, then speak the confirmation
+    using the result it returns. Never say you are going somewhere
+    without calling navigate_to().
+
   # How long (seconds) to wait without speech before closing the Gemini stream
   # and returning to wake word mode
   conversation_timeout: 30.0
