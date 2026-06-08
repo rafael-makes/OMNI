@@ -565,8 +565,28 @@ class BehaviorNode(Node):
         status_str = status_names.get(status, f'UNKNOWN({status})')
         self.get_logger().info(f'Navigation finished — status: {status_str}')
         self._current_goal_handle = None
-        # Return to IDLE regardless of outcome so wake word resumes
+
+        if status == 4:
+            prompt = (
+                'You have just successfully arrived at the destination. '
+                'Announce your arrival briefly in character — one sentence.'
+            )
+        elif status == 5:
+            prompt = None  # cancelled by user — no announcement needed
+        else:
+            prompt = (
+                'Navigation has failed — you could not reach the destination. '
+                'Apologise briefly in character and mention the robot got stuck or '
+                'could not find a path. One sentence only.'
+            )
+
         self._set_state('IDLE')
+
+        if prompt:
+            self._wake.stop()
+            time.sleep(0.1)
+            self._audio.start_capture()
+            self._bridge.open_session(initial_prompt=prompt)
 
     def _nav_feedback_callback(self, feedback_msg):
         """Receives periodic distance-remaining feedback from bt_navigator."""
