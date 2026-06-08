@@ -589,6 +589,7 @@ local_costmap:
         clear_threshold: 0.2
         mark_threshold: 0.8
         clear_on_max_reading: true
+        input_sensor_reliability: "BEST_EFFORT"
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
