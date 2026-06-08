@@ -133,7 +133,8 @@ class BehaviorNode(Node):
         # Updated by _reset_conversation_timeout(), called by gemini_bridge on
         # any incoming Gemini message (audio, function calls, server content).
         # CPython's GIL makes float assignment atomic, so no lock needed here.
-        self._last_activity_time = time.monotonic()
+        self._last_activity_time  = time.monotonic()
+        self._state_entered_time  = time.monotonic()  # updated by _set_state()
 
         # ── Presence tracking ──────────────────────────────────────────────────
         # _last_person_seen: monotonic timestamp of the most recent camera frame
@@ -179,6 +180,8 @@ class BehaviorNode(Node):
         self.create_timer(0.1, self._publish_state)
         # Check conversation timeout every 5 seconds. Fine-grained enough at 30s timeout.
         self.create_timer(5.0, self._check_conversation_timeout)
+        # State watchdog: recovers from stuck NAVIGATING/SPEAKING/LISTENING states.
+        self.create_timer(5.0, self._check_state_watchdog)
         # Check presence timeout every 1 second. Gives ~1s re-arm latency when a
         # person reappears, which is imperceptible in normal use.
         self.create_timer(1.0, self._check_presence_timeout)
@@ -251,6 +254,7 @@ class BehaviorNode(Node):
             if old_state != 'ERROR':
                 self._prev_state = old_state
             self._current_state = new_state
+            self._state_entered_time = time.monotonic()
 
         self.get_logger().info(f'State: {old_state} → {new_state}')
 
@@ -319,6 +323,41 @@ class BehaviorNode(Node):
             )
             self._bridge.close_session()
             self._set_state('IDLE')
+
+    def _check_state_watchdog(self):
+        """
+        Fires every 5 seconds. Recovers from states that should not last forever:
+          NAVIGATING — Nav2 goal callback failed to fire; cancel and return to IDLE.
+          SPEAKING   — Gemini stream died without closing cleanly; return to IDLE.
+        LISTENING is already covered by _check_conversation_timeout.
+        """
+        with self._state_lock:
+            state   = self._current_state
+            entered = self._state_entered_time
+
+        elapsed = time.monotonic() - entered
+
+        if state == 'NAVIGATING' and elapsed > 120.0:
+            # Navigation taking more than 2 minutes with no state transition —
+            # goal callbacks are likely lost. Cancel and recover.
+            self.get_logger().warn(
+                f'Watchdog: stuck in NAVIGATING for {elapsed:.0f}s — cancelling and returning to IDLE'
+            )
+            if self._current_goal_handle:
+                self._current_goal_handle.cancel_goal_async()
+                self._current_goal_handle = None
+            self._set_state('IDLE')
+            self._wake.start()
+
+        elif state == 'SPEAKING' and elapsed > 60.0:
+            # Speaking for more than 60s — Gemini stream likely died.
+            self.get_logger().warn(
+                f'Watchdog: stuck in SPEAKING for {elapsed:.0f}s — closing session and returning to IDLE'
+            )
+            self._bridge.close_session()
+            self._audio.stop_capture()
+            self._set_state('IDLE')
+            self._wake.start()
 
     # ── Wake word callback ─────────────────────────────────────────────────────
 

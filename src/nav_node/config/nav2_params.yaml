@@ -465,10 +465,11 @@ global_costmap:
         # cost_scaling_factor: 2.5 — broad cost gradient pushes path toward
         # doorway center without making the passage too narrow for NavFn.
         cost_scaling_factor: 2.5
-        # inflation_radius: 0.22m — balances doorway center routing vs passability.
-        # 745mm doorway: 745 - 2×220 = 305mm navigable corridor (needs 150mm min).
-        # 0.30m was too large — doorway appeared only 145mm wide, blocking all plans.
-        inflation_radius: 0.22
+        # inflation_radius: 0.12m — reduced from 0.22m which was blocking plans
+        # in rooms with furniture. Global costmap only needs enough inflation to
+        # keep the planner away from walls; local costmap + DWB handle real-time
+        # collision avoidance with the full footprint.
+        inflation_radius: 0.12
 
 
 # =============================================================================
