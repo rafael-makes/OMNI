@@ -135,6 +135,7 @@ class BehaviorNode(Node):
         # CPython's GIL makes float assignment atomic, so no lock needed here.
         self._last_activity_time  = time.monotonic()
         self._state_entered_time  = time.monotonic()  # updated by _set_state()
+        self._fault_active        = False              # True from fault until safety clears
 
         # ── Presence tracking ──────────────────────────────────────────────────
         # _last_person_seen: monotonic timestamp of the most recent camera frame
@@ -390,7 +391,8 @@ class BehaviorNode(Node):
         so OMNI can react in character. inject_context() is thread-safe.
         """
         fault_text = msg.data
-        self._last_fault = fault_text
+        self._last_fault   = fault_text
+        self._fault_active = True
         self.get_logger().error(f'Safety fault received: {fault_text}')
 
         # Snapshot state BEFORE calling _set_state so we know what was happening
@@ -424,16 +426,15 @@ class BehaviorNode(Node):
         is stuck in a fault-related state (ERROR or SPEAKING from fault announcement),
         auto-recover to IDLE so OMNI responds to the wake word again.
         """
-        if msg.data.startswith('OK') and self._current_state in ('ERROR', 'SPEAKING'):
-            # Only auto-recover if the fault has been cleared — don't interrupt
-            # a normal conversation that happens to coincide with safety OK.
-            if self._last_fault is not None:
+        if msg.data.startswith('OK') and self._fault_active:
+            if self._current_state in ('ERROR', 'SPEAKING', 'LISTENING'):
                 self.get_logger().info(
                     f'Safety cleared — auto-recovering from {self._current_state} to IDLE'
                 )
                 self._bridge.close_session()
                 self._audio.stop_capture()
-                self._last_fault = None
+                self._fault_active = False
+                self._last_fault   = None
                 self._set_state('IDLE')
                 self._wake.start()
 

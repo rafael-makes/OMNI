@@ -246,7 +246,7 @@ controller_server:
       # sim_time: how far ahead (seconds) to simulate each trajectory
       # 0.8s: reduced from 1.2s to prevent DWB from seeing the goal through
       # the wall and arcing diagonally toward it (doorway corner-cutting).
-      sim_time: 0.8
+      sim_time: 1.5
 
       # linear_granularity: simulation step size (m)
       linear_granularity: 0.05
@@ -348,8 +348,9 @@ behavior_server:
     spin_dist: 1.57
 
     # Backup parameters: OMNI moves backward a short distance
-    # backup_dist: how far to back up (meters)
-    backup_dist: 0.30
+    # backup_dist: raised 0.30→0.45m — backs up far enough to reach a new position
+    # before retrying a turn in tight spaces.
+    backup_dist: 0.45
     # backup_speed: must be above MIN_PWM=35 floor (~0.11 m/s). 0.18 gives margin.
     backup_speed: 0.18
 
@@ -464,12 +465,12 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         # cost_scaling_factor: 2.5 — broad cost gradient pushes path toward
         # doorway center without making the passage too narrow for NavFn.
-        cost_scaling_factor: 2.5
-        # inflation_radius: 0.12m — reduced from 0.22m which was blocking plans
-        # in rooms with furniture. Global costmap only needs enough inflation to
-        # keep the planner away from walls; local costmap + DWB handle real-time
-        # collision avoidance with the full footprint.
-        inflation_radius: 0.12
+        # cost_scaling_factor: 1.5 — broader gradient routes NavFn through hallway
+        # centers instead of cutting corners close to walls.
+        cost_scaling_factor: 1.5
+        # inflation_radius: 0.15m — slightly larger than 0.12m to push path center
+        # away from walls, helping OMNI set up wide before turns.
+        inflation_radius: 0.15
 
 
 # =============================================================================
