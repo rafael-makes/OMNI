@@ -94,25 +94,57 @@ bt_navigator:
 # NavFn A* is the right choice for OMNI at this stage.
 planner_server:
   ros__parameters:
-    # planner_plugins: list of planners to load. Each is a named plugin.
     planner_plugins: ["GridBased"]
 
     GridBased:
-      plugin: "nav2_navfn_planner::NavfnPlanner"
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
 
-      # tolerance: how close to the goal (meters) counts as "reached"
-      # 0.5m is generous — good for furniture-filled rooms where exact
-      # positioning is not required. Tighten if you need precise docking.
+      # tolerance: how close to goal counts as reached (meters)
       tolerance: 0.5
 
-      # use_astar: true = A* (goal-directed, faster), false = Dijkstra
-      # A* is strongly preferred for single-goal navigation.
-      use_astar: true
-
-      # allow_unknown: true = plan through unexplored (grey) map cells
-      # Indoor SLAM often leaves some cells unknown at room edges.
-      # Allowing unknown means OMNI can still plan through partially mapped areas.
+      # allow_unknown: plan through unexplored cells
       allow_unknown: true
+
+      # minimum_turning_radius: the tightest arc OMNI can physically make (m).
+      # Forces Smac to plan paths OMNI can actually execute — sets up wide before
+      # corners instead of cutting them. 0.30m is conservative for a diff-drive
+      # robot; tighten to 0.20 if paths are too wide for narrow hallways.
+      minimum_turning_radius: 0.30
+
+      # angle_quantization_bins: heading resolution (360 / bins = degrees/bin).
+      # 72 bins = 5° increments — good balance of path quality vs plan time.
+      angle_quantization_bins: 72
+
+      # motion_model_for_search: REEDS_SHEPP allows reversing (we enabled
+      # min_vel_x: -0.15 so the robot can back up). DUBIN for forward-only.
+      motion_model_for_search: "REEDS_SHEPP"
+
+      # maximum_planning_time: seconds before giving up (Pi 5 is fast enough)
+      maximum_planning_time: 5.0
+
+      # cache_obstacle_heuristic: reuse heuristic between replan calls — big
+      # CPU saving when the map doesn't change between replans.
+      cache_obstacle_heuristic: true
+
+      # reverse_penalty: slight cost for reversing so OMNI prefers forward paths
+      # but will reverse if genuinely needed.
+      reverse_penalty: 2.0
+
+      # non_straight_penalty: mild penalty for arcs vs straight lines
+      non_straight_penalty: 1.2
+
+      # cost_penalty: how much costmap cost influences path choice
+      cost_penalty: 2.0
+
+      # smooth_path: apply built-in Smac smoother to the planned path
+      smooth_path: true
+
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
+        do_refinement: true
 
 
 # =============================================================================
