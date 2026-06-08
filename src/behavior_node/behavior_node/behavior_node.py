@@ -401,13 +401,19 @@ class BehaviorNode(Node):
 
         self._set_state('ERROR')
 
-        # If we were IDLE, the wake word detector owns the mic.
-        # We must stop it and hand the mic to audio_handler before opening the session.
-        # If we were already in LISTENING/SPEAKING, capture is already running — skip.
+        # Cancel any active Nav2 goal so the robot stops immediately.
+        if self._current_goal_handle is not None:
+            self._current_goal_handle.cancel_goal_async()
+            self._current_goal_handle = None
+
+        # Always ensure mic is available for the fault announcement.
+        # - IDLE: wake word detector owns the mic — stop it first.
+        # - NAVIGATING: mic was never started — start it now.
+        # - LISTENING/SPEAKING: capture already running — start_capture() is idempotent.
         if state_before_fault == 'IDLE':
             self._wake.stop()
-            time.sleep(0.1)             # 100ms for ALSA to release device 0
-            self._audio.start_capture() # now safe to open the mic
+            time.sleep(0.1)   # 100ms for ALSA to release device 0
+        self._audio.start_capture()
 
         # Pass the fault as initial_prompt so it is the very first thing Gemini
         # sees when the session opens — no race with inject_context().
