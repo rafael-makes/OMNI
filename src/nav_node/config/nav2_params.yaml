@@ -109,7 +109,7 @@ planner_server:
       # Forces Smac to plan paths OMNI can actually execute — sets up wide before
       # corners instead of cutting them. 0.30m is conservative for a diff-drive
       # robot; tighten to 0.20 if paths are too wide for narrow hallways.
-      minimum_turning_radius: 0.30
+      minimum_turning_radius: 0.50
 
       # angle_quantization_bins: heading resolution (360 / bins = degrees/bin).
       # 72 bins = 5° increments — good balance of path quality vs plan time.
