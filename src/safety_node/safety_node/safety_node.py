@@ -40,7 +40,8 @@ class SafetyNode(Node):
         self.declare_parameter('critical_voltage',     10.5)  # 3S LiPo absolute floor (3.5V/cell)
         self.declare_parameter('warning_voltage',      11.1)  # 3S LiPo low warning (3.7V/cell)
         self.declare_parameter('watchdog_timeout_sec',  0.5)  # silence on /cmd_vel_raw → fault
-        self.declare_parameter('stall_clear_timeout_sec', 2.0) # seconds after last stall msg before auto-clear
+        self.declare_parameter('stall_clear_timeout_sec', 2.0)  # seconds after last stall msg before auto-clear
+        self.declare_parameter('stall_max_duration_sec',  8.0)  # force-clear after this long regardless of Pico signals
         self.declare_parameter('min_proximity_m',       0.15) # 15 cm proximity stop
 
         self._max_tilt      = self.get_parameter('max_tilt_degrees').value
@@ -48,6 +49,8 @@ class SafetyNode(Node):
         self._warn_voltage  = self.get_parameter('warning_voltage').value
         self._watchdog_sec      = self.get_parameter('watchdog_timeout_sec').value
         self._stall_clear_sec   = self.get_parameter('stall_clear_timeout_sec').value
+        self._stall_max_sec     = self.get_parameter('stall_max_duration_sec').value
+        self._stall_fault_time  = 0.0   # when the stall fault first fired
         self._min_proximity     = self.get_parameter('min_proximity_m').value
 
         # ── Fault state ───────────────────────────────────────────────────────
@@ -151,6 +154,7 @@ class SafetyNode(Node):
             if msg.data:
                 if not self.fault_stall:
                     self.fault_stall = True
+                    self._stall_fault_time = time.monotonic()
                     self._publish_fault('fault_stall: motor stall detected — will auto-clear if stall stops')
                 self._last_stall_time = time.monotonic()
         except Exception as e:
@@ -227,10 +231,15 @@ class SafetyNode(Node):
         # Stall auto-clear: Pico only publishes True, never False.
         # If no stall message has arrived for stall_clear_timeout_sec, clear the fault.
         if self.fault_stall:
-            if time.monotonic() - self._last_stall_time > self._stall_clear_sec:
+            now = time.monotonic()
+            if now - self._last_stall_time > self._stall_clear_sec:
                 self.fault_stall = False
                 self.get_logger().info('fault_stall auto-cleared — no stall signal for '
                                        f'{self._stall_clear_sec:.1f}s')
+            elif now - self._stall_fault_time > self._stall_max_sec:
+                self.fault_stall = False
+                self.get_logger().warn('fault_stall force-cleared — stall persisted for '
+                                       f'{self._stall_max_sec:.1f}s (robot may still be stuck)')
 
         # Tilt: robot is leaning too far — risk of falling or tipping a payload
         if self._current_tilt_deg > self._max_tilt:

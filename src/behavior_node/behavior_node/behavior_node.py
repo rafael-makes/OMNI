@@ -357,6 +357,20 @@ class BehaviorNode(Node):
             )
             self._bridge.close_session()
             self._audio.stop_capture()
+            self._fault_active = False
+            self._set_state('IDLE')
+            self._wake.start()
+
+        elif state == 'ERROR' and elapsed > 35.0:
+            # ERROR for more than 35s — fault session timed out without recovery.
+            # Safety may still be faulted but we restore the wake word so the user
+            # can at least talk to OMNI and ask it to clear the fault.
+            self.get_logger().warn(
+                f'Watchdog: stuck in ERROR for {elapsed:.0f}s — restoring wake word'
+            )
+            self._bridge.close_session()
+            self._audio.stop_capture()
+            self._fault_active = False
             self._set_state('IDLE')
             self._wake.start()
 
