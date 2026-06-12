@@ -5,7 +5,7 @@
 # OMNI physical dimensions:
 #   Body: 500mm wide × 400mm deep × 880mm tall
 #   Footprint (half-widths): ±0.25m left/right, ±0.20m front/back
-#   Inflation radius: 0.55m (footprint diagonal 0.32m + 0.23m safety buffer)
+#   Global inflation radius: 0.20m (circumscribed radius 0.43m; planning uses robot_radius=0.15m)
 #   Max linear speed: 0.3 m/s  (top-heavy — keep it slow for nav)
 #   Max angular speed: 1.2 rad/s
 #   Min driveable speeds (MIN_PWM=35, 10kg motors):
@@ -500,9 +500,10 @@ global_costmap:
         # cost_scaling_factor: 1.0 — very broad gradient, pushes NavFn path well
         # away from walls and corner edges for centered hallway routing.
         cost_scaling_factor: 1.0
-        # inflation_radius: 0.25m — large enough to push path to hallway center.
-        # NavFn treats inflated cells as costly so it routes around the "fat" corner.
-        inflation_radius: 0.25
+        # inflation_radius: 0.20m — reduced from 0.25m after robot narrowed to 500mm.
+        # Still pushes path to hallway center; tighter value helps find paths in
+        # narrower gaps (760mm doorway with 500mm robot = 130mm clearance per side).
+        inflation_radius: 0.20
 
 
 # =============================================================================
