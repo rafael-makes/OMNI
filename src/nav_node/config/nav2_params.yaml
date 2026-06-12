@@ -3,9 +3,9 @@
 # =============================================================================
 #
 # OMNI physical dimensions:
-#   Body: 600mm wide × 400mm deep × 880mm tall
-#   Footprint (half-widths): ±0.30m left/right, ±0.20m front/back
-#   Inflation radius: 0.55m (footprint diagonal 0.36m + 0.19m safety buffer)
+#   Body: 500mm wide × 400mm deep × 880mm tall
+#   Footprint (half-widths): ±0.25m left/right, ±0.20m front/back
+#   Inflation radius: 0.55m (footprint diagonal 0.32m + 0.23m safety buffer)
 #   Max linear speed: 0.3 m/s  (top-heavy — keep it slow for nav)
 #   Max angular speed: 1.2 rad/s
 #   Min driveable speeds (MIN_PWM=35, 10kg motors):
@@ -321,7 +321,7 @@ controller_server:
       # BaseObstacle: checks costmap cost at the robot center point only.
       # Replaced ObstacleFootprint (full polygon check) — the polygon check
       # rejected all trajectories in rooms with scattered furniture because the
-      # 0.60m×0.40m footprint clipped nearby chair legs/desk edges at every step.
+      # 0.50m×0.40m footprint clipped nearby chair legs/desk edges at every step.
       # Scale raised 0.02→0.08: with local inflation_radius=0.28m (arm extent),
       # obstacles near arm tips now produce cost ~169 at robot center, and this
       # scale makes that penalty meaningful in trajectory scoring.
@@ -548,12 +548,12 @@ local_costmap:
       resolution: 0.05
 
       # Rectangular footprint covering arms bent at 90°:
-      #   Body: 600mm wide × 400mm deep
+      #   Body: 500mm wide × 400mm deep
       #   Front: 0.20m body + 0.15m arms = 0.35m
       #   Rear: reduced to 0.05m — robot can safely back to within 50mm of a wall.
       #   With inflation_radius=0.15m, total rear clearance = 0.05+0.15 = 0.20m from base_link.
       #   This lets the robot back out of hallways and tight spots before turning.
-      footprint: "[[0.35, 0.30], [0.35, -0.30], [-0.05, -0.30], [-0.05, 0.30]]"
+      footprint: "[[0.35, 0.25], [0.35, -0.25], [-0.05, -0.25], [-0.05, 0.25]]"
 
       # No static_layer here — the local costmap is purely sensor-driven.
       # This means it reacts to dynamic obstacles (people, chairs, pets)
