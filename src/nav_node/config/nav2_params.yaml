@@ -495,15 +495,17 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # cost_scaling_factor: 2.5 — broad cost gradient pushes path toward
-        # doorway center without making the passage too narrow for NavFn.
-        # cost_scaling_factor: 1.0 — very broad gradient, pushes NavFn path well
-        # away from walls and corner edges for centered hallway routing.
-        cost_scaling_factor: 1.0
-        # inflation_radius: 0.20m — reduced from 0.25m after robot narrowed to 500mm.
-        # Still pushes path to hallway center; tighter value helps find paths in
-        # narrower gaps (760mm doorway with 500mm robot = 130mm clearance per side).
-        inflation_radius: 0.20
+        # cost_scaling_factor: 2.0 — moderate gradient. Steeper than 1.0 so paths
+        # near corners are more expensive, pushing the planner to route further from
+        # walls without making doorways uncrossable.
+        cost_scaling_factor: 2.0
+        # inflation_radius: 0.30m — the global costmap uses robot_radius=0.15m
+        # (not the actual 0.25m half-width) to avoid blocking doorways. That means
+        # the planner happily routes within 0.15m of a wall, putting the real robot
+        # body only 0.10m clear. A 0.30m inflation gradient makes cells near corners
+        # expensive enough that the Smac planner avoids them; 760mm doorway center
+        # is 330mm from each wall (>300mm inflation threshold) so doorways stay clear.
+        inflation_radius: 0.30
 
 
 # =============================================================================
