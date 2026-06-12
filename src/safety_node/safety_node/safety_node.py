@@ -73,6 +73,13 @@ class SafetyNode(Node):
         self._last_stall_time    = 0.0              # timestamp of last stall True message
         self._current_voltage    = 0.0              # latest BMS pack voltage
         self._current_tilt_deg   = 0.0              # latest tilt in degrees
+        # True while stall_recovery_node is driving /cmd_vel directly. We stop
+        # publishing entirely so its recovery commands aren't interleaved with
+        # our 20Hz zero-flood (which otherwise wins and the backup never happens).
+        # Estop and tilt still override — see _safety_check_cb.
+        self._recovery_active     = False
+        self._recovery_start_time = 0.0   # for the stuck-recovery timeout
+        self._recovery_max_sec    = 15.0  # yield never lasts longer than this
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._cmd_vel_pub = self.create_publisher(Twist,  '/cmd_vel',       10)
@@ -87,6 +94,7 @@ class SafetyNode(Node):
         self.create_subscription(Bool,    '/estop/pressed',        self._estop_cb,        10)
         self.create_subscription(Range,   '/tof/proximity',        self._proximity_cb,    10)
         self.create_subscription(String,  '/safety/clear_fault',   self._clear_fault_cb,  10)
+        self.create_subscription(Bool,    '/stall_recovery/active', self._recovery_cb,    10)
 
         # ── Timers ────────────────────────────────────────────────────────────
         # Safety checks at 20 Hz — fast enough to catch transient faults
@@ -188,6 +196,16 @@ class SafetyNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Proximity callback error: {e}')
 
+    def _recovery_cb(self, msg: Bool):
+        # stall_recovery_node announces when it takes over /cmd_vel directly.
+        if msg.data != self._recovery_active:
+            self._recovery_active = msg.data
+            if msg.data:
+                self._recovery_start_time = time.monotonic()
+                self.get_logger().info('stall recovery active — yielding /cmd_vel')
+            else:
+                self.get_logger().info('stall recovery finished — resuming /cmd_vel gating')
+
     def _clear_fault_cb(self, msg: String):
         # Manual fault reset for latching faults.
         # Accepted payloads: "stall", "estop", "all"
@@ -270,6 +288,25 @@ class SafetyNode(Node):
             self.fault_stall     or
             self.fault_estop
         )
+
+        # Stall recovery owns /cmd_vel: stall_recovery_node publishes its own
+        # backup/rotate commands directly. If we kept publishing here (zeros
+        # because fault_stall is active), our 20Hz would out-publish its 10Hz
+        # and the recovery motion would never physically happen.
+        # HARD faults (estop, tilt) still take priority — a recovery move must
+        # never override a human's e-stop or drive a tipping robot.
+        if self._recovery_active:
+            # Failsafe: if stall_recovery_node died mid-recovery and never sent
+            # False, reclaim the topic after recovery_max_sec.
+            if time.monotonic() - self._recovery_start_time > self._recovery_max_sec:
+                self._recovery_active = False
+                self.get_logger().warn(
+                    f'stall recovery yield expired after {self._recovery_max_sec:.0f}s — reclaiming /cmd_vel')
+            elif self.fault_estop or self.fault_tilt:
+                self._cmd_vel_pub.publish(Twist())
+                return
+            else:
+                return  # yield the topic to stall_recovery_node
 
         if any_fault:
             # CRITICAL: actively publish zeros — do NOT just stop publishing.

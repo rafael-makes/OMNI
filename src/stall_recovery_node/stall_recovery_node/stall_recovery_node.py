@@ -2,13 +2,19 @@
 stall_recovery_node — detects motor stalls during Nav2 navigation and recovers.
 
 Recovery logic:
-  1. Stop — flood /cmd_vel with zero at 10Hz for 0.3s
-  2. Check rear clearance via /tof/left_rear and /tof/right_rear
+  1. Announce recovery on /stall_recovery/active so safety_node yields /cmd_vel
+     (otherwise the stall fault's 20Hz zero-flood overrides our backup commands
+     and the only motion that survives is the rotation after the fault clears)
+  2. Stop — flood /cmd_vel with zero at 10Hz for 0.3s
+  3. Check rear clearance via /tof/left_rear and /tof/right_rear
      - If rear is clear (> min_rear_clearance), back up as far as safe
        (up to max_backup_dist, keeping 0.15m safety margin from rear wall)
      - If rear is blocked (< min_rear_clearance), do a short backup only
-  3. Rotate opposite to stuck direction (alternates each attempt)
-  4. Re-send original goal to Nav2
+  4. Check front clearance: if the backup opened space ahead, SKIP the rotation
+     and let the planner replan from the new position. Rotating after a clean
+     backup tends to swing the body back into whatever caused the stall.
+  5. Only if front is still blocked: rotate opposite to stuck direction
+  6. Re-send original goal to Nav2
 
 Publishing /cmd_vel at 10Hz during recovery overrides Nav2 controller_server
 (which runs at 5Hz) without needing to cancel the active goal.
@@ -43,6 +49,7 @@ class StallRecoveryNode(Node):
         self.declare_parameter('rotate_duration',    0.9)   # seconds (~82° at 1.6 rad/s)
         self.declare_parameter('cooldown',           2.5)   # seconds between recoveries
         self.declare_parameter('publish_hz',         10.0)  # rate to flood /cmd_vel during recovery
+        self.declare_parameter('min_front_clearance', 0.40) # m — front clear beyond this after backup = skip rotation
 
         self._backup_speed       = self.get_parameter('backup_speed').value
         self._min_backup_dist    = self.get_parameter('min_backup_dist').value
@@ -53,6 +60,7 @@ class StallRecoveryNode(Node):
         self._rotate_duration    = self.get_parameter('rotate_duration').value
         self._cooldown           = self.get_parameter('cooldown').value
         self._publish_hz         = self.get_parameter('publish_hz').value
+        self._min_front_clearance = self.get_parameter('min_front_clearance').value
 
         # ── State ─────────────────────────────────────────────────────────────
         self._current_goal: PoseStamped | None = None
@@ -61,15 +69,21 @@ class StallRecoveryNode(Node):
         self._last_angular_z     = 0.0
         self._recovery_count     = 0
 
-        # Latest rear ToF readings (meters). None = not yet received.
-        self._rear_left_range:  float | None = None
-        self._rear_right_range: float | None = None
+        # Latest ToF readings (meters). None = not yet received.
+        self._rear_left_range:   float | None = None
+        self._rear_right_range:  float | None = None
+        self._front_left_range:  float | None = None
+        self._front_right_range: float | None = None
 
         # ── Nav2 action client ────────────────────────────────────────────────
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         # ── Publishers / subscribers ──────────────────────────────────────────
         self._cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # safety_node yields /cmd_vel to us while this is True — otherwise its
+        # 20Hz stall-fault zero-flood overrides our 10Hz recovery commands and
+        # the backup never physically happens.
+        self._active_pub = self.create_publisher(Bool, '/stall_recovery/active', 10)
 
         # tof_node publishes with BEST_EFFORT reliability — match it here
         sensor_qos = QoSProfile(
@@ -81,8 +95,10 @@ class StallRecoveryNode(Node):
         self.create_subscription(Bool,        '/motor/stall_detected', self._stall_cb,      10)
         self.create_subscription(PoseStamped, '/goal_pose',            self._goal_cb,       10)
         self.create_subscription(Twist,       '/cmd_vel',              self._cmdvel_cb,     10)
-        self.create_subscription(Range,       '/tof/left_rear',        self._rear_left_cb,  sensor_qos)
-        self.create_subscription(Range,       '/tof/right_rear',       self._rear_right_cb, sensor_qos)
+        self.create_subscription(Range,       '/tof/left_rear',        self._rear_left_cb,   sensor_qos)
+        self.create_subscription(Range,       '/tof/right_rear',       self._rear_right_cb,  sensor_qos)
+        self.create_subscription(Range,       '/tof/front_left',       self._front_left_cb,  sensor_qos)
+        self.create_subscription(Range,       '/tof/front_right',      self._front_right_cb, sensor_qos)
 
         self.get_logger().info('stall_recovery_node ready')
 
@@ -100,6 +116,18 @@ class StallRecoveryNode(Node):
             self._rear_right_range = msg.max_range
         else:
             self._rear_right_range = msg.range
+
+    def _front_left_cb(self, msg: Range):
+        if msg.range < msg.min_range or msg.range > msg.max_range:
+            self._front_left_range = msg.max_range
+        else:
+            self._front_left_range = msg.range
+
+    def _front_right_cb(self, msg: Range):
+        if msg.range < msg.min_range or msg.range > msg.max_range:
+            self._front_right_range = msg.max_range
+        else:
+            self._front_right_range = msg.range
 
     def _goal_cb(self, msg: PoseStamped):
         self._current_goal = msg
@@ -189,12 +217,26 @@ class StallRecoveryNode(Node):
 
     # ── Main recovery thread ──────────────────────────────────────────────────
 
+    def _front_is_clear(self) -> bool:
+        """True if both front ToF sensors see at least min_front_clearance."""
+        readings = [r for r in (self._front_left_range, self._front_right_range)
+                    if r is not None]
+        if not readings:
+            return False   # no data — assume blocked, fall through to rotation
+        return min(readings) > self._min_front_clearance
+
     def _run_recovery(self):
         try:
             self._recovery_count += 1
             attempt = self._recovery_count
             self.get_logger().info(
                 f'Recovery attempt #{attempt} — flooding /cmd_vel at {self._publish_hz:.0f}Hz')
+
+            # Step 0: tell safety_node to yield /cmd_vel to us. Without this its
+            # stall-fault zero-flood (20Hz) overrides our backup (10Hz) and the
+            # robot never actually moves backward — it just spins later.
+            self._active_pub.publish(Bool(data=True))
+            time.sleep(0.1)   # let safety_node process the message before we drive
 
             # Step 1: stop
             self._flood_vel(0.0, 0.0, 0.3)
@@ -209,17 +251,23 @@ class StallRecoveryNode(Node):
             # Step 3: stop briefly
             self._flood_vel(0.0, 0.0, 0.2)
 
-            # Step 4: rotate — alternate direction each attempt
-            if attempt % 2 == 1:
-                rotate_dir = -1.0 if self._last_angular_z >= 0 else 1.0
-                label = 'opposite to stuck dir'
+            # Step 4: rotate ONLY if the front is still blocked after backing up.
+            # If the backup opened space, rotating just swings the body back into
+            # whatever caused the stall — let the planner replan from here instead.
+            if self._front_is_clear():
+                self.get_logger().info(
+                    'Recovery: front clear after backup — skipping rotation, replanning.')
             else:
-                rotate_dir = 1.0 if self._last_angular_z >= 0 else -1.0
-                label = 'same as stuck dir (retry)'
+                if attempt % 2 == 1:
+                    rotate_dir = -1.0 if self._last_angular_z >= 0 else 1.0
+                    label = 'opposite to stuck dir'
+                else:
+                    rotate_dir = 1.0 if self._last_angular_z >= 0 else -1.0
+                    label = 'same as stuck dir (retry)'
 
-            self.get_logger().info(
-                f'Recovery: rotating ({label}) for {self._rotate_duration:.1f}s...')
-            self._flood_vel(0.0, rotate_dir * self._rotate_speed, self._rotate_duration)
+                self.get_logger().info(
+                    f'Recovery: front blocked — rotating ({label}) for {self._rotate_duration:.1f}s...')
+                self._flood_vel(0.0, rotate_dir * self._rotate_speed, self._rotate_duration)
 
             # Step 5: stop
             self._flood_vel(0.0, 0.0, 0.3)
@@ -234,6 +282,7 @@ class StallRecoveryNode(Node):
         except Exception as e:
             self.get_logger().error(f'Recovery exception: {e}')
         finally:
+            self._active_pub.publish(Bool(data=False))
             self._recovering = False
             self.get_logger().info(f'Recovery #{self._recovery_count} complete.')
 
