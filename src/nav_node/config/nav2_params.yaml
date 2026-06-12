@@ -322,10 +322,12 @@ controller_server:
       # Replaced ObstacleFootprint (full polygon check) — the polygon check
       # rejected all trajectories in rooms with scattered furniture because the
       # 0.50m×0.40m footprint clipped nearby chair legs/desk edges at every step.
-      # Scale raised 0.02→0.08: with local inflation_radius=0.28m (arm extent),
-      # obstacles near arm tips now produce cost ~169 at robot center, and this
-      # scale makes that penalty meaningful in trajectory scoring.
-      BaseObstacle.scale: 0.08
+      # Scale raised 0.08→0.5: local inflation_radius is now 0.45m (covers the
+      # body corner at 0.43m from center), so center-point cost finally reflects
+      # real clipping risk. At 0.5, a near-wall trajectory contributes ~125 to
+      # the score — enough to outweigh PathDist (48) and GoalDist (24) pull,
+      # so DWB swings wide at corners instead of shaving them.
+      BaseObstacle.scale: 0.5
 
       # PathDist: penalizes trajectories that drift far from the global path
       # Raised 32→48: stronger pull keeps robot in doorway corridor instead
@@ -554,8 +556,9 @@ local_costmap:
       #   Body: 500mm wide × 400mm deep
       #   Front: 0.20m body + 0.15m arms = 0.35m
       #   Rear: reduced to 0.05m — robot can safely back to within 50mm of a wall.
-      #   With inflation_radius=0.15m, total rear clearance = 0.05+0.15 = 0.20m from base_link.
       #   This lets the robot back out of hallways and tight spots before turning.
+      #   (Backing near walls stays legal: inflation only REJECTS within ~5cm of
+      #   an obstacle; the 0.45m gradient just makes it costly, not forbidden.)
       footprint: "[[0.35, 0.25], [0.35, -0.25], [-0.05, -0.25], [-0.05, 0.25]]"
 
       # No static_layer here — the local costmap is purely sensor-driven.
@@ -596,12 +599,18 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.5
-        # Reduced 0.20→0.15m: 0.20m was too aggressive — when the robot was
-        # near a wall (common after entering a room), inflation marked ALL
-        # trajectories lethal, causing instant goal failure. 0.15m still provides
-        # clearance but leaves enough free space for DWB to sample valid paths.
-        inflation_radius: 0.15
+        # cost_scaling_factor lowered 3.5→2.0: with the wider radius below, a
+        # steep decay would make the outer half of the gradient near-zero and
+        # useless for scoring. 2.0 keeps cost meaningful across the whole band.
+        cost_scaling_factor: 2.0
+        # inflation_radius 0.15→0.45m: BaseObstacle only checks cost at the robot
+        # CENTER, but the body corner is 0.43m from center (sqrt(0.35²+0.25²)).
+        # With 0.15m inflation the center could pass 0.16m from a ToF-marked wall
+        # at zero cost while the body clipped it by 9cm — sensors saw the wall,
+        # DWB drove into it anyway. 0.45m makes any body-clipping trajectory
+        # carry cost. Cells are only REJECTED (inscribed/lethal) within ~5cm of
+        # the obstacle, so near-wall trajectories stay valid — just expensive.
+        inflation_radius: 0.45
 
 
 # =============================================================================
