@@ -28,12 +28,11 @@ AXIS_L2      = 2   # L2 trigger: rests at -1.0, fully pressed = +1.0
 BTN_R1       = 5   # R1 shoulder button — boost
 
 # ── Speed limits ──────────────────────────────────────────────────────────────
-# 10kg high-torque motors with MIN_PWM=35:
-#   min linear  ≈ 0.11 m/s  (35/16.4 FF_GAIN × 0.053m wheel radius)
-#   min angular ≈ 0.75 rad/s
-MAX_LINEAR_MPS  = 0.35  # m/s   — comfortable indoor speed
-MAX_ANGULAR_RPS = 1.5   # rad/s — precise turning, well above 0.75 rad/s floor
-BOOST_FACTOR    = 1.5   # multiplier when R1 held
+# Defaults are conservative for mapping. Override at launch:
+#   ros2 run motor_control_node ps4_teleop --ros-args -p max_linear_mps:=0.35
+MAX_LINEAR_MPS_DEFAULT  = 0.35  # m/s   — Pico firmware MIN_PWM=85 → floor ~0.30 m/s; stay above
+MAX_ANGULAR_RPS_DEFAULT = 1.0   # rad/s — conservative for mapping; override for normal driving
+BOOST_FACTOR            = 1.5   # multiplier when R1 held
 
 # ── Velocity ramp ─────────────────────────────────────────────────────────────
 # Smooths direction changes — prevents jerk when reversing from stop.
@@ -49,6 +48,11 @@ class PS4Teleop(Node):
 
     def __init__(self):
         super().__init__('ps4_teleop')
+
+        self.declare_parameter('max_linear_mps',  MAX_LINEAR_MPS_DEFAULT)
+        self.declare_parameter('max_angular_rps', MAX_ANGULAR_RPS_DEFAULT)
+        self._max_linear  = self.get_parameter('max_linear_mps').value
+        self._max_angular = self.get_parameter('max_angular_rps').value
 
         self._pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self._timer = self.create_timer(1.0 / PUBLISH_HZ, self._timer_cb)
@@ -69,8 +73,8 @@ class PS4Teleop(Node):
             "║  D-pad ↔         → turn left / right     ║\n"
             "║  D-pad diagonal  → arc (move + turn)     ║\n"
             "║  R1 (hold)       → 2× speed boost        ║\n"
-            f"║  Max linear  : {MAX_LINEAR_MPS:.1f} m/s               ║\n"
-            f"║  Max angular : {MAX_ANGULAR_RPS:.1f} rad/s           ║\n"
+            f"║  Max linear  : {self._max_linear:.2f} m/s              ║\n"
+            f"║  Max angular : {self._max_angular:.2f} rad/s          ║\n"
             "║  Ctrl-C          → exit                  ║\n"
             "╚══════════════════════════════════════════╝"
         )
@@ -147,8 +151,8 @@ class PS4Teleop(Node):
 
             # hat_y: +1=up → forward (+linear.x)
             # hat_x: +1=right → right turn (-angular.z, ROS CCW-positive)
-            target_vx = float(hat_y)  * MAX_LINEAR_MPS  * boost
-            target_wz = float(-hat_x) * MAX_ANGULAR_RPS * boost
+            target_vx = float(hat_y)  * self._max_linear  * boost
+            target_wz = float(-hat_x) * self._max_angular * boost
 
             dt = 1.0 / PUBLISH_HZ
             self._vx = self._ramp(self._vx, target_vx, ACCEL_LINEAR_MPS2  * dt)

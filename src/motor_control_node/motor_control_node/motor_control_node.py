@@ -1,11 +1,11 @@
 """
 OMNI motor_control_node
-Bridges /cmd_vel ↔ Arduino serial and republishes odometry.
+Bridges /cmd_vel ↔ Pi Pico serial and republishes odometry.
 
-Serial protocol (set by Arduino firmware):
-  Pi → Arduino : "C,<left_mps>,<right_mps>\\n"
-  Pi → Arduino : "R\\n"  (reset odometry)
-  Arduino → Pi : "O,x,y,theta,vx,vtheta,left_mps,right_mps\\n"  @ 20 Hz
+Serial protocol (set by Pico firmware):
+  Pi → Pico : "C,<left_mps>,<right_mps>\\n"
+  Pi → Pico : "R\\n"  (reset odometry)
+  Pico → Pi : "O,x,y,theta,vx,vtheta,left_mps,right_mps\\n"  @ 20 Hz
 """
 
 import math
@@ -35,7 +35,7 @@ class MotorControlNode(Node):
         self.declare_parameter('serial_port',     '/dev/arduino')
         self.declare_parameter('baud_rate',       115200)
         self.declare_parameter('wheel_separation', 0.305)
-        self.declare_parameter('wheel_radius',     0.050)
+        self.declare_parameter('wheel_radius',     0.053)
         self.declare_parameter('cmd_vel_timeout',  0.5)
         self.declare_parameter('odom_frame',         'odom')
         self.declare_parameter('base_frame',         'base_link')
@@ -43,7 +43,7 @@ class MotorControlNode(Node):
         # can't send commands the hardware can't track (max hardware ≈ 1.0 m/s).
         # Conservative defaults for first-drive; raise in the launch file once tuned.
         self.declare_parameter('max_linear_speed',   0.5)   # m/s
-        self.declare_parameter('max_angular_speed',  2.0)   # rad/s — 10kg motors, MIN_PWM=35, floor ~0.75 rad/s
+        self.declare_parameter('max_angular_speed',  2.0)   # rad/s — Pico firmware MIN_PWM=85, floor ~0.30 m/s
         # publish_tf: set false when robot_localization EKF takes over odom→base_link
         self.declare_parameter('publish_tf', True)
 
@@ -107,7 +107,7 @@ class MotorControlNode(Node):
                 timeout=1.0,
                 write_timeout=1.0,
             )
-            # Flush any leftover Arduino boot messages
+            # Flush any leftover Pico boot messages
             time.sleep(2.0)
             self._ser.reset_input_buffer()
             self.get_logger().info(f'Serial connected: {self._port}')
@@ -150,7 +150,7 @@ class MotorControlNode(Node):
     def _reset_odom_cb(self, _req, response):
         self._serial_write('R\n')
         response.success = True
-        response.message = 'Odometry reset sent to Arduino'
+        response.message = 'Odometry reset sent to Pico'
         return response
 
     # ── Serial read loop (background thread) ──────────────────────────────────
@@ -244,7 +244,7 @@ class MotorControlNode(Node):
     # ── Encoder / stall parser ────────────────────────────────────────────────
 
     def _parse_encoder(self, line: str):
-        # Arduino sends "E:left_ticks,right_ticks,stall_flag\n"
+        # Pico sends "E:left_ticks,right_ticks,stall_flag\n"
         # stall_flag is 0 (normal) or 1 (motor stalled / overcurrent detected)
         try:
             # Strip the "E:" prefix, then split into the three comma-separated fields

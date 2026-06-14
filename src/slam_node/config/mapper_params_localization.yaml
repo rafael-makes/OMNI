@@ -31,7 +31,7 @@ slam_toolbox:
     throttle_scans: 1               # process every scan
     transform_publish_period: 0.05  # 20 Hz TF publish
     map_update_interval: 5.0        # rebuild occupancy grid every 5s
-    resolution: 0.05                # 5cm/cell — good for home navigation
+    resolution: 0.025               # 2.5cm/cell — matches mapping resolution
     max_laser_range: 10.0           # LD19 max range is ~12m; 10m is safe indoors
     minimum_travel_distance: 0.05   # update after 5cm movement
     minimum_travel_heading: 0.1     # update after ~6° rotation
