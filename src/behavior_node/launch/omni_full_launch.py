@@ -189,7 +189,16 @@ def generate_launch_description():
         emulate_tty=True,
         parameters=[{
             'serial_port': LaunchConfiguration('motor_serial_port'),
+            'publish_tf': False,   # yaw_fusion_node owns odom→base_link TF
         }],
+    )
+
+    yaw_fusion_node = Node(
+        package='yaw_fusion_node',
+        executable='yaw_fusion_node',
+        name='yaw_fusion_node',
+        output='screen',
+        emulate_tty=True,
     )
 
     imu_node = Node(
@@ -198,6 +207,7 @@ def generate_launch_description():
         name='imu_node',
         output='screen',
         emulate_tty=True,
+        parameters=[{'publish_rate_hz': 100.0}],
     )
 
     lidar_node = Node(
@@ -388,6 +398,7 @@ def generate_launch_description():
         camera_tf,
         # Sensors (t=0)
         motor_control_node,
+        yaw_fusion_node,
         imu_node,
         lidar_node,
         tof_node,
