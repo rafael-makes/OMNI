@@ -8,7 +8,7 @@ import numpy as np
 try:
     import lgpio
     import spidev
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageChops
     _HW_AVAILABLE = True
     _HW_ERROR = ''
 except ImportError as e:
@@ -38,7 +38,7 @@ CY = W // 2
 # ── State → color map (R, G, B) ───────────────────────────────────────────────
 
 STATE_COLORS = {
-    'IDLE':       (255, 140,   0),   # amber
+    'IDLE':       (  0, 140, 255),   # cyborg blue
     'LISTENING':  (  0, 220, 255),   # cyan
     'SPEAKING':   (  0, 255,  80),   # green
     'NAVIGATING': (220, 220, 255),   # white-blue
@@ -49,25 +49,16 @@ STATE_COLORS = {
 
 _DEFAULT_STATE = 'IDLE'
 
-# Look-style parameters per state: (saccade_range, saccade_interval, lerp_alpha)
-_LOOK_PARAMS = {
-    'IDLE':       (0.5,  (2.0, 4.0), 0.04),
-    'LISTENING':  (0.2,  (3.0, 5.0), 0.03),
-    'SPEAKING':   (0.6,  (0.4, 0.9), 0.06),
-    'NAVIGATING': (0.1,  (3.0, 6.0), 0.03),
-    'EXPLORING':  (0.9,  (0.1, 0.4), 0.10),
-    'DOCKING':    (0.1,  (2.0, 4.0), 0.03),
-    'ERROR':      (0.5,  (0.1, 0.3), 0.12),
-}
-
-_BLINK_INTERVALS = {
-    'IDLE':       (3.0, 5.0),
-    'LISTENING':  (5.0, 8.0),
-    'SPEAKING':   (1.5, 3.5),
-    'NAVIGATING': (4.0, 7.0),
-    'EXPLORING':  (2.5, 4.5),
-    'DOCKING':    (5.0, 8.0),
-    'ERROR':      (1.0, 2.5),
+# HAL 9000 glow pulse speed (rad/s) per state — state is conveyed by lens
+# colour plus how fast/urgently the core breathes.
+_PULSE_SPEED = {
+    'IDLE':       1.0,   # slow, calm breathing
+    'LISTENING':  1.8,   # attentive
+    'SPEAKING':   5.0,   # rapid flutter while talking
+    'NAVIGATING': 1.4,
+    'EXPLORING':  2.6,
+    'DOCKING':    0.9,
+    'ERROR':      8.0,   # urgent alarm throb
 }
 
 
@@ -129,125 +120,85 @@ def _init_gc9a01(write_cmd, write_data):
     write_cmd(0x29); time.sleep(0.02)
 
 
-# ── HUD eye renderer (from confirmed working code) ────────────────────────────
+# ── HAL 9000 lens renderer ────────────────────────────────────────────────────
 
 def _lerp_color(c1, c2, t):
     return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
 
-def _draw_eye(side, now, pulse, look_x, look_y, blink, color):
+# Cyborg-eye geometry (radii in px, display is 240 wide → max radius 120)
+_R_IRIS  = 116   # outer edge of the glowing iris
+_R_PUPIL = 42    # mechanical pupil radius
+
+
+def _draw_cyborg_eye(now, pulse, color):
+    """Render a glowing mechanical 'cyborg' iris: a radial-gradient iris with a
+    mid-radius glow ring, slowly rotating fibre striations, concentric tech
+    rings, and a dark pupil with a hot sensor core.  Both eyes render
+    identically — no left/right mirroring, no saccade, no blink."""
     img  = Image.new('RGB', (W, W), (0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     cr, cg, cb = color
-    dim    = (cr // 6,  cg // 6,  cb // 6)
-    mid    = (cr // 3,  cg // 3,  cb // 3)
-    full   = (cr,       cg,       cb)
-    bright = (min(255, cr + 60), min(255, cg + 60), min(255, cb + 60))
+    dim     = (cr // 6, cg // 6, cb // 6)
+    mid     = (cr // 2, cg // 2, cb // 2)
+    bright  = (min(255, cr + 70), min(255, cg + 70), min(255, cb + 70))
+    breathe = 0.60 + 0.40 * pulse
 
-    # Background subtle glow
-    for r in range(115, 0, -5):
-        t = 1 - r / 115
-        v = int(18 * t)
+    # ── Iris body — gradient peaking in a mid-radius glow ring ───────────────
+    for r in range(_R_IRIS, 0, -1):
+        t   = r / _R_IRIS                          # 1 rim .. 0 centre
+        lvl = (0.12 + 0.55 * max(0.0, 1 - abs(t - 0.58) / 0.58) ** 1.3) * breathe
         draw.ellipse([CX - r, CY - r, CX + r, CY + r],
-                     fill=(cr * v // 255, cg * v // 255, cb * v // 255))
+                     fill=(int(cr * lvl), int(cg * lvl), int(cb * lvl)))
 
-    # Outer ring — slow rotate, mirrored per side
-    outer_r   = 112
-    rot_speed = 0.3 if side == 'left' else -0.3
-    rot_angle = now * rot_speed
-    seg_count = 32
-    seg_gap   = 4
-    seg_deg   = (360 / seg_count) - seg_gap
-    for i in range(seg_count):
-        start = rot_angle * (180 / math.pi) + i * (360 / seg_count)
-        c = bright if i % 4 == 0 else mid
-        draw.arc([CX - outer_r, CY - outer_r, CX + outer_r, CY + outer_r],
-                 start=start, end=start + seg_deg, fill=c, width=3)
-
-    # Second ring with tick marks
-    ring2_r    = 95
-    tick_count = 48
-    for i in range(tick_count):
-        angle    = math.radians(i * (360 / tick_count))
-        tick_len = 8 if i % 6 == 0 else 4
-        x1 = CX + int((ring2_r - tick_len) * math.cos(angle))
-        y1 = CY + int((ring2_r - tick_len) * math.sin(angle))
-        x2 = CX + int(ring2_r * math.cos(angle))
-        y2 = CY + int(ring2_r * math.sin(angle))
-        c  = full if i % 6 == 0 else dim
+    # ── Radial fibre striations — slow rotation for a living mechanism ───────
+    rot  = now * 0.15
+    fibs = 90
+    for i in range(fibs):
+        a  = rot + i * (2 * math.pi / fibs)
+        x1 = CX + _R_PUPIL * math.cos(a); y1 = CY + _R_PUPIL * math.sin(a)
+        x2 = CX + _R_IRIS  * math.cos(a); y2 = CY + _R_IRIS  * math.sin(a)
+        c  = bright if i % 2 == 0 else dim
         draw.line([(x1, y1), (x2, y2)], fill=c, width=1)
 
-    # Segmented arc ring — counter-rotate, mirrored
-    ring3_r    = 80
-    rot2       = now * (-0.5 if side == 'left' else 0.5)
-    seg2_count = 12
-    seg2_gap   = 8
-    seg2_deg   = (360 / seg2_count) - seg2_gap
-    for i in range(seg2_count):
-        start = rot2 * (180 / math.pi) + i * (360 / seg2_count)
-        alpha = 1.0 if i % 3 == 0 else 0.4
-        c = (int(cr * alpha), int(cg * alpha), int(cb * alpha))
-        draw.arc([CX - ring3_r, CY - ring3_r, CX + ring3_r, CY + ring3_r],
-                 start=start, end=start + seg2_deg, fill=c, width=4)
+    # ── Concentric tech rings ────────────────────────────────────────────────
+    for rr, wd in ((_R_IRIS - 1, 2), (94, 1), (68, 1)):
+        draw.ellipse([CX - rr, CY - rr, CX + rr, CY + rr], outline=mid, width=wd)
 
-    # Inner solid ring
-    ring4_r = 62
-    draw.ellipse([CX - ring4_r, CY - ring4_r, CX + ring4_r, CY + ring4_r],
-                 outline=mid, width=1)
-
-    # Pulse ring (breathes)
-    pulse_r = int(68 + 5 * pulse)
-    pulse_c = (int(cr * (0.3 + 0.5 * pulse)),
-               int(cg * (0.3 + 0.5 * pulse)),
-               int(cb * (0.3 + 0.5 * pulse)))
-    draw.ellipse([CX - pulse_r, CY - pulse_r, CX + pulse_r, CY + pulse_r],
-                 outline=pulse_c, width=2)
-
-    # Targeting brackets — mirrored on right eye
-    bracket_r = 52
-    blen      = 14
-    bthick    = 2
-    corners   = [(-1, -1), (1, -1), (-1, 1), (1, 1)]
-    if side == 'right':
-        corners = [(-x, y) for x, y in corners]
-    for dx, dy in corners:
-        bx = CX + dx * bracket_r
-        by = CY + dy * bracket_r
-        draw.line([(bx, by), (bx - dx * blen, by)], fill=full, width=bthick)
-        draw.line([(bx, by), (bx, by - dy * blen)], fill=full, width=bthick)
-
-    # Crosshair lines (subtle)
-    cross_r = 55
-    draw.line([(CX - cross_r, CY), (CX - 10, CY)], fill=dim, width=1)
-    draw.line([(CX + 10,      CY), (CX + cross_r, CY)], fill=dim, width=1)
-    draw.line([(CX, CY - cross_r), (CX, CY - 10)], fill=dim, width=1)
-    draw.line([(CX, CY + 10),      (CX, CY + cross_r)], fill=dim, width=1)
-
-    # Pupil with look offset
-    ox      = int(look_x * 20)
-    oy      = int(look_y * 20)
-    px, py  = CX + ox, CY + oy
-    pupil_r = 22
-    for pr in range(pupil_r + 10, pupil_r - 1, -2):
-        alpha = 0.15 * (1 - (pr - pupil_r) / 10)
-        draw.ellipse([px - pr, py - pr, px + pr, py + pr],
-                     fill=(int(cr * alpha), int(cg * alpha), int(cb * alpha)))
-    draw.ellipse([px - pupil_r, py - pupil_r, px + pupil_r, py + pupil_r],
+    # ── Pupil — dark aperture ────────────────────────────────────────────────
+    draw.ellipse([CX - _R_PUPIL, CY - _R_PUPIL, CX + _R_PUPIL, CY + _R_PUPIL],
                  fill=(0, 0, 0))
-    draw.ellipse([px - pupil_r, py - pupil_r, px + pupil_r, py + pupil_r],
-                 outline=full, width=2)
-    draw.ellipse([px - 7, py - 9, px - 1, py - 3], fill=(255, 255, 255))
-    draw.ellipse([px + 3, py + 3, px + 7, py + 7],
-                 fill=(min(255, cr + 80), min(255, cg + 80), min(255, cb + 80)))
 
-    # Blink eyelids
-    if blink > 0.01:
-        lid = int((W // 2 + 20) * blink)
-        draw.rectangle([0, 0, W, CY - 60 + lid], fill=(0, 0, 0))
-        draw.rectangle([0, CY + 60 - lid, W, W],  fill=(0, 0, 0))
+    # ── Glowing collarette + hot sensor core, composited additively ──────────
+    glow = Image.new('RGB', (W, W), (0, 0, 0))
+    gd   = ImageDraw.Draw(glow)
+    # glow ring whose radius rings in and out around the pupil with the pulse
+    ring_c = _R_PUPIL + 4 + 14 * pulse     # expands outward as the pulse swells
+    ring_w = 9                              # soft falloff thickness
+    for r in range(int(ring_c + ring_w), int(ring_c - ring_w), -1):
+        if r < 1:
+            continue
+        lvl = 1 - abs(r - ring_c) / ring_w
+        if lvl <= 0:
+            continue
+        gd.ellipse([CX - r, CY - r, CX + r, CY + r],
+                   outline=(int(bright[0] * lvl), int(bright[1] * lvl),
+                            int(bright[2] * lvl)), width=2)
+    # hot sensor core at the very centre
+    core = 13
+    for r in range(core + 14, 0, -1):
+        if r > core:
+            t   = (r - core) / 14
+            lvl = (1 - t) ** 2
+            col = (int(bright[0] * lvl), int(bright[1] * lvl), int(bright[2] * lvl))
+        else:
+            w   = (1 - r / core) ** 1.5
+            col = _lerp_color(bright, (255, 255, 255), w)
+        gd.ellipse([CX - r, CY - r, CX + r, CY + r], fill=col)
+    img = ImageChops.add(img, glow)
 
-    # Circular mask — clips to round display
+    # ── Circular mask — clips to round display ───────────────────────────────
     mask  = Image.new('L', (W, W), 0)
     ImageDraw.Draw(mask).ellipse([2, 2, W - 2, W - 2], fill=255)
     black = Image.new('RGB', (W, W), (0, 0, 0))
@@ -270,17 +221,8 @@ class EyeNode(Node):
         self._stop_event     = threading.Event()
 
         # Animation variables
-        self._look_x         = 0.0
-        self._look_y         = 0.0
-        self._target_x       = 0.0
-        self._target_y       = 0.0
-        self._next_saccade_t = time.monotonic()
-        self._blended_color  = list(STATE_COLORS[_DEFAULT_STATE])
-
-        self._blinking    = False
-        self._blink_phase = 0.0
-        self._blink       = 0.0
-        self._next_blink_t = time.monotonic() + random.uniform(2.0, 4.0)
+        self._blended_color = list(STATE_COLORS[_DEFAULT_STATE])
+        self._pulse_speed   = _PULSE_SPEED[_DEFAULT_STATE]
 
         # ── Hardware init ─────────────────────────────────────────────────────
         if _HW_AVAILABLE:
@@ -401,64 +343,28 @@ class EyeNode(Node):
                 state = self._current_state
 
             target_color = STATE_COLORS[state]
-            look_rng, saccade_ivl, lerp_alpha = _LOOK_PARAMS[state]
-            blink_lo, blink_hi = _BLINK_INTERVALS[state]
 
-            # Smooth color transition
+            # Smooth color transition between states
             self._blended_color = list(_lerp_color(
                 tuple(int(c) for c in self._blended_color),
                 target_color, 0.05
             ))
             color = tuple(int(c) for c in self._blended_color)
 
-            pulse = math.sin(now * 2.0) * 0.5 + 0.5
+            # Smoothly ease the pulse speed toward the state's target so the
+            # rhythm shifts gracefully rather than jumping on a state change.
+            self._pulse_speed += (_PULSE_SPEED[state] - self._pulse_speed) * 0.05
 
-            # Saccade
-            if t0 >= self._next_saccade_t:
-                lo, hi = saccade_ivl
-                self._next_saccade_t = t0 + random.uniform(lo, hi)
-                if state == 'DOCKING':
-                    self._target_x = random.uniform(-0.2, 0.2)
-                    self._target_y = random.uniform(0.3, 0.7)
-                elif state == 'NAVIGATING':
-                    self._target_x = random.gauss(0.0, 0.15)
-                    self._target_y = random.gauss(0.1, 0.1)
-                else:
-                    self._target_x = random.uniform(-look_rng, look_rng)
-                    self._target_y = random.uniform(-look_rng * 0.6, look_rng * 0.6)
-                self._target_x = max(-1.0, min(1.0, self._target_x))
-                self._target_y = max(-1.0, min(1.0, self._target_y))
-
-            self._look_x += (self._target_x - self._look_x) * lerp_alpha
-            self._look_y += (self._target_y - self._look_y) * lerp_alpha
-
-            # Blink
-            if not self._blinking and t0 >= self._next_blink_t:
-                self._blinking    = True
-                self._blink_phase = 0.0
-            if self._blinking:
-                self._blink_phase += 0.12
-                self._blink = (
-                    math.sin(self._blink_phase * math.pi)
-                    if self._blink_phase <= 1.0 else 0.0
-                )
-                if self._blink_phase > 1.0:
-                    self._blinking     = False
-                    self._next_blink_t = t0 + random.uniform(blink_lo, blink_hi)
-            else:
-                self._blink = 0.0
+            # Breathing glow + faint flicker for an analogue, "alive" lens
+            pulse = math.sin(now * self._pulse_speed) * 0.5 + 0.5
+            pulse = max(0.0, min(1.0, pulse + random.uniform(-0.04, 0.04)))
 
             try:
-                left_img  = _draw_eye('left',  now, pulse,
-                                      self._look_x, self._look_y,
-                                      self._blink, color)
-                right_img = _draw_eye('right', now, pulse,
-                                      self._look_x, self._look_y,
-                                      self._blink, color)
+                eye_img = _draw_cyborg_eye(now, pulse, color)
 
                 if _HW_AVAILABLE and self._spi0 is not None:
-                    self._send_frame(self._spi0, left_img)
-                    self._send_frame(self._spi1, right_img)
+                    self._send_frame(self._spi0, eye_img)
+                    self._send_frame(self._spi1, eye_img)
 
             except Exception as e:
                 self.get_logger().warn(
