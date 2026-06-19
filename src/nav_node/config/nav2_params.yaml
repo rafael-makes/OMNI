@@ -16,8 +16,8 @@
 #
 # TF tree:
 #   map → odom (published by slam_toolbox via slam_node)
-#   odom → base_link (published by motor_control_node)
-#   base_link → lidar_link (static transform in slam_launch.py, z=0.38m)
+#   odom → base_link (published by yaw_fusion_node — IMU yaw + wheel x/y)
+#   base_link → lidar_link (static transform in slam_launch.py, z=0.825m)
 #
 # cmd_vel:
 #   controller_server publishes to /cmd_vel → motor_control_node directly.
@@ -41,8 +41,8 @@ bt_navigator:
     # robot_base_frame: the moving robot frame — must match motor_control_node
     robot_base_frame: base_link
 
-    # odom_topic: wheel odometry direct — EKF disabled (too slow on Pi 5)
-    odom_topic: /odom
+    # odom_topic: fused odometry — yaw_fusion_node blends BNO085 yaw with wheel x/y
+    odom_topic: /odometry/fused
 
     # bt_loop_duration: how often the behavior tree ticks (ms)
     # 10ms = 100Hz. Lower = more responsive, higher CPU cost.
@@ -444,17 +444,16 @@ global_costmap:
       # use_sim_time: must match the launch argument
       use_sim_time: False
 
-      # Global costmap uses a small PLANNING radius (NOT the physical footprint).
-      # The physical body is 0.20m half-width but the SLAM-mapped walls appear
-      # several cells thick (LiDAR multi-scan overlap), so even 0.20m inflation
-      # makes doorways appear completely blocked. We use 0.15m so the planner
-      # can route through real doorways (~70cm+). The local costmap and DWB
-      # controller handle actual collision avoidance with the full footprint.
-      robot_radius: 0.25
+      # Global costmap uses the inscribed radius of the physical footprint (0.20m)
+      # for planning. The local costmap footprint polygon + ToF range_sensor_layer
+      # handle actual collision avoidance — global robot_radius only affects which
+      # paths the planner considers reachable. 2.5cm map: 680mm doorway - 2×200mm
+      # = 280mm free for planner centerline. Local costmap catches real obstacles.
+      robot_radius: 0.20
 
       # resolution: costmap cell size (meters). Must match the SLAM map
-      # resolution (0.05m = 5cm cells) for consistent obstacle marking.
-      resolution: 0.05
+      # resolution (0.025m = 2.5cm cells) for consistent obstacle marking.
+      resolution: 0.025
 
       # track_unknown_space: true = treat unexplored cells as potentially free
       # (allows planning through unmapped areas during active SLAM)
@@ -500,14 +499,12 @@ global_costmap:
         # cost_scaling_factor: 2.0 — moderate gradient. Steeper than 1.0 so paths
         # near corners are more expensive, pushing the planner to route further from
         # walls without making doorways uncrossable.
-        cost_scaling_factor: 2.0
-        # inflation_radius: 0.30m — the global costmap uses robot_radius=0.15m
-        # (not the actual 0.25m half-width) to avoid blocking doorways. That means
-        # the planner happily routes within 0.15m of a wall, putting the real robot
-        # body only 0.10m clear. A 0.30m inflation gradient makes cells near corners
-        # expensive enough that the Smac planner avoids them; 760mm doorway center
-        # is 330mm from each wall (>300mm inflation threshold) so doorways stay clear.
-        inflation_radius: 0.06
+        cost_scaling_factor: 3.5
+        # inflation_radius: 0.20m — creates a strong centering gradient so the
+        # global planner routes down the middle of corridors and doorways.
+        # Doorway center (680mm/2 = 340mm from wall) > inflation_radius so
+        # the centerline stays in the low-cost zone and paths stay centered.
+        inflation_radius: 0.20
 
 
 # =============================================================================
@@ -550,7 +547,7 @@ local_costmap:
       height: 4
 
       # resolution: same as global costmap for consistent obstacle sizes
-      resolution: 0.05
+      resolution: 0.025
 
       # Rectangular footprint covering arms bent at 90°:
       #   Body: 500mm wide × 400mm deep
