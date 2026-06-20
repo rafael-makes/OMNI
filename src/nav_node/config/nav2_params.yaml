@@ -5,7 +5,7 @@
 # OMNI physical dimensions:
 #   Body: 500mm wide × 400mm deep × 880mm tall
 #   Footprint (half-widths): ±0.25m left/right, ±0.20m front/back
-#   Global inflation radius: 0.20m (circumscribed radius 0.43m; planning uses robot_radius=0.15m)
+#   Global robot_radius: 0.26m (must be >= footprint half-width 0.25m; prevents IsPathValid replan loop)
 #   Max linear speed: 0.3 m/s  (top-heavy — keep it slow for nav)
 #   Max angular speed: 1.2 rad/s
 #   Min driveable speeds (MIN_PWM=35, 10kg motors):
@@ -97,54 +97,17 @@ planner_server:
     planner_plugins: ["GridBased"]
 
     GridBased:
-      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      plugin: "nav2_navfn_planner::NavfnPlanner"
 
       # tolerance: how close to goal counts as reached (meters)
       tolerance: 0.5
 
+      # use_astar: true = A* (faster, prefers straight lines).
+      # false = Dijkstra (more uniform cost spread, sometimes better in tight spaces).
+      use_astar: false
+
       # allow_unknown: plan through unexplored cells
       allow_unknown: true
-
-      # minimum_turning_radius: the tightest arc OMNI can physically make (m).
-      # Forces Smac to plan paths OMNI can actually execute — sets up wide before
-      # corners instead of cutting them. 0.30m is conservative for a diff-drive
-      # robot; tighten to 0.20 if paths are too wide for narrow hallways.
-      minimum_turning_radius: 0.38
-
-      # angle_quantization_bins: heading resolution (360 / bins = degrees/bin).
-      # 72 bins = 5° increments — good balance of path quality vs plan time.
-      angle_quantization_bins: 72
-
-      # motion_model_for_search: REEDS_SHEPP allows reversing (we enabled
-      # min_vel_x: -0.15 so the robot can back up). DUBIN for forward-only.
-      motion_model_for_search: "REEDS_SHEPP"
-
-      # maximum_planning_time: seconds before giving up (Pi 5 is fast enough)
-      maximum_planning_time: 5.0
-
-      # cache_obstacle_heuristic: reuse heuristic between replan calls — big
-      # CPU saving when the map doesn't change between replans.
-      cache_obstacle_heuristic: true
-
-      # reverse_penalty: slight cost for reversing so OMNI prefers forward paths
-      # but will reverse if genuinely needed.
-      reverse_penalty: 2.0
-
-      # non_straight_penalty: mild penalty for arcs vs straight lines
-      non_straight_penalty: 1.2
-
-      # cost_penalty: how much costmap cost influences path choice
-      cost_penalty: 2.0
-
-      # smooth_path: apply built-in Smac smoother to the planned path
-      smooth_path: true
-
-      smoother:
-        max_iterations: 1000
-        w_smooth: 0.3
-        w_data: 0.2
-        tolerance: 1.0e-10
-        do_refinement: true
 
 
 # =============================================================================
@@ -213,7 +176,7 @@ controller_server:
 
       # max_vel_x: maximum forward speed (m/s)
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
-      max_vel_x: 0.4
+      max_vel_x: 0.35
 
       # min_vel_x: negative value allows reversing.
       # -0.15 m/s gives DWB a backup option when forward paths are blocked.
@@ -232,10 +195,11 @@ controller_server:
       min_vel_theta: 0.0
 
       # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
-      max_speed_xy: 0.4
+      max_speed_xy: 0.35
 
-      # min_speed_xy: raised to match MIN_PWM=50 floor (~0.163 m/s)
-      min_speed_xy: 0.20
+      # min_speed_xy: must match Pico MIN_PWM=85 floor (~0.30 m/s).
+      # DWB sampling below this produces zero physical motion — wasted samples.
+      min_speed_xy: 0.32
 
       # min_speed_theta: MIN_PWM=50 → each wheel ~0.163 m/s → angular floor
       # = 0.163 / (track/2) = 0.163 / 0.1525 = 1.07 rad/s. 1.1 gives margin.
@@ -275,10 +239,11 @@ controller_server:
       # 20 gives good coverage of the 0–0.8 rad/s range
       vtheta_samples: 20
 
-      # sim_time: how far ahead (seconds) to simulate each trajectory
-      # 0.8s: reduced from 1.2s to prevent DWB from seeing the goal through
-      # the wall and arcing diagonally toward it (doorway corner-cutting).
-      sim_time: 1.5
+      # sim_time: how far ahead (seconds) to simulate each trajectory.
+      # 0.8s: at 0.4 m/s max, this projects 0.32m — enough to steer but not
+      # so far that doorway trajectories clip the far doorframe and all get
+      # rejected. 1.5s was projecting 0.60m through the 0.68m doorway opening.
+      sim_time: 0.8
 
       # linear_granularity: simulation step size (m)
       linear_granularity: 0.05
@@ -444,12 +409,14 @@ global_costmap:
       # use_sim_time: must match the launch argument
       use_sim_time: False
 
-      # Global costmap uses the inscribed radius of the physical footprint (0.20m)
-      # for planning. The local costmap footprint polygon + ToF range_sensor_layer
-      # handle actual collision avoidance — global robot_radius only affects which
-      # paths the planner considers reachable. 2.5cm map: 680mm doorway - 2×200mm
-      # = 280mm free for planner centerline. Local costmap catches real obstacles.
-      robot_radius: 0.20
+      # robot_radius: 0.22m — the global planner keeps path centers ≥0.22m from
+      # walls. The local costmap footprint inscribed radius is ~0.05m (rear edge),
+      # so IsPathValid only fails if a footprint corner overlaps a lethal cell —
+      # at 340mm from doorway wall the body corner is 90mm clear, well above 5mm.
+      # 0.26m caused "Failed to create plan" after doorway clips because the robot
+      # position ended up inside the 0.26m inscribed zone. 0.22m gives a 240mm
+      # planning corridor through the 680mm doorway vs 160mm at 0.26m.
+      robot_radius: 0.22
 
       # resolution: costmap cell size (meters). Must match the SLAM map
       # resolution (0.025m = 2.5cm cells) for consistent obstacle marking.
@@ -460,51 +427,30 @@ global_costmap:
       track_unknown_space: true
 
       # plugins: which costmap layers to load, in order
-      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      # Global costmap uses static_layer only — no live obstacle_layer.
+      # In localization mode the walls are already in the static map. Adding a
+      # live obstacle_layer causes LiDAR noise / furniture to accumulate as
+      # permanent obstacles in the global costmap, blocking NavFn from planning
+      # (planner sees robot surrounded by lethal cells → "Failed to create plan").
+      # Dynamic obstacle avoidance is handled entirely by the local costmap.
+      plugins: ["static_layer", "inflation_layer"]
 
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
-        # map_subscribe_transient_local: true = use transient-local QoS to
-        # receive the last published /map even if we subscribe after it published
         map_subscribe_transient_local: True
-
-      obstacle_layer:
-        plugin: "nav2_costmap_2d::ObstacleLayer"
-        # enabled: allows disabling this layer for debugging
-        enabled: True
-        # observation_sources: named sensors that report obstacles
-        observation_sources: scan
-        scan:
-          # topic: where to read LaserScan data — lidar_node publishes here
-          topic: /scan
-          # max_obstacle_height: ignore points above this (avoids ceiling hits)
-          max_obstacle_height: 2.0
-          # clearing: true = LiDAR free-space beams clear previous obstacles
-          # This is important — without it, obstacles that moved stay forever
-          clearing: True
-          # marking: true = LiDAR hits mark new obstacles
-          marking: True
-          # data_type: LaserScan format
-          data_type: "LaserScan"
-          # raytrace_max_range: maximum range to use for clearing free space (m)
-          # LD19 max range is 12m but 5m is reliable indoors
-          raytrace_max_range: 5.0
-          raytrace_min_range: 0.0
-          # obstacle_max_range: maximum range to mark as obstacle (m)
-          obstacle_max_range: 4.5
-          obstacle_min_range: 0.0
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # cost_scaling_factor: 2.0 — moderate gradient. Steeper than 1.0 so paths
         # near corners are more expensive, pushing the planner to route further from
         # walls without making doorways uncrossable.
-        cost_scaling_factor: 3.5
-        # inflation_radius: 0.20m — creates a strong centering gradient so the
-        # global planner routes down the middle of corridors and doorways.
-        # Doorway center (680mm/2 = 340mm from wall) > inflation_radius so
-        # the centerline stays in the low-cost zone and paths stay centered.
-        inflation_radius: 0.20
+        cost_scaling_factor: 5.0
+        # inflation_radius: 0.30m — wider gradient forces NavFn to route closer
+        # to the corridor/doorway center. 0.20m was too narrow: the path could
+        # hug one side of a 680mm doorway and the robot's shoulder would clip.
+        # Doorway center is 340mm from each wall; 0.30m inflation means the
+        # center of the doorway stays in a lower-cost zone than near-wall paths.
+        inflation_radius: 0.30
 
 
 # =============================================================================
@@ -565,7 +511,7 @@ local_costmap:
       # No static_layer here — the local costmap is purely sensor-driven.
       # This means it reacts to dynamic obstacles (people, chairs, pets)
       # without being confused by the static map.
-      plugins: ["obstacle_layer", "range_sensor_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "inflation_layer"]
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -582,32 +528,17 @@ local_costmap:
           obstacle_max_range: 4.5
           obstacle_min_range: 0.0
 
-      range_sensor_layer:
-        plugin: "nav2_costmap_2d::RangeSensorLayer"
-        topics: ["/tof/left", "/tof/front_left", "/tof/front_right",
-                 "/tof/right", "/tof/left_rear", "/tof/right_rear"]
-        phi: 0.5
-        inflate_cone: 1.0
-        no_readings_timeout: 0.0
-        clear_threshold: 0.2
-        mark_threshold: 0.8
-        clear_on_max_reading: true
-        input_sensor_reliability: "BEST_EFFORT"
-
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         # cost_scaling_factor lowered 3.5→2.0: with the wider radius below, a
         # steep decay would make the outer half of the gradient near-zero and
         # useless for scoring. 2.0 keeps cost meaningful across the whole band.
         cost_scaling_factor: 2.0
-        # inflation_radius 0.15→0.45m: BaseObstacle only checks cost at the robot
-        # CENTER, but the body corner is 0.43m from center (sqrt(0.35²+0.25²)).
-        # With 0.15m inflation the center could pass 0.16m from a ToF-marked wall
-        # at zero cost while the body clipped it by 9cm — sensors saw the wall,
-        # DWB drove into it anyway. 0.45m makes any body-clipping trajectory
-        # carry cost. Cells are only REJECTED (inscribed/lethal) within ~5cm of
-        # the obstacle, so near-wall trajectories stay valid — just expensive.
-        inflation_radius: 0.45
+        # inflation_radius: 0.15m — leaves 680-2×150=380mm clear corridor in
+        # the doorway for DWB to find valid forward trajectories. 0.25m was
+        # leaving only 180mm which caused all doorway trajectories to score
+        # poorly and DWB would give up (FollowPath → FAILURE).
+        inflation_radius: 0.15
 
 
 # =============================================================================

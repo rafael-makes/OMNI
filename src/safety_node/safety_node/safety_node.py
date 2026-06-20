@@ -62,6 +62,7 @@ class SafetyNode(Node):
         self.fault_voltage   = False  # Battery below critical_voltage
         self.fault_watchdog  = False  # No /cmd_vel_raw received recently
         self.fault_proximity = False  # TOF sensor too close to an obstacle
+        self._tof_close: set[str] = set()  # tracks which sensors are currently close
         #
         # LATCHING faults stay active until /safety/clear_fault is published:
         self.fault_stall     = False  # Motor stall detected (hardware issue possible)
@@ -92,7 +93,11 @@ class SafetyNode(Node):
         self.create_subscription(Float32, '/bms/battery_voltage',  self._voltage_cb,      10)
         self.create_subscription(Bool,    '/motor/stall_detected', self._stall_cb,        10)
         self.create_subscription(Bool,    '/estop/pressed',        self._estop_cb,        10)
-        self.create_subscription(Range,   '/tof/proximity',        self._proximity_cb,    10)
+        for _tof_topic in (
+            '/tof/left', '/tof/front_left', '/tof/front_right',
+            '/tof/right', '/tof/left_rear', '/tof/right_rear',
+        ):
+            self.create_subscription(Range, _tof_topic, self._proximity_cb, 10)
         self.create_subscription(String,  '/safety/clear_fault',   self._clear_fault_cb,  10)
         self.create_subscription(Bool,    '/stall_recovery/active', self._recovery_cb,    10)
 
@@ -179,20 +184,21 @@ class SafetyNode(Node):
             self.get_logger().warn(f'E-stop callback error: {e}')
 
     def _proximity_cb(self, msg: Range):
-        # Multiple TOF sensors publish on the same topic. Each callback fires
-        # independently. If ANY sensor sees an obstacle within min_proximity_m
-        # the fault activates. It auto-clears when all sensors report clear again.
+        # Each of the 6 ToF sensors calls here. Track which sensors are close
+        # in a set so fault_proximity only clears when ALL sensors are clear.
         try:
+            topic = msg.header.frame_id  # tof_* frame names identify the sensor
             if msg.range < self._min_proximity:
+                if topic not in self._tof_close:
+                    self._tof_close.add(topic)
                 if not self.fault_proximity:
                     self.fault_proximity = True
-                    self._publish_fault(f'fault_proximity: TOF range {msg.range:.3f}m < {self._min_proximity}m')
+                    self._publish_fault(
+                        f'fault_proximity: {topic} range {msg.range:.3f}m < {self._min_proximity}m')
             else:
-                # Auto-clear: obstacle no longer detected by this sensor.
-                # NOTE: if multiple sensors are faulted, one clearing won't un-fault
-                # if another is still below threshold — that's acceptable because
-                # the next callback from the still-close sensor will re-set it.
-                self.fault_proximity = False
+                self._tof_close.discard(topic)
+                if not self._tof_close:
+                    self.fault_proximity = False
         except Exception as e:
             self.get_logger().warn(f'Proximity callback error: {e}')
 

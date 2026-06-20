@@ -44,6 +44,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     LogInfo,
     TimerAction,
@@ -325,6 +326,39 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
+    # ── Auto initial pose ──────────────────────────────────────────────────────
+    # Publishes the robot's known starting position (office doorway) at t=10s,
+    # after slam_toolbox activates (t=8s). Published 5 times so slam_toolbox
+    # scan-matches reliably before Nav2 starts at t=12s.
+    # Coordinates captured 2026-06-19 with Display frame=map in Foxglove.
+    # Update x/y/z(orient)/w if the robot's home position changes.
+    auto_initialpose = TimerAction(
+        period=10.0,
+        actions=[
+            LogInfo(msg='[omni_full] t=10s — publishing initial pose at home position'),
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'topic', 'pub', '--times', '5',
+                    '/initialpose',
+                    'geometry_msgs/msg/PoseWithCovarianceStamped',
+                    (
+                        '{'
+                        'header: {frame_id: map}, '
+                        'pose: {pose: {'
+                        'position: {x: -3.4144, y: 3.5072, z: 0.0}, '
+                        'orientation: {x: 0.0, y: 0.0, z: -0.02476, w: 0.99969}'
+                        '}, covariance: ['
+                        '0.25,0,0,0,0,0, 0,0.25,0,0,0,0, 0,0,0,0,0,0, '
+                        '0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0.069'
+                        ']}'
+                        '}'
+                    ),
+                ],
+                output='screen',
+            ),
+        ],
+    )
+
     # ── Nav2 stack (delayed) ───────────────────────────────────────────────────
     # slam_toolbox activates at t=8s. Nav2 starts at t=12s (4s margin) so the
     # map→odom TF exists before bt_navigator begins bonding. Nav2's lifecycle_manager
@@ -412,6 +446,8 @@ def generate_launch_description():
         chest_node,
         # SLAM localization (configure@3s, activate@8s — internal timers)
         slam_include,
+        # Initial pose (t=10s — after SLAM active, before Nav2 starts)
+        auto_initialpose,
         # Nav2 (t=12s — waits for SLAM to be active)
         nav_delayed,
         # Brain (t=0 — wake word active immediately)

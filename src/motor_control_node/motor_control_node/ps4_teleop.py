@@ -30,16 +30,21 @@ BTN_R1       = 5   # R1 shoulder button — boost
 # ── Speed limits ──────────────────────────────────────────────────────────────
 # Defaults are conservative for mapping. Override at launch:
 #   ros2 run motor_control_node ps4_teleop --ros-args -p max_linear_mps:=0.35
-MAX_LINEAR_MPS_DEFAULT  = 0.35  # m/s   — Pico firmware MIN_PWM=85 → floor ~0.30 m/s; stay above
-MAX_ANGULAR_RPS_DEFAULT = 1.0   # rad/s — conservative for mapping; override for normal driving
+MAX_LINEAR_MPS_DEFAULT  = 0.35  # m/s
+MAX_ANGULAR_RPS_DEFAULT = 2.2   # rad/s — must be >1.97 so pure turns exceed Pico MIN_PWM floor
 BOOST_FACTOR            = 1.5   # multiplier when R1 held
 
+# ── Wheel floor boost ─────────────────────────────────────────────────────────
+# Pico firmware clamps PWM below MIN_PWM=85 to zero. With FF_GAIN≈14 and
+# wheel_radius=0.053m this means wheel speeds below ~0.30 m/s produce no motion.
+# When a commanded vx/wz would drive either wheel below this floor, we scale the
+# whole command up so the slower wheel just meets the floor.
+WHEEL_SEP_M   = 0.305   # metres — must match motor_control_node / Pico firmware
+MIN_WHEEL_MPS = 0.32    # slightly above the ~0.30 m/s stall floor
+
 # ── Velocity ramp ─────────────────────────────────────────────────────────────
-# Smooths direction changes — prevents jerk when reversing from stop.
-# The ramp eases commands through zero so the firmware PID and motors
-# transition gradually rather than snapping from one direction to the other.
-ACCEL_LINEAR_MPS2  = 1.5   # m/s²   — 0→0.35 m/s in ~2 ticks (0.2 s)
-ACCEL_ANGULAR_RPS2 = 6.0   # rad/s² — 0→1.5 rad/s in ~2 ticks (0.2 s)
+ACCEL_LINEAR_MPS2  = 1.5   # m/s²
+ACCEL_ANGULAR_RPS2 = 8.0   # rad/s² — faster ramp to reach 2.2 rad/s quickly
 
 PUBLISH_HZ = 10
 
@@ -131,11 +136,30 @@ class PS4Teleop(Node):
         self._pub.publish(Twist())
 
     def _ramp(self, current: float, target: float, max_step: float) -> float:
-        """Step current toward target by at most max_step."""
         delta = target - current
         if abs(delta) <= max_step:
             return target
         return current + max_step * (1.0 if delta > 0.0 else -1.0)
+
+    def _apply_wheel_floor(self, vx: float, wz: float) -> tuple[float, float]:
+        """Scale vx/wz up so the slower wheel meets the Pico MIN_PWM floor.
+
+        Pure turns at low wz would otherwise have both wheels below the stall
+        floor. Scaling preserves the vx/wz ratio (same arc radius).
+        """
+        if abs(vx) < 0.001 and abs(wz) < 0.001:
+            return 0.0, 0.0
+        left  = vx - wz * WHEEL_SEP_M / 2.0
+        right = vx + wz * WHEEL_SEP_M / 2.0
+        driven = [abs(v) for v in (left, right) if abs(v) > 0.001]
+        if not driven:
+            return 0.0, 0.0
+        min_speed = min(driven)
+        if min_speed < MIN_WHEEL_MPS:
+            scale = MIN_WHEEL_MPS / min_speed
+            vx *= scale
+            wz *= scale
+        return vx, wz
 
     # ── 10 Hz publish callback ────────────────────────────────────────────────
 
@@ -158,9 +182,10 @@ class PS4Teleop(Node):
             self._vx = self._ramp(self._vx, target_vx, ACCEL_LINEAR_MPS2  * dt)
             self._wz = self._ramp(self._wz, target_wz, ACCEL_ANGULAR_RPS2 * dt)
 
+            vx, wz = self._apply_wheel_floor(self._vx, self._wz)
             msg = Twist()
-            msg.linear.x  = self._vx
-            msg.angular.z = self._wz
+            msg.linear.x  = vx
+            msg.angular.z = wz
             self._pub.publish(msg)
             self._deadman_was_held = True
 
