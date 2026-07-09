@@ -516,9 +516,23 @@ local_costmap:
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        observation_sources: scan
+        # observation_sources is whitespace-separated. LD-19 (scan) is the
+        # primary; oak_depth is the OAK-D Lite depth->LaserScan converted on the
+        # Jetson (topic /oak/scan, frame oak_rgb_camera_optical_frame, reachable via
+        # base_link->oak published by the Jetson driver). Both mark+clear independently.
+        observation_sources: scan oak_depth
         scan:
           topic: /scan
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.0
+        oak_depth:
+          topic: /oak/scan
           max_obstacle_height: 2.0
           clearing: True
           marking: True

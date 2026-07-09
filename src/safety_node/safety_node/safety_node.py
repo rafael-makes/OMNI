@@ -22,6 +22,9 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+
+from rcl_interfaces.msg import SetParametersResult
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu, Range
@@ -42,7 +45,7 @@ class SafetyNode(Node):
         self.declare_parameter('watchdog_timeout_sec',  0.5)  # silence on /cmd_vel_raw → fault
         self.declare_parameter('stall_clear_timeout_sec', 2.0)  # seconds after last stall msg before auto-clear
         self.declare_parameter('stall_max_duration_sec',  8.0)  # force-clear after this long regardless of Pico signals
-        self.declare_parameter('min_proximity_m',       0.15) # 15 cm proximity stop
+        self.declare_parameter('min_proximity_m',       0.075) # 75 mm proximity stop
 
         self._max_tilt      = self.get_parameter('max_tilt_degrees').value
         self._crit_voltage  = self.get_parameter('critical_voltage').value
@@ -52,6 +55,24 @@ class SafetyNode(Node):
         self._stall_max_sec     = self.get_parameter('stall_max_duration_sec').value
         self._stall_fault_time  = 0.0   # when the stall fault first fired
         self._min_proximity     = self.get_parameter('min_proximity_m').value
+
+        # ── Live parameter tuning ─────────────────────────────────────────────
+        # Maps each ROS parameter to the cached attribute it feeds. The callback
+        # below keeps the cached value in sync so thresholds can be changed at
+        # runtime without relaunching, e.g.:
+        #   ros2 param set /safety_node min_proximity_m 0.10
+        # All values are floats and must be > 0; min_proximity_m is additionally
+        # clamped to the ToF sensor's usable range (0.03–1.20 m).
+        self._param_attr = {
+            'max_tilt_degrees':        '_max_tilt',
+            'critical_voltage':        '_crit_voltage',
+            'warning_voltage':         '_warn_voltage',
+            'watchdog_timeout_sec':    '_watchdog_sec',
+            'stall_clear_timeout_sec': '_stall_clear_sec',
+            'stall_max_duration_sec':  '_stall_max_sec',
+            'min_proximity_m':         '_min_proximity',
+        }
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # ── Fault state ───────────────────────────────────────────────────────
         # Each fault is its own named bool — easy to read, easy to log, no
@@ -93,11 +114,16 @@ class SafetyNode(Node):
         self.create_subscription(Float32, '/bms/battery_voltage',  self._voltage_cb,      10)
         self.create_subscription(Bool,    '/motor/stall_detected', self._stall_cb,        10)
         self.create_subscription(Bool,    '/estop/pressed',        self._estop_cb,        10)
+        _sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         for _tof_topic in (
             '/tof/left', '/tof/front_left', '/tof/front_right',
             '/tof/right', '/tof/left_rear', '/tof/right_rear',
         ):
-            self.create_subscription(Range, _tof_topic, self._proximity_cb, 10)
+            self.create_subscription(Range, _tof_topic, self._proximity_cb, _sensor_qos)
         self.create_subscription(String,  '/safety/clear_fault',   self._clear_fault_cb,  10)
         self.create_subscription(Bool,    '/stall_recovery/active', self._recovery_cb,    10)
 
@@ -108,6 +134,55 @@ class SafetyNode(Node):
         self.create_timer(1.0,  self._status_cb)
 
         self.get_logger().info('safety_node started')
+
+    # ── Live parameter callback ───────────────────────────────────────────────
+
+    def _on_set_parameters(self, params):
+        """
+        Validate and apply runtime parameter changes. Called by rclpy on every
+        `ros2 param set`. Returning successful=False rejects the change and the
+        stored parameter value is left untouched, so a bad value never reaches
+        the safety logic. Updating the cached float attribute is atomic (GIL),
+        so this is safe to run alongside the 20 Hz safety check.
+        """
+        # Validate the whole batch first — rclpy applies a `set` atomically, so
+        # we must not mutate any cached value until every param has passed, or a
+        # later rejection would leave the cache out of sync with the param store.
+        pending = []  # (attr, value) to apply once all checks pass
+        for p in params:
+            attr = self._param_attr.get(p.name)
+            if attr is None:
+                # Not one of our tunable thresholds — accept without caching.
+                continue
+
+            try:
+                value = float(p.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} must be a number, got {p.value!r}',
+                )
+
+            if value <= 0.0:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} must be > 0, got {value}',
+                )
+
+            if p.name == 'min_proximity_m' and not (0.03 <= value <= 1.20):
+                return SetParametersResult(
+                    successful=False,
+                    reason=(f'min_proximity_m {value} out of ToF range '
+                            f'0.03–1.20 m'),
+                )
+
+            pending.append((attr, value, p.name))
+
+        for attr, value, name in pending:
+            setattr(self, attr, value)
+            self.get_logger().info(f'Parameter updated: {name} = {value}')
+
+        return SetParametersResult(successful=True)
 
     # ── Subscriber callbacks ──────────────────────────────────────────────────
 

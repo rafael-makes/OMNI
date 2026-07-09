@@ -166,8 +166,17 @@ class AudioHandler:
         Call this before starting WakeWordDetector so the mic is free.
         """
         self._capture_running = False
-        # Unblock get_mic_chunk() if it is waiting inside the queue
-        self._mic_queue.put(b'')
+        # Wake get_mic_chunk() if it is blocked waiting on the queue.
+        # MUST be non-blocking: this runs on the single-threaded ROS executor.
+        # If the queue is already full the consumer (gemini send loop) has
+        # stopped draining it — it is therefore NOT waiting, so the sentinel is
+        # unnecessary and is safely dropped. A blocking put() here deadlocks the
+        # whole node (executor stops publishing /robot_state and the watchdog
+        # never fires), which leaves the eyes/LCD/matrix frozen on ERROR.
+        try:
+            self._mic_queue.put_nowait(b'')
+        except queue.Full:
+            pass
         self._log.info('AudioHandler capture stopping')
 
     def get_mic_chunk(self) -> bytes:
@@ -199,8 +208,11 @@ class AudioHandler:
         self._capture_running = False
         self._speaker_running = False
         self._muted.clear()
-        # Unblock get_mic_chunk() if it is waiting
-        self._mic_queue.put(b'')
+        # Wake get_mic_chunk() if it is waiting — non-blocking (see stop_capture).
+        try:
+            self._mic_queue.put_nowait(b'')
+        except queue.Full:
+            pass
         self._log.info('AudioHandler stopping')
 
     def is_playing(self) -> bool:

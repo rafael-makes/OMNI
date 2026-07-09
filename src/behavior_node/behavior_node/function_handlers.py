@@ -38,8 +38,13 @@ from tf2_ros import Buffer, TransformListener
 VALID_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'}
 
 # States Gemini is allowed to request via set_robot_state().
-# NAVIGATING is intentionally excluded — navigation is started by navigate_to() only.
-_GEMINI_SETTABLE_STATES = {'IDLE', 'LISTENING', 'SPEAKING', 'EXPLORING', 'DOCKING', 'ERROR'}
+# NAVIGATING is excluded — navigation is started by navigate_to() only.
+# SPEAKING and LISTENING are excluded — they are auto-managed by the audio
+# pipeline (SPEAKING on the first audio chunk, back to LISTENING when playback
+# drains; see gemini_bridge._await_playback_and_set_listening). If the model
+# sets SPEAKING by hand, that recovery watcher never spawns and the robot is
+# stranded in SPEAKING until a timeout — observed as conversation "lockups".
+_GEMINI_SETTABLE_STATES = {'IDLE', 'EXPLORING', 'DOCKING', 'ERROR'}
 
 # ── Tool declarations ──────────────────────────────────────────────────────────
 # Passed to Gemini's LiveConnectConfig when the session opens.
@@ -52,8 +57,10 @@ OMNI_TOOLS = [
             genai_types.FunctionDeclaration(
                 name='set_robot_state',
                 description=(
-                    'Change OMNI\'s operating state. Use IDLE when conversation ends, '
-                    'SPEAKING when talking, LISTENING when waiting for input. '
+                    'Change OMNI\'s operating state. Use IDLE only when the '
+                    'conversation is fully finished. Do NOT use this for talking or '
+                    'listening — the SPEAKING and LISTENING states are handled '
+                    'automatically while you converse, so never set them yourself. '
                     'NEVER use this to start navigation — call navigate_to() instead.'
                 ),
                 parameters=genai_types.Schema(
@@ -64,6 +71,7 @@ OMNI_TOOLS = [
                             description=(
                                 f'One of: {", ".join(sorted(_GEMINI_SETTABLE_STATES))}. '
                                 'Use IDLE when the conversation is fully finished. '
+                                'SPEAKING/LISTENING are automatic — do not set them. '
                                 'Do NOT use NAVIGATING here — call navigate_to() for navigation.'
                             ),
                         )

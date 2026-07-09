@@ -33,7 +33,8 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument(
             'gemini_model',
-            default_value='models/gemini-2.5-flash-native-audio-latest',
+            # Tool-capable Live model required: native-audio models reject `tools`.
+            default_value='models/gemini-3.1-flash-live-preview',
             description='Gemini model name passed to the Live API',
         ),
         DeclareLaunchArgument(

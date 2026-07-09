@@ -144,11 +144,17 @@ class GeminiBridge:
 
         self._loop.call_soon_threadsafe(_cancel)
 
-    def inject_context(self, text: str):
+    def is_session_active(self) -> bool:
+        """True while a Gemini Live session is open. Safe to read from any thread."""
+        return self._session_active
+
+    def inject_context(self, text: str, *, alert: bool = True):
         """
         Send a text message into the active Gemini session.
         Used by behavior_node to inject [SYSTEM ALERT] fault messages so
-        Gemini can react in character. Prefixes with [SYSTEM ALERT] automatically.
+        Gemini can react in character. With alert=True (default) the text is
+        prefixed with [SYSTEM ALERT] to trigger the system-prompt urgency rule;
+        pass alert=False to send the text as-is (e.g. a scripted /audio/say line).
         Safe to call from the ROS2 thread.
         """
         async def _inject():
@@ -157,10 +163,10 @@ class GeminiBridge:
                     'inject_context() called but no session is active — ignoring'
                 )
                 return
-            alert = f'[SYSTEM ALERT] {text}'
-            self._node.get_logger().info(f'Injecting context: {alert}')
+            payload = f'[SYSTEM ALERT] {text}' if alert else text
+            self._node.get_logger().info(f'Injecting context: {payload}')
             try:
-                await self._session_ref.send(input=alert)
+                await self._session_ref.send(input=payload)
             except Exception as exc:
                 self._node.get_logger().error(f'inject_context failed: {exc}')
 
@@ -201,6 +207,23 @@ class GeminiBridge:
                     f'Gemini session dropped unexpectedly: {exc}. '
                     f'Reconnecting in {_RECONNECT_DELAY}s...'
                 )
+
+                # The session died mid-turn, so neither the turn_complete branch
+                # nor the clean receive()-exhaust fallback in _recv_loop ran — the
+                # SPEAKING→LISTENING transition was skipped and the robot is orphaned
+                # in SPEAKING. Recover immediately instead of leaving it frozen for
+                # ~45s until _check_state_watchdog fires. Only touch SPEAKING: a fault
+                # (ERROR) or a function handler (NAVIGATING) may have already moved us
+                # elsewhere, in which case leave that state alone.
+                if self._node._current_state == 'SPEAKING':
+                    self._node.get_logger().warn(
+                        'Session dropped while SPEAKING — recovering to LISTENING '
+                        '(previously stayed stuck until the 45s watchdog).'
+                    )
+                    await self._loop.run_in_executor(
+                        None, self._node._set_state, 'LISTENING'
+                    )
+
                 await asyncio.sleep(_RECONNECT_DELAY)
 
                 if not self._running:
@@ -255,6 +278,21 @@ class GeminiBridge:
                     prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
                         voice_name=self._voice,
                     )
+                )
+            ),
+            # Voice-activity detection (VAD) tuning. Without this, Gemini uses a
+            # default start-of-speech threshold that only triggered on our louder
+            # turns (~450+ mic RMS) and ignored quieter speech (~300-400 RMS),
+            # making OMNI appear to "go deaf" mid-conversation. START_SENSITIVITY_HIGH
+            # lowers that threshold to catch softer speech while staying above the
+            # ~90-130 quiet-room floor. silence_duration_ms=1000 gives a full second
+            # of pause tolerance before Gemini decides the user's turn has ended, so
+            # natural mid-sentence pauses don't get cut off.
+            realtime_input_config=genai_types.RealtimeInputConfig(
+                automatic_activity_detection=genai_types.AutomaticActivityDetection(
+                    start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    silence_duration_ms=1000,
                 )
             ),
         )

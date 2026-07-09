@@ -3,7 +3,8 @@ omni_full_launch.py — Complete OMNI robot bring-up.
 
 Starts the full stack in dependency order:
 
-  t=0s   Sensor nodes      — motor_control, imu, lidar, tof, camera
+  t=0s   Sensor nodes      — motor_control, imu, lidar, tof
+                             (person detection runs on the Jetson, not here)
   t=0s   Support nodes     — bms, safety, eye, servo, chest
   t=0s   Static TFs        — base_link→imu_link, base_link→camera_link
   t=0s   slam_toolbox      — spawned but self-managed via slam_launch.py TimerActions:
@@ -104,7 +105,9 @@ def generate_launch_description():
     # behavior_node — identical to behavior_minimal_launch.py
     gemini_model_arg = DeclareLaunchArgument(
         'gemini_model',
-        default_value='models/gemini-2.5-flash-native-audio-latest',
+        # Must be a tool-capable Live model: native-audio models reject `tools`
+        # (function calling) with WS 1008 and drop mid-turn. See behavior_node.py.
+        default_value='models/gemini-3.1-flash-live-preview',
         description='Gemini model name passed to the Live API',
     )
     gemini_voice_arg = DeclareLaunchArgument(
@@ -166,8 +169,10 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_imu',
-        # BNO085: x=0.129m forward, y=0, z=0.275m above floor plane.
-        arguments=['0.129', '0', '0.275', '0', '0', '0', 'base_link', 'imu_link'],
+        # BNO085: x=0.129m forward, y=0, z=0.625m above floor plane (raised from
+        # 0.275m when OMNI was made taller, 2026-07-07). z barely affects the 2D
+        # yaw fusion; x/y unchanged (only the mast height grew).
+        arguments=['0.129', '0', '0.625', '0', '0', '0', 'base_link', 'imu_link'],
         output='screen',
     )
 
@@ -175,8 +180,14 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_camera',
-        # IMX500: x=0.089m forward, y=0, z=0.695m above floor plane.
-        arguments=['0.089', '0', '0.695', '0', '0', '0', 'base_link', 'camera_link'],
+        # Defines camera_link so the Jetson's /camera/detections (frame_id=camera_link)
+        # has a frame. NOTE: PLACEHOLDER — offsets are the old IMX500 head position and
+        # this is STATIC, but the IMX219 now rides the pan/tilt head, so camera_link
+        # actually moves. Fine while head_tracking works in pixel space; revisit if any
+        # node uses camera_link geometrically (then publish it dynamically off servo state).
+        # z=1.075m measured 2026-07-07 (IMX219 head height on the taller OMNI). x is
+        # still the old IMX500 estimate — head is a placeholder anyway.
+        arguments=['0.089', '0', '1.075', '0', '0', '0', 'base_link', 'camera_link'],
         output='screen',
     )
 
@@ -230,13 +241,11 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
-    camera_node = Node(
-        package='camera_node',
-        executable='camera_node',
-        name='camera_node',
-        output='screen',
-        emulate_tty=True,
-    )
+    # camera_node (Pi IMX500) DECOMMISSIONED 2026-07-07 — person detection moved to
+    # the Jetson (IMX219 + YOLO26n TensorRT). The Jetson's head_detector node now
+    # publishes /camera/detections and /camera/status over the network. Do NOT run a
+    # Pi camera_node here or it double-publishes /camera/detections and conflicts.
+    # Jetson launch: `ros2 run head_detector head_detector_node --ros-args -p source:=csi`
 
     # ── BMS node ───────────────────────────────────────────────────────────────
     # Publishes /battery/status — behavior_node reads this for report_status().
@@ -314,6 +323,13 @@ def generate_launch_description():
         package='foxglove_bridge',
         executable='foxglove_bridge',
         name='foxglove_bridge',
+        output='screen',
+    )
+
+    tof_viz_node = Node(
+        package='tof_viz_node',
+        executable='tof_viz_node',
+        name='tof_viz_node',
         output='screen',
     )
 
@@ -436,7 +452,7 @@ def generate_launch_description():
         imu_node,
         lidar_node,
         tof_node,
-        camera_node,
+        # camera_node removed — person detection now runs on the Jetson (see note above)
         # Support (t=0)
         bms_node,
         safety_node,
@@ -454,5 +470,6 @@ def generate_launch_description():
         behavior_node,
         # Tools
         foxglove_node,
+        tof_viz_node,
         stall_recovery_node,
     ])

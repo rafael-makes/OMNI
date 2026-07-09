@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Range
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Twist, PoseStamped
@@ -61,6 +62,26 @@ class StallRecoveryNode(Node):
         self._cooldown           = self.get_parameter('cooldown').value
         self._publish_hz         = self.get_parameter('publish_hz').value
         self._min_front_clearance = self.get_parameter('min_front_clearance').value
+
+        # ── Live parameter tuning ─────────────────────────────────────────────
+        # All recovery thresholds are read at use-time, so updating the cached
+        # value takes effect on the next recovery without a relaunch, e.g.:
+        #   ros2 param set /stall_recovery_node backup_speed 0.30
+        # Every value must be > 0. Updating a float is atomic (GIL), so this is
+        # safe alongside the recovery sequence thread.
+        self._param_attr = {
+            'backup_speed':        '_backup_speed',
+            'min_backup_dist':     '_min_backup_dist',
+            'max_backup_dist':     '_max_backup_dist',
+            'rear_safety_margin':  '_rear_safety_margin',
+            'min_rear_clearance':  '_min_rear_clearance',
+            'rotate_speed':        '_rotate_speed',
+            'rotate_duration':     '_rotate_duration',
+            'cooldown':            '_cooldown',
+            'publish_hz':          '_publish_hz',
+            'min_front_clearance': '_min_front_clearance',
+        }
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # ── State ─────────────────────────────────────────────────────────────
         self._current_goal: PoseStamped | None = None
@@ -101,6 +122,37 @@ class StallRecoveryNode(Node):
         self.create_subscription(Range,       '/tof/front_right',      self._front_right_cb, sensor_qos)
 
         self.get_logger().info('stall_recovery_node ready')
+
+    # ── Live parameter callback ───────────────────────────────────────────────
+
+    def _on_set_parameters(self, params):
+        """
+        Validate and apply runtime parameter changes (ros2 param set). Returning
+        successful=False rejects the whole batch and leaves the stored value
+        untouched, so a bad value never reaches the recovery logic. Validate the
+        full batch before mutating anything, since a set is applied atomically.
+        """
+        pending = []  # (attr, value, name) to apply once all checks pass
+        for p in params:
+            attr = self._param_attr.get(p.name)
+            if attr is None:
+                continue
+            try:
+                value = float(p.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} must be a number, got {p.value!r}')
+            if value <= 0.0:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} must be > 0, got {value}')
+            pending.append((attr, value, p.name))
+
+        for attr, value, name in pending:
+            setattr(self, attr, value)
+            self.get_logger().info(f'Parameter updated: {name} = {value}')
+        return SetParametersResult(successful=True)
 
     # ── Sensor callbacks ──────────────────────────────────────────────────────
 

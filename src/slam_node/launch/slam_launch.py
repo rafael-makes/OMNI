@@ -39,16 +39,25 @@ def generate_launch_description():
     # ── LiDAR static TF ──────────────────────────────────────────────────────
     # LD19 is on top of the mast, centred over the robot.
     # frame_id=base_link  child_frame_id=lidar_link  (matches lidar_node default)
-    # x=0  y=0  z=0.825m  roll=0  pitch=0  yaw=0
-    # Measured: lidar scan plane is 825mm above the floor.
+    # x=0  y=0  z=1.210m  roll=0  pitch=0  yaw=0
+    # Measured 2026-07-07: lidar scan plane is 1210mm above the floor (raised from
+    # 825mm when OMNI was made taller). base_link is at floor level, so this z is
+    # the absolute scan-plane height.
     lidar_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_lidar',
-        arguments=['0', '0', '0.825', '0', '0', '0',
+        arguments=['0', '0', '1.210', '0', '0', '0',
                    'base_link', 'lidar_link'],
         output='screen',
     )
+
+    # base_link -> oak TF is now published BY THE JETSON's depthai driver
+    # (omni_jetson_bringup/config/oak_lite_depth.yaml, camera.i_tf_parent_frame=
+    # base_link + i_tf_cam_pos_*), which roots the OAK's whole optical-frame tree
+    # at base_link so /oak/scan (frame oak_rgb_camera_optical_frame) is reachable.
+    # The old Pi-side base_link->oak_link static TF was removed (dead-end frame,
+    # and would double-parent 'oak'). Placeholder mount offsets live in that yaml.
 
     tof_tfs = [
         Node(package='tf2_ros', executable='static_transform_publisher',
@@ -154,6 +163,7 @@ def generate_launch_description():
             description='Path to slam_toolbox params YAML'),
         LogInfo(msg='OMNI slam_node starting — map→odom→base_link, LiDAR z=0.38m'),
         lidar_tf,
+        # oak_tf removed — Jetson depthai driver now publishes base_link->oak (see above)
         *tof_tfs,
         slam_node,
         configure_event,

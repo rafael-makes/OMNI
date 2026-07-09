@@ -7,6 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
@@ -71,6 +72,15 @@ class CameraNode(Node):
         self._nms_iou_thresh  = self.get_parameter('nms_iou_threshold').value
         self._max_detections  = self.get_parameter('max_detections').value
 
+        # ── Live parameter tuning ─────────────────────────────────────────────
+        # Only the detection thresholds are runtime-tunable — they are read on
+        # every frame in the capture thread, so a change takes effect on the next
+        # frame without a relaunch, e.g.:
+        #   ros2 param set /camera_node confidence_threshold 0.55
+        # fps/model/resolution are NOT here: they are bound to timers and the
+        # camera config at init and cannot be changed without re-init.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         # ── State ────────────────────────────────────────────────────────────
         self._latest_frame      = None   # numpy [H, W, 3] RGB888
         self._latest_detections = []     # list of dicts
@@ -124,6 +134,51 @@ class CameraNode(Node):
             f'confidence ≥ {self._conf_thresh}, NMS IoU ≤ {self._nms_iou_thresh}, '
             f'max_detections={self._max_detections}'
         )
+
+    # ── Live parameter callback ───────────────────────────────────────────────
+
+    def _on_set_parameters(self, params):
+        """
+        Validate and apply runtime detection-threshold changes (ros2 param set).
+        Rejecting (successful=False) leaves the stored value untouched, so a bad
+        value never reaches the detection path. Validate the whole batch before
+        mutating, since a set is applied atomically. Float/int writes are atomic
+        (GIL), so this is safe alongside the capture thread that reads them.
+        """
+        pending = []  # (attr, value, name) to apply once all checks pass
+        for p in params:
+            if p.name in ('confidence_threshold', 'nms_iou_threshold'):
+                try:
+                    value = float(p.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f'{p.name} must be a number, got {p.value!r}')
+                if not (0.0 <= value <= 1.0):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f'{p.name} must be in 0.0–1.0, got {value}')
+                attr = ('_conf_thresh' if p.name == 'confidence_threshold'
+                        else '_nms_iou_thresh')
+                pending.append((attr, value, p.name))
+            elif p.name == 'max_detections':
+                try:
+                    value = int(p.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f'max_detections must be an integer, got {p.value!r}')
+                if value < 1:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f'max_detections must be >= 1, got {value}')
+                pending.append(('_max_detections', value, p.name))
+            # all other params are init-time only — accept without caching
+
+        for attr, value, name in pending:
+            setattr(self, attr, value)
+            self.get_logger().info(f'Parameter updated: {name} = {value}')
+        return SetParametersResult(successful=True)
 
     # ── Connection ───────────────────────────────────────────────────────────
 

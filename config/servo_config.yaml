@@ -2,19 +2,19 @@ servos:
   left_shoulder:
     board: 0
     channel: 0
-    neutral_pw: 1600
+    neutral_pw: 1550
     min_pw: 500
     max_pw: 2500
   left_elbow:
     board: 0
     channel: 1
-    neutral_pw: 2050
+    neutral_pw: 1350
     min_pw: 500
     max_pw: 2500
   left_wrist:
     board: 0
     channel: 2
-    neutral_pw: 1600
+    neutral_pw: 550
     min_pw: 500
     max_pw: 2500
   left_gripper:
@@ -26,13 +26,13 @@ servos:
   head_pan:
     board: 0
     channel: 4
-    neutral_pw: 1550
+    neutral_pw: 1500
     min_pw: 500
     max_pw: 2500
   head_tilt:
     board: 0
     channel: 5
-    neutral_pw: 1450
+    neutral_pw: 1500
     min_pw: 700
     max_pw: 2300
   right_shoulder:
@@ -44,18 +44,18 @@ servos:
   right_elbow:
     board: 1
     channel: 1
-    neutral_pw: 1150
+    neutral_pw: 2000
     min_pw: 500
     max_pw: 2500
   right_wrist:
     board: 1
     channel: 2
-    neutral_pw: 1050
+    neutral_pw: 2350
     min_pw: 500
     max_pw: 2500
   right_gripper:
     board: 1
     channel: 3
-    neutral_pw: 1850
+    neutral_pw: 2300
     min_pw: 700
     max_pw: 2300
