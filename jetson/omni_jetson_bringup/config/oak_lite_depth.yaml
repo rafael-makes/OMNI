@@ -1,0 +1,37 @@
+/oak:
+  ros__parameters:
+    camera:
+      # Depth-only: no RGB stream, no onboard NN -> minimal USB2 bandwidth so depth
+      # runs fast (~21 Hz vs ~3.5 Hz default RGBD+NN). OAK-D Lite has no IMU and no
+      # IR projector, so disable both.
+      i_pipeline_type: depth
+      i_nn_type: none
+      i_enable_imu: false
+      i_enable_ir: false
+
+      # TF: let the driver root its whole camera tree at base_link so /oak/scan
+      # (frame oak_rgb_camera_optical_frame) is reachable from the Pi's TF tree.
+      # This REPLACES the old Pi-side base_link->oak_link static TF (dead-end frame).
+      # MEASURED body mount (Rafael, 2026-07-07): 132mm forward, center, 925mm high,
+      # tilted 10 deg downward. pos in metres; rpy in RADIANS (driver feeds these
+      # straight into a URDF <origin rpy>). +pitch tilts the camera forward-axis DOWN.
+      i_publish_tf_from_calibration: true
+      i_tf_camera_model: OAK-D-LITE
+      i_tf_parent_frame: base_link
+      i_tf_base_frame: oak
+      # NOTE: the driver declares these pose params as STRINGS (they also accept
+      # "auto" to read from calibration), so the numbers MUST be quoted.
+      i_tf_cam_pos_x: '0.132'
+      i_tf_cam_pos_y: '0.0'
+      i_tf_cam_pos_z: '0.925'
+      i_tf_cam_roll: '0.0'
+      i_tf_cam_pitch: '0.1745'   # 10 deg downward
+      i_tf_cam_yaw: '0.0'
+    left:
+      i_resolution: '400'     # OAK-D Lite mono cams: 400p (640x400) native
+      i_fps: 30.0
+    right:
+      i_resolution: '400'
+      i_fps: 30.0
+    stereo:
+      i_subpixel: false       # off = faster; laserscan doesn't need subpixel precision

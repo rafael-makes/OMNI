@@ -57,3 +57,8 @@ maps/
 # TF tree debug exports
 frames_*.gv
 frames_*.pdf
+
+# Jetson: device-specific TensorRT engine (rebuild from onnx) + build artifacts
+jetson/models/*.engine
+jetson/**/build/
+jetson/**/install/

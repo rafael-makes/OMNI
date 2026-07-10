@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<package format="3">
+  <name>omni_jetson_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Launch + config for OMNI's Jetson-side sensors: OAK-D Lite depth -> LaserScan
+    (/oak/scan) for the Pi's Nav2 obstacle layer. Head-tracking detector lives in
+    the separate head_detector package.
+  </description>
+  <maintainer email="redline6k@gmail.com">Rafael</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>depthai_ros_driver</exec_depend>
+  <exec_depend>depthimage_to_laserscan</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
