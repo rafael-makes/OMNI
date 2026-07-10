@@ -42,6 +42,13 @@ _NEUTRAL_RETURN_RATE = 0.1
 # Once within this distance of the axis neutral, snap exactly to it to stop creeping.
 _NEUTRAL_SNAP = 0.01
 
+# Output smoothing (anti-notch): the 10 Hz control law only sets a TARGET; a faster
+# slew timer moves the actually-published position toward that target so the servos
+# glide instead of snapping in 10 Hz steps. slew_alpha (fraction of the remaining gap
+# closed per slew tick) is a live-tunable param; _SLEW_HZ is the slew rate.
+_SLEW_HZ = 50.0
+_SLEW_SNAP = 0.0015
+
 
 def _deg_to_norm(deg: float) -> float:
     """servo_node maps 0–180° onto a servo's pulse range; we track [0,1] internally."""
@@ -54,13 +61,20 @@ class HeadTrackingNode(Node):
         super().__init__('head_tracking_node')
 
         # ── Parameters ──────────────────────────────────────────────────────
-        # Gain signs come from measured direction convention (see project memory
-        # head-servo-directions): pan hi=left/lo=right, tilt hi=down/lo=up.
-        #   person right (pan_error +ve) -> turn right -> angle down -> pan_gain -ve
-        #   person below (tilt_error +ve) -> tilt down -> angle up   -> tilt_gain +ve
-        self.declare_parameter('pan_gain',                  -0.05)
-        self.declare_parameter('tilt_gain',                  0.05)
-        self.declare_parameter('max_step',                  0.02)
+        # Gain signs from measured direction. Pan: person right -> pan_gain -ve.
+        # TILT REVERSED 2026-07-09 — single servo on ch6 with the servo reverser
+        # removed: higher servo angle = head UP, so tilt_gain is NEGATIVE. Speeds
+        # (pan_gain, max_step) tuned live and confirmed good by Rafael.
+        self.declare_parameter('pan_gain',                  -0.18)
+        self.declare_parameter('tilt_gain',                 -0.05)
+        self.declare_parameter('max_step',                  0.09)
+        # Aim point: fraction of the person-box HEIGHT measured DOWN from the TOP of
+        # the box. 0.15 ~ forehead/face, so the head looks at the face (not the torso
+        # center) and tilt stops saturating downward. 0.5 = old bbox-center behavior.
+        self.declare_parameter('head_target_frac',          0.2)
+        # Output smoothing: fraction of the remaining gap the head glides each 50 Hz
+        # slew tick. Lower = smoother but a touch laggier; higher = snappier/notchier.
+        self.declare_parameter('slew_alpha',                0.4)
         self.declare_parameter('detection_confidence_min',  0.7)
         self.declare_parameter('tracking_states',           'IDLE,LISTENING,SPEAKING')
         self.declare_parameter('return_to_neutral_timeout', 2.0)
@@ -69,21 +83,24 @@ class HeadTrackingNode(Node):
         self.declare_parameter('pan_board',                 0)
         self.declare_parameter('pan_channel',               4)
         self.declare_parameter('tilt_board',                0)
-        self.declare_parameter('tilt_channel',              5)
-        # Per-axis safe travel envelope and resting gaze, in degrees. These are
-        # NARROWER than the mechanical end-stops (pan 50–130, tilt 74–94) on
-        # purpose — driving into a stop stalls the servo (BMS-trip risk). Tilt
-        # level gaze is 84°, not 90°, so its neutral is offset.
+        self.declare_parameter('tilt_channel',              6)  # ch5 died (overheat 2026-07-09)
+        # Per-axis safe travel envelope and resting gaze, in degrees. NARROWER than
+        # the mechanical end-stops on purpose — driving into a stop stalls the servo.
+        # TILT RECALIBRATED 2026-07-09 for the single servo on ch6 (reverser removed):
+        # measured full-down=90°, full-up=105°, level=97° (higher angle = up). Limits
+        # keep ~2° margin from each stop.
         self.declare_parameter('pan_min_deg',      52.0)
         self.declare_parameter('pan_max_deg',     128.0)
         self.declare_parameter('pan_neutral_deg',  90.0)
-        self.declare_parameter('tilt_min_deg',     76.0)
-        self.declare_parameter('tilt_max_deg',     92.0)
-        self.declare_parameter('tilt_neutral_deg', 84.0)
+        self.declare_parameter('tilt_min_deg',     92.0)
+        self.declare_parameter('tilt_max_deg',    103.0)
+        self.declare_parameter('tilt_neutral_deg', 97.0)
 
         self._pan_gain        = self.get_parameter('pan_gain').value
         self._tilt_gain       = self.get_parameter('tilt_gain').value
         self._max_step        = self.get_parameter('max_step').value
+        self._head_target_frac = self.get_parameter('head_target_frac').value
+        self._slew_alpha       = self.get_parameter('slew_alpha').value
         self._conf_min        = self.get_parameter('detection_confidence_min').value
         self._tracking_states = {
             s.strip()
@@ -119,6 +136,8 @@ class HeadTrackingNode(Node):
             'pan_gain':                 '_pan_gain',
             'tilt_gain':                '_tilt_gain',
             'max_step':                 '_max_step',
+            'head_target_frac':         '_head_target_frac',
+            'slew_alpha':               '_slew_alpha',
             'detection_confidence_min': '_conf_min',
             'return_to_neutral_timeout': '_return_timeout',
         }
@@ -135,8 +154,10 @@ class HeadTrackingNode(Node):
         # ── State ────────────────────────────────────────────────────────────
         # Servo positions as normalized [0.0, 1.0]; axis neutral is per-axis
         # (pan 90° → 0.5, tilt 84° → 0.467) because tilt's level gaze is offset.
-        self._pan_norm         = self._pan_neutral
+        self._pan_norm         = self._pan_neutral   # TARGET (10 Hz control updates this)
         self._tilt_norm        = self._tilt_neutral
+        self._pan_out          = self._pan_neutral   # smoothed OUTPUT (50 Hz slew publishes)
+        self._tilt_out         = self._tilt_neutral
         self._robot_state      = 'IDLE'
         # Initialise to boot time so the 2-second timeout doesn't fire
         # immediately before any detection arrives.
@@ -153,8 +174,9 @@ class HeadTrackingNode(Node):
         )
         self.create_subscription(String, '/robot_state', self._on_robot_state, 10)
 
-        # ── Control timer (10 Hz — matches camera detection rate) ────────────
+        # ── Timers: 10 Hz control sets the TARGET; 50 Hz slew smooths the OUTPUT ──
         self.create_timer(0.1, self._control_cb)
+        self.create_timer(1.0 / _SLEW_HZ, self._slew_cb)
 
         self.get_logger().info(
             f'head_tracking_node started — '
@@ -247,7 +269,11 @@ class HeadTrackingNode(Node):
                         and result.hypothesis.score > best_score):
                     best_score = result.hypothesis.score
                     best_cx    = det.bbox.center.position.x / self._img_w
-                    best_cy    = det.bbox.center.position.y / self._img_h
+                    # Aim at the head region (near the top of the person box) rather
+                    # than the torso center, so the robot looks at the face.
+                    head_y     = (det.bbox.center.position.y
+                                  - det.bbox.size_y * (0.5 - self._head_target_frac))
+                    best_cy    = head_y / self._img_h
 
         if best_cx is not None:
             # Clamp to [0,1] — belt-and-suspenders against out-of-frame coords
@@ -272,24 +298,34 @@ class HeadTrackingNode(Node):
             pan_error  = cx_norm - 0.5
             tilt_error = cy_norm - 0.5
 
-            changed = False
+            # Update the TARGET only; the 50 Hz slew timer publishes smoothed motion.
             if abs(pan_error) > _DEAD_ZONE:
                 delta = max(-self._max_step, min(self._max_step,
                     self._pan_gain * pan_error))
                 self._pan_norm = max(self._pan_min, min(self._pan_max,
                     self._pan_norm + delta))
-                changed = True
             if abs(tilt_error) > _DEAD_ZONE:
                 delta = max(-self._max_step, min(self._max_step,
                     self._tilt_gain * tilt_error))
                 self._tilt_norm = max(self._tilt_min, min(self._tilt_max,
                     self._tilt_norm + delta))
-                changed = True
-            if changed:
-                self._publish_servos()
 
         elif elapsed >= self._return_timeout:
             self._step_toward_neutral()
+
+    def _slew_cb(self):
+        """50 Hz: glide the published output toward the target — kills the 10 Hz notch."""
+        new_pan  = self._pan_out  + (self._pan_norm  - self._pan_out)  * self._slew_alpha
+        new_tilt = self._tilt_out + (self._tilt_norm - self._tilt_out) * self._slew_alpha
+        # settle exactly on target so we stop republishing once caught up
+        if abs(self._pan_norm  - new_pan)  <= _SLEW_SNAP:
+            new_pan  = self._pan_norm
+        if abs(self._tilt_norm - new_tilt) <= _SLEW_SNAP:
+            new_tilt = self._tilt_norm
+        if new_pan != self._pan_out or new_tilt != self._tilt_out:
+            self._pan_out  = new_pan
+            self._tilt_out = new_tilt
+            self._publish_servos()
 
     # ── Servo helpers ─────────────────────────────────────────────────────────
 
@@ -312,20 +348,21 @@ class HeadTrackingNode(Node):
             self._tilt_norm = max(self._tilt_min, min(self._tilt_max, self._tilt_norm + step))
             if abs(self._tilt_norm - self._tilt_neutral) <= _NEUTRAL_SNAP:
                 self._tilt_norm = self._tilt_neutral
-
-        self._publish_servos()
+        # target decayed toward neutral; the 50 Hz slew publishes the smoothed motion
 
     def _snap_to_neutral(self):
         """Immediately publish neutral and reset internal state."""
         self._latest_detection = None
         self._pan_norm  = self._pan_neutral
         self._tilt_norm = self._tilt_neutral
+        self._pan_out   = self._pan_neutral
+        self._tilt_out  = self._tilt_neutral
         self._publish_servos()
 
     def _publish_servos(self):
         """Publish pan and tilt angles as a single Float32MultiArray command."""
-        pan_deg  = self._pan_norm  * 180.0
-        tilt_deg = self._tilt_norm * 180.0
+        pan_deg  = self._pan_out  * 180.0
+        tilt_deg = self._tilt_out * 180.0
 
         msg = Float32MultiArray()
         # servo_node expects groups of three: [board_id, channel, angle_degrees, ...]

@@ -31,7 +31,7 @@ servos:
     max_pw: 2500
   head_tilt:
     board: 0
-    channel: 5
+    channel: 6          # moved from ch5 (killed by the 2026-07-09 tilt-servo overheat)
     neutral_pw: 1500
     min_pw: 700
     max_pw: 2300
