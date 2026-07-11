@@ -40,6 +40,7 @@ GEMINI_API_KEY must be exported before launching:
 """
 
 import os
+import subprocess
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -48,6 +49,8 @@ from launch.actions import (
     ExecuteProcess,
     IncludeLaunchDescription,
     LogInfo,
+    OpaqueFunction,
+    SetLaunchConfiguration,
     TimerAction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -74,8 +77,9 @@ def generate_launch_description():
     # SLAM
     slam_map_arg = DeclareLaunchArgument(
         'map_file',
-        default_value='/home/pi/omni_ws/maps/omni_home_map',
-        description='Path prefix of the saved pose graph (no extension)',
+        default_value='auto',
+        description='Pose-graph path prefix, or "auto" to pick by floor '
+                    '(AprilTag dock -> barometer fallback) at boot',
     )
 
     # Nav2
@@ -299,6 +303,52 @@ def generate_launch_description():
         }],
     )
 
+    # ── Boot floor resolver ────────────────────────────────────────────────────
+    # When map_file == 'auto', pick the map by which floor OMNI booted on:
+    # AprilTag dock tag first (Jetson /detections; id 0 = main, id 1 = basement),
+    # barometer fallback if no tag is seen. Runs baro_floor_resolver in its own
+    # process — which reads /detections and the BMP280 directly — and captures the
+    # chosen map path from stdout. An explicit map_file:=<path> skips all of this.
+    #
+    # Placed before baro_node below so the resolver's direct BMP280 read at 0x77
+    # doesn't overlap baro_node's polling of the same device.
+    _DEFAULT_MAP = '/home/pi/omni_ws/maps/omni_home_map'
+
+    def _resolve_map_file(context, *args, **kwargs):
+        requested = LaunchConfiguration('map_file').perform(context)
+        if requested != 'auto':
+            return []  # explicit override — respect it, resolver not run
+        map_path = _DEFAULT_MAP
+        try:
+            result = subprocess.run(
+                ['ros2', 'run', 'baro_node', 'baro_floor_resolver',
+                 '--quiet', '--tag-timeout', '4', '--seconds', '2'],
+                capture_output=True, text=True, timeout=25)
+            lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+            if lines and lines[-1].startswith('/'):
+                map_path = lines[-1].strip()
+                note = f'[omni_full] boot floor resolver selected map: {map_path}'
+            else:
+                note = (f'[omni_full] floor resolver gave no map; '
+                        f'using default {map_path}')
+        except Exception as e:  # noqa: BLE001 — never let boot fail on this
+            note = f'[omni_full] floor resolver error ({e}); using default {map_path}'
+        return [
+            LogInfo(msg=note),
+            SetLaunchConfiguration('map_file', map_path),
+        ]
+
+    resolve_map_action = OpaqueFunction(function=_resolve_map_file)
+
+    # Barometer node — live floor tracking + accepts /baro/set_floor re-anchoring
+    # from the dock behaviour. Starts after the resolver (see note above).
+    baro_node = Node(
+        package='baro_node',
+        executable='baro_node',
+        name='baro_node',
+        output='screen',
+    )
+
     # ── SLAM — localization mode ───────────────────────────────────────────────
     # Loads the saved pose graph and localises within the existing map.
     # Does not modify the map. Delegates to localization_launch.py which:
@@ -460,6 +510,10 @@ def generate_launch_description():
         eye_node,
         servo_node,
         chest_node,
+        # Boot floor resolution: AprilTag dock -> baro fallback sets map_file.
+        # Blocks ~6s while it reads the tag topic + BMP280, then baro_node starts.
+        resolve_map_action,
+        baro_node,
         # SLAM localization (configure@3s, activate@8s — internal timers)
         slam_include,
         # Initial pose (t=10s — after SLAM active, before Nav2 starts)

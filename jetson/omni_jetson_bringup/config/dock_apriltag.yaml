@@ -1,0 +1,20 @@
+# apriltag_ros (christianrauch, 3.4.0) params for the rear dock camera.
+# Wildcard namespace so it applies regardless of node name.
+#
+# Floor selection needs only the tag ID (id 0 = main, id 1 = basement), so pose
+# estimation is disabled here — that also silences the "camera not calibrated"
+# warning. Re-enable it (set pose_estimation_method + calibrate the cam) when the
+# back-in docking behaviour needs tag pose.
+/**:
+  ros__parameters:
+    image_transport: raw
+    family: 36h11
+    size: 0.162                 # printed tag black-square edge (m); only used for pose
+    max_hamming: 0
+    pose_estimation_method: ""   # "" = ids only, no pose (no calibration required)
+    detector:
+      threads: 2
+      decimate: 2.0              # downsample for speed; ids still detect strongly
+      blur: 0.0
+      refine: true
+      sharpening: 0.25

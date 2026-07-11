@@ -19,6 +19,7 @@ src/geographic_info/
 src/interactive_markers/
 src/laser_geometry/
 src/vision_msgs/
+src/apriltag_msgs/
 
 # Python
 __pycache__/
