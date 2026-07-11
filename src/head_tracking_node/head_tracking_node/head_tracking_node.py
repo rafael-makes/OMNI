@@ -1,9 +1,20 @@
 """
 head_tracking_node.py — Pan/tilt head tracking for OMNI.
 
-Subscribes to /camera/detections and drives head_pan + head_tilt servos
-via /servo_commands to keep the highest-confidence person detection
-centered in the camera frame.
+Drives head_pan + head_tilt servos via /servo_commands to keep the tracked
+subject centered in the camera frame. Two detection sources (both from the
+Jetson head_detector_node), with faces preferred:
+
+  * /camera/faces      (class_id='face')   — YuNet face boxes. When a face is
+    fresh the head centers DIRECTLY on the face box center (accurate gaze).
+  * /camera/detections (class_id='person') — YOLO person boxes. Fallback when
+    no face is visible (person far/turned away); aims at the head region of
+    the person box (head_target_frac) as before.
+
+This face-preferred/person-fallback design keeps close-range gaze locked on the
+real face while still tracking a person across the room. Faces are the near-term
+target for the persistent per-person memory work; /camera/detections stays the
+general world feed the semantic-mapping layer will consume.
 
 P controller (independent axes, normalized servo position):
   pan_error  = detection_cx / image_width  - 0.5   (+ve = person right of center)
@@ -76,6 +87,13 @@ class HeadTrackingNode(Node):
         # slew tick. Lower = smoother but a touch laggier; higher = snappier/notchier.
         self.declare_parameter('slew_alpha',                0.4)
         self.declare_parameter('detection_confidence_min',  0.7)
+        # Face tracking (preferred source). prefer_faces gates whether a fresh
+        # face overrides the person box. face_confidence_min filters YuNet faces.
+        # face_timeout: how long a face stays "fresh" before we fall back to the
+        # person box — short, so losing the face for a moment doesn't stall.
+        self.declare_parameter('prefer_faces',              True)
+        self.declare_parameter('face_confidence_min',       0.6)
+        self.declare_parameter('face_timeout',              0.6)
         self.declare_parameter('tracking_states',           'IDLE,LISTENING,SPEAKING')
         self.declare_parameter('return_to_neutral_timeout', 2.0)
         self.declare_parameter('image_width',               1280)
@@ -102,6 +120,9 @@ class HeadTrackingNode(Node):
         self._head_target_frac = self.get_parameter('head_target_frac').value
         self._slew_alpha       = self.get_parameter('slew_alpha').value
         self._conf_min        = self.get_parameter('detection_confidence_min').value
+        self._prefer_faces    = self.get_parameter('prefer_faces').value
+        self._face_conf_min   = self.get_parameter('face_confidence_min').value
+        self._face_timeout    = self.get_parameter('face_timeout').value
         self._tracking_states = {
             s.strip()
             for s in self.get_parameter('tracking_states').value.split(',')
@@ -139,6 +160,8 @@ class HeadTrackingNode(Node):
             'head_target_frac':         '_head_target_frac',
             'slew_alpha':               '_slew_alpha',
             'detection_confidence_min': '_conf_min',
+            'face_confidence_min':      '_face_conf_min',
+            'face_timeout':             '_face_timeout',
             'return_to_neutral_timeout': '_return_timeout',
         }
         self._deg_params = {
@@ -163,6 +186,8 @@ class HeadTrackingNode(Node):
         # immediately before any detection arrives.
         self._last_person_time = time.monotonic()
         self._latest_detection = None   # (cx_norm, cy_norm) when person seen
+        self._last_face_time   = time.monotonic()
+        self._latest_face      = None   # (cx_norm, cy_norm) when face seen
 
         # ── Publishers ───────────────────────────────────────────────────────
         self._servo_pub = self.create_publisher(Float32MultiArray, '/servo_commands', 10)
@@ -171,6 +196,9 @@ class HeadTrackingNode(Node):
         sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
         self.create_subscription(
             Detection2DArray, '/camera/detections', self._on_detections, sensor_qos
+        )
+        self.create_subscription(
+            Detection2DArray, '/camera/faces', self._on_faces, sensor_qos
         )
         self.create_subscription(String, '/robot_state', self._on_robot_state, 10)
 
@@ -182,6 +210,8 @@ class HeadTrackingNode(Node):
             f'head_tracking_node started — '
             f'pan_gain={self._pan_gain}, tilt_gain={self._tilt_gain}, '
             f'max_step={self._max_step}, conf_min={self._conf_min}, '
+            f'prefer_faces={self._prefer_faces}, '
+            f'face_conf_min={self._face_conf_min}, face_timeout={self._face_timeout}s, '
             f'dead_zone={_DEAD_ZONE}, '
             f'pan_travel=[{self._pan_min * 180:.0f}°, {self._pan_max * 180:.0f}°]@'
             f'{self._pan_neutral * 180:.0f}°, '
@@ -213,15 +243,20 @@ class HeadTrackingNode(Node):
                     return SetParametersResult(
                         successful=False,
                         reason=f'{p.name} must be a number, got {p.value!r}')
-                if p.name == 'detection_confidence_min' and not (0.0 <= value <= 1.0):
+                if (p.name in ('detection_confidence_min', 'face_confidence_min')
+                        and not (0.0 <= value <= 1.0)):
                     return SetParametersResult(
                         successful=False,
                         reason=f'{p.name} must be in 0.0–1.0, got {value}')
-                if p.name in ('max_step', 'return_to_neutral_timeout') and value <= 0.0:
+                if (p.name in ('max_step', 'return_to_neutral_timeout', 'face_timeout')
+                        and value <= 0.0):
                     return SetParametersResult(
                         successful=False,
                         reason=f'{p.name} must be > 0, got {value}')
                 pending.append((self._plain_params[p.name], value, p.name))
+
+            elif p.name == 'prefer_faces':
+                pending.append(('_prefer_faces', bool(p.value), p.name))
 
             elif p.name in self._deg_params:
                 try:
@@ -283,35 +318,78 @@ class HeadTrackingNode(Node):
             )
             self._last_person_time = time.monotonic()
 
+    def _on_faces(self, msg: Detection2DArray):
+        """Highest-confidence face → aim directly at the face box CENTER.
+
+        Unlike the person path, no head_target_frac offset is applied: the face
+        box already IS the face, so its center is the gaze target.
+        """
+        if self._robot_state not in self._tracking_states:
+            return
+
+        best_score = -1.0
+        best_cx = best_cy = None
+        for det in msg.detections:
+            for result in det.results:
+                if (result.hypothesis.class_id.lower() == 'face'
+                        and result.hypothesis.score >= self._face_conf_min
+                        and result.hypothesis.score > best_score):
+                    best_score = result.hypothesis.score
+                    best_cx    = det.bbox.center.position.x / self._img_w
+                    best_cy    = det.bbox.center.position.y / self._img_h
+
+        if best_cx is not None:
+            self._latest_face = (
+                max(0.0, min(1.0, best_cx)),
+                max(0.0, min(1.0, best_cy)),
+            )
+            self._last_face_time = time.monotonic()
+
     # ── Control loop (10 Hz) ──────────────────────────────────────────────────
 
     def _control_cb(self):
         if self._robot_state not in self._tracking_states:
             return
 
-        elapsed = time.monotonic() - self._last_person_time
+        now = time.monotonic()
+        face_fresh = (self._prefer_faces and self._latest_face is not None
+                      and (now - self._last_face_time) < self._face_timeout)
+        person_fresh = (self._latest_detection is not None
+                        and (now - self._last_person_time) < self._return_timeout)
 
-        if elapsed < self._return_timeout and self._latest_detection is not None:
-            cx_norm, cy_norm      = self._latest_detection
-            self._latest_detection = None   # consume; next update comes from next msg
-
-            pan_error  = cx_norm - 0.5
-            tilt_error = cy_norm - 0.5
-
-            # Update the TARGET only; the 50 Hz slew timer publishes smoothed motion.
-            if abs(pan_error) > _DEAD_ZONE:
-                delta = max(-self._max_step, min(self._max_step,
-                    self._pan_gain * pan_error))
-                self._pan_norm = max(self._pan_min, min(self._pan_max,
-                    self._pan_norm + delta))
-            if abs(tilt_error) > _DEAD_ZONE:
-                delta = max(-self._max_step, min(self._max_step,
-                    self._tilt_gain * tilt_error))
-                self._tilt_norm = max(self._tilt_min, min(self._tilt_max,
-                    self._tilt_norm + delta))
-
-        elif elapsed >= self._return_timeout:
+        if face_fresh:
+            # Preferred: a face is visible — aim straight at the face box center.
+            cx_norm, cy_norm  = self._latest_face
+            self._latest_face = None   # consume; next update comes from next msg
+            self._apply_tracking(cx_norm, cy_norm)
+        elif person_fresh:
+            # Fallback: no fresh face, but a person box is available.
+            cx_norm, cy_norm       = self._latest_detection
+            self._latest_detection = None
+            self._apply_tracking(cx_norm, cy_norm)
+        elif (now - max(self._last_face_time, self._last_person_time)
+              ) >= self._return_timeout:
+            # Nothing seen for a while — drift the head back to neutral.
             self._step_toward_neutral()
+
+    def _apply_tracking(self, cx_norm, cy_norm):
+        """P-control step toward a target (already the intended gaze point).
+
+        Updates the TARGET only; the 50 Hz slew timer publishes smoothed motion.
+        """
+        pan_error  = cx_norm - 0.5
+        tilt_error = cy_norm - 0.5
+
+        if abs(pan_error) > _DEAD_ZONE:
+            delta = max(-self._max_step, min(self._max_step,
+                self._pan_gain * pan_error))
+            self._pan_norm = max(self._pan_min, min(self._pan_max,
+                self._pan_norm + delta))
+        if abs(tilt_error) > _DEAD_ZONE:
+            delta = max(-self._max_step, min(self._max_step,
+                self._tilt_gain * tilt_error))
+            self._tilt_norm = max(self._tilt_min, min(self._tilt_max,
+                self._tilt_norm + delta))
 
     def _slew_cb(self):
         """50 Hz: glide the published output toward the target — kills the 10 Hz notch."""
@@ -353,6 +431,7 @@ class HeadTrackingNode(Node):
     def _snap_to_neutral(self):
         """Immediately publish neutral and reset internal state."""
         self._latest_detection = None
+        self._latest_face      = None
         self._pan_norm  = self._pan_neutral
         self._tilt_norm = self._tilt_neutral
         self._pan_out   = self._pan_neutral

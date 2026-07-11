@@ -1,23 +1,32 @@
 """
-head_detector_node — Jetson IMX219 + YOLO26n (native TensorRT) person detector.
+head_detector_node — Jetson IMX219 + YOLO26n (native TensorRT) person detector
+plus YuNet face detection for head tracking.
 
-Drop-in replacement for the Pi's old camera_node detection topic. Publishes
-vision_msgs/Detection2DArray on /camera/detections with the SAME contract the
-Pi's head_tracking_node / behavior_node already consume:
+Publishes TWO vision_msgs/Detection2DArray topics (both QoS BEST_EFFORT /
+VOLATILE / depth 10, frame_id 'camera_link', bbox in IMAGE PIXELS at
+image_width x image_height — default 1280x720 — matching head_tracking_node):
 
-  * topic     : /camera/detections   (QoS BEST_EFFORT / VOLATILE / depth 10)
-  * type      : vision_msgs/Detection2DArray
-  * class_id  : 'person'  (compared case-insensitively downstream)
-  * score     : float in [0, 1]      <-- ONE convention, end-to-end
-  * bbox      : center.position.{x,y} + size_{x,y} in IMAGE PIXELS at
-                image_width x image_height (default 1280x720), matching
-                head_tracking_node's image_width/image_height params.
-  * frame_id  : 'camera_link'        (same as old node)
+  * /camera/detections — YOLO26n person boxes, class_id='person'. Unchanged
+    world/object feed that behavior_node consumes and that the planned
+    semantic-mapping layer will build on (YOLO already detects all COCO
+    classes; only 'person' is published today).
+  * /camera/faces      — YuNet face boxes, class_id='face'. The head-tracking
+    target feed: head_tracking_node centres the head directly on the face box
+    when a face is visible, and falls back to the person box otherwise.
 
-Inference: YOLO26n exported to ONNX and built into an FP16 TensorRT engine with
-trtexec against the on-board CUDA 13.2 / TRT 10.16 toolchain. The engine is
+  * score : float in [0, 1]  <-- ONE convention, end-to-end (both topics)
+
+YOLO inference: YOLO26n exported to ONNX and built into an FP16 TensorRT engine
+with trtexec against the on-board CUDA 13.2 / TRT 10.16 toolchain. The engine is
 END-TO-END (NMS-free): output is [1, 300, 6] rows of [x1,y1,x2,y2,score,cls] in
 letterboxed 640x640 pixels — so no NMS is done here.
+
+Face inference: OpenCV's YuNet (cv2.FaceDetectorYN, the 2022mar ONNX — the
+2023mar model needs OpenCV >= 4.8 and the Jetson has 4.6). Runs on the full BGR
+frame each capture iteration; cheap CPU DNN. Faces are independent of the YOLO
+boxes here (association to persons is left to the semantic-mapping layer). If the
+YuNet model fails to load, face publishing is disabled and person detection
+continues unaffected.
 
 Phantom-person suppression (the old IMX500 node reported ~5 false persons on
 clutter): min-confidence + min-box-area + a short temporal-persistence filter
@@ -115,6 +124,61 @@ class TrtYolo:
         return self._host_out.reshape(self.out_shape)[0]          # [300, 6]
 
 
+class YuNetFace:
+    """Thin wrapper around cv2.FaceDetectorYN (YuNet).
+
+    Constructed and invoked only from the capture thread. detect() takes a BGR
+    frame at capture resolution and returns a list of face dicts in the SAME
+    dict shape the YOLO postprocess uses ({score,x1,y1,x2,y2,cx,cy,bw,bh}) but
+    already scaled into publish space (image_width x image_height), so the
+    publish path is identical for persons and faces.
+
+    YuNet raw output is [N, 15]: cols 0-3 = box (x, y, w, h) in the input-size
+    pixel space, cols 4-13 = 5 landmarks (x, y), col 14 = score.
+    """
+
+    def __init__(self, model_path, cap_wh, pub_wh, score_thr, nms_thr, top_k):
+        self._cap_w, self._cap_h = cap_wh
+        self._sx = pub_wh[0] / float(cap_wh[0])   # capture -> publish scale
+        self._sy = pub_wh[1] / float(cap_wh[1])
+        self._pub_w, self._pub_h = pub_wh
+        # config="" for ONNX; input_size set to the frame we actually pass in.
+        self._fd = cv2.FaceDetectorYN.create(
+            model_path, '', (self._cap_w, self._cap_h), score_thr, nms_thr, top_k)
+        self._score_thr = score_thr
+
+    def set_score_threshold(self, thr):
+        """Re-applied from the capture thread when the live param changes."""
+        if thr != self._score_thr:
+            self._fd.setScoreThreshold(thr)
+            self._score_thr = thr
+
+    def detect(self, bgr):
+        h, w = bgr.shape[:2]
+        if (w, h) != (self._cap_w, self._cap_h):
+            # capture size drifted (e.g. source reopened at a different mode)
+            self._cap_w, self._cap_h = w, h
+            self._sx = self._pub_w / float(w)
+            self._sy = self._pub_h / float(h)
+            self._fd.setInputSize((w, h))
+        _, faces = self._fd.detect(bgr)
+        out = []
+        if faces is None:
+            return out
+        for f in faces:
+            x, y, bw, bh, score = f[0], f[1], f[2], f[3], f[14]
+            x1 = float(np.clip(x * self._sx, 0, self._pub_w))
+            y1 = float(np.clip(y * self._sy, 0, self._pub_h))
+            x2 = float(np.clip((x + bw) * self._sx, 0, self._pub_w))
+            y2 = float(np.clip((y + bh) * self._sy, 0, self._pub_h))
+            w2, h2 = x2 - x1, y2 - y1
+            if w2 <= 1 or h2 <= 1:
+                continue
+            out.append({'score': float(score), 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                        'cx': x1 + w2 / 2, 'cy': y1 + h2 / 2, 'bw': w2, 'bh': h2})
+        return out
+
+
 class HeadDetectorNode(Node):
 
     def __init__(self):
@@ -149,6 +213,16 @@ class HeadDetectorNode(Node):
         self.declare_parameter('persist_window',       5)      # last M frames
         self.declare_parameter('persist_min_hits',     3)      # need K of M
         self.declare_parameter('persist_iou',          0.3)    # box match IoU
+        # ── Face detection (YuNet) ────────────────────────────────────────────
+        # publish_faces gates the whole face path (model load + /camera/faces).
+        # yunet_model_path defaults next to the TRT engine. face_score_threshold
+        # and face_nms_threshold are YuNet's own gates; face_top_k caps candidates
+        # before NMS. face_score_threshold is runtime-tunable.
+        self.declare_parameter('publish_faces',         True)
+        self.declare_parameter('yunet_model_path',      '')     # '' -> engine dir/yunet_face.onnx
+        self.declare_parameter('face_score_threshold',  0.6)
+        self.declare_parameter('face_nms_threshold',    0.3)
+        self.declare_parameter('face_top_k',            50)
         # Debug feed: publish the annotated frame as CompressedImage (JPEG) on
         # /camera/image_annotated/compressed so you can watch it in Foxglove from a
         # PC. Off by default (saves USB/net + CPU); turn on with -p publish_debug_image:=true.
@@ -175,18 +249,26 @@ class HeadDetectorNode(Node):
         self._persist_iou = float(gp('persist_iou'))
         self._debug_image = bool(gp('publish_debug_image'))
         self._jpeg_quality = int(gp('debug_jpeg_quality'))
+        self._publish_faces = bool(gp('publish_faces'))
+        self._yunet_path    = str(gp('yunet_model_path'))
+        self._face_score    = float(gp('face_score_threshold'))
+        self._face_nms      = float(gp('face_nms_threshold'))
+        self._face_top_k    = int(gp('face_top_k'))
 
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # ── State ────────────────────────────────────────────────────────────
         self._lock = threading.Lock()
-        self._latest_detections = []          # list of published dicts
+        self._latest_detections = []          # list of published person dicts
+        self._latest_faces = []               # list of published face dicts
         self._stop = threading.Event()
         self._connected = False
         self._frame_count = 0
         self._infer_ms = 0.0
+        self._face_ms = 0.0
         self._history = deque(maxlen=64)       # recent raw person boxes per frame
         self._trt = None
+        self._yunet = None                     # YuNetFace, built in the capture thread
         self._latest_frame = None              # newest BGR frame, for the debug feed
 
         # ── Publishers (match old camera_node QoS) ───────────────────────────
@@ -194,6 +276,9 @@ class HeadDetectorNode(Node):
                                 reliability=ReliabilityPolicy.BEST_EFFORT,
                                 durability=DurabilityPolicy.VOLATILE)
         self._det_pub = self.create_publisher(Detection2DArray, '/camera/detections', sensor_qos)
+        self._face_pub = (
+            self.create_publisher(Detection2DArray, '/camera/faces', sensor_qos)
+            if self._publish_faces else None)
         self._status_pub = self.create_publisher(String, '/camera/status', 10)
         self._debug_pub = (
             self.create_publisher(CompressedImage, '/camera/image_annotated/compressed', 1)
@@ -209,7 +294,9 @@ class HeadDetectorNode(Node):
         self.get_logger().info(
             f'head_detector_node started — source={self._source}, '
             f'publish space {self._img_w}x{self._img_h}, conf>={self._conf_thresh}, '
-            f'persist {self._persist_hits}/{self._persist_win}, max_det={self._max_det}')
+            f'persist {self._persist_hits}/{self._persist_win}, max_det={self._max_det}, '
+            f'faces={"on" if self._publish_faces else "off"} '
+            f'(score>={self._face_score})')
 
     # ── Live parameter callback ───────────────────────────────────────────────
     def _on_set_parameters(self, params):
@@ -247,6 +334,17 @@ class HeadDetectorNode(Node):
                 pending.append(('_persist_hits', max(1, int(p.value)), p.name))
             elif p.name == 'persist_iou':
                 pending.append(('_persist_iou', float(p.value), p.name))
+            elif p.name == 'face_score_threshold':
+                try:
+                    v = float(p.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(successful=False,
+                                               reason='face_score_threshold must be a number')
+                if not (0.0 <= v <= 1.0):
+                    return SetParametersResult(successful=False,
+                                               reason='face_score_threshold must be in 0.0-1.0')
+                # Applied to the live YuNet detector from the capture thread.
+                pending.append(('_face_score', v, p.name))
         for attr, val, name in pending:
             setattr(self, attr, val)
             self.get_logger().info(f'Parameter updated: {name} = {val}')
@@ -363,6 +461,23 @@ class HeadDetectorNode(Node):
             self.get_logger().error(f'TRT init failed: {e}')
             return
 
+        # YuNet is optional: a load failure disables face publishing but leaves
+        # person detection fully working.
+        if self._publish_faces:
+            try:
+                import os
+                model = self._yunet_path or os.path.join(
+                    os.path.dirname(self._engine_path), 'yunet_face.onnx')
+                self._yunet = YuNetFace(
+                    model, (self._cap_w, self._cap_h), (self._img_w, self._img_h),
+                    self._face_score, self._face_nms, self._face_top_k)
+                self.get_logger().info(f'YuNet face detector loaded: {model}')
+            except Exception as e:
+                self._yunet = None
+                self.get_logger().error(
+                    f'YuNet load failed ({e}) — face detection disabled, '
+                    f'person detection continues')
+
         cap = None
         while not self._stop.is_set():
             if cap is None:
@@ -400,8 +515,25 @@ class HeadDetectorNode(Node):
             confirmed = self._persistence_filter(person_boxes)
             # largest-box first (area), then score
             confirmed.sort(key=lambda d: (-(d['bw'] * d['bh']), -d['score']))
+
+            # ── Face detection (YuNet) — independent of the YOLO boxes ─────────
+            faces = []
+            if self._yunet is not None:
+                try:
+                    self._yunet.set_score_threshold(self._face_score)
+                    tf = time.monotonic()
+                    faces = self._yunet.detect(frame)
+                    self._face_ms = (time.monotonic() - tf) * 1000.0
+                    # largest face first — the closest person's face wins tracking
+                    faces.sort(key=lambda d: -(d['bw'] * d['bh']))
+                    faces = faces[:self._max_det]
+                except Exception as e:
+                    self.get_logger().warn(f'YuNet detect error: {e}',
+                                           throttle_duration_sec=5.0)
+
             with self._lock:
                 self._latest_detections = confirmed[:self._max_det]
+                self._latest_faces = faces
                 self._frame_count += 1
                 if self._debug_image:
                     self._latest_frame = frame
@@ -411,20 +543,38 @@ class HeadDetectorNode(Node):
         now = self.get_clock().now().to_msg()
         with self._lock:
             dets = list(self._latest_detections)
+            faces = list(self._latest_faces)
             connected = self._connected
             frames = self._frame_count
             infer_ms = self._infer_ms
+            face_ms = self._face_ms
             frame = self._latest_frame if self._debug_pub is not None else None
 
+        self._det_pub.publish(self._build_array(now, dets, 'person'))
+        if self._face_pub is not None:
+            self._face_pub.publish(self._build_array(now, faces, 'face'))
+
+        self._status_ticks += 1
+        if self._status_ticks % max(1, round(self._det_fps)) == 0:
+            self._status_pub.publish(String(data=json.dumps({
+                'connected': connected, 'persons': len(dets), 'faces': len(faces),
+                'frames': frames, 'infer_ms': round(infer_ms, 2),
+                'face_ms': round(face_ms, 2)})))
+
+        if self._debug_pub is not None and frame is not None:
+            self._publish_annotated(now, frame, dets, faces)
+
+    def _build_array(self, stamp, items, class_id):
+        """Pack a box-dict list into a Detection2DArray with the given class_id."""
         arr = Detection2DArray()
-        arr.header.stamp = now
+        arr.header.stamp = stamp
         arr.header.frame_id = self._frame_id
-        for d in dets:
+        for d in items:
             det = Detection2D()
-            det.header.stamp = now
+            det.header.stamp = stamp
             det.header.frame_id = self._frame_id
             hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = 'person'
+            hyp.hypothesis.class_id = class_id
             hyp.hypothesis.score = d['score']          # 0-1, single convention
             det.results.append(hyp)
             det.bbox.center.position.x = d['cx']
@@ -432,21 +582,12 @@ class HeadDetectorNode(Node):
             det.bbox.size_x = d['bw']
             det.bbox.size_y = d['bh']
             arr.detections.append(det)
-        self._det_pub.publish(arr)
+        return arr
 
-        self._status_ticks += 1
-        if self._status_ticks % max(1, round(self._det_fps)) == 0:
-            self._status_pub.publish(String(data=json.dumps({
-                'connected': connected, 'persons': len(dets),
-                'frames': frames, 'infer_ms': round(infer_ms, 2)})))
-
-        if self._debug_pub is not None and frame is not None:
-            self._publish_annotated(now, frame, dets)
-
-    def _publish_annotated(self, stamp, frame, dets):
-        """Draw person boxes + head-aim markers on the frame, publish as JPEG."""
+    def _publish_annotated(self, stamp, frame, dets, faces):
+        """Draw person boxes (green) + face boxes (cyan) on the frame, JPEG it."""
         img = frame.copy()
-        # dets are in publish space (image_width x image_height); the frame is capture
+        # boxes are in publish space (image_width x image_height); the frame is capture
         # space (capture_width x capture_height) — scale the boxes back onto the frame.
         fx = self._cap_w / float(self._img_w)
         fy = self._cap_h / float(self._img_h)
@@ -456,9 +597,12 @@ class HeadDetectorNode(Node):
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(img, f"{d['score']:.2f}", (x1, max(12, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-            # red dot = where head_tracking aims (~0.15 down from box top = the face)
-            hx = int(d['cx'] * fx); hy = int((d['cy'] - d['bh'] * 0.35) * fy)
-            cv2.circle(img, (hx, hy), 5, (0, 0, 255), -1)
+        # face boxes (cyan): head_tracking centres directly on the face box centre.
+        for d in faces:
+            x1 = int((d['cx'] - d['bw'] / 2) * fx); y1 = int((d['cy'] - d['bh'] / 2) * fy)
+            x2 = int((d['cx'] + d['bw'] / 2) * fx); y2 = int((d['cy'] + d['bh'] / 2) * fy)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
+            cv2.circle(img, (int(d['cx'] * fx), int(d['cy'] * fy)), 4, (0, 0, 255), -1)
         ok, buf = cv2.imencode('.jpg', img,
                                [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
         if not ok:
