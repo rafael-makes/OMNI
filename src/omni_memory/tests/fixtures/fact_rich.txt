@@ -1,0 +1,9 @@
+Rafael: Morning OMNI. Quick reminder — I like my coffee pretty early, around 6 AM.
+OMNI: Noted, Rafael.
+Rafael: Important one: my daughter Sofia is allergic to peanuts, so never suggest peanut snacks to her.
+OMNI: Understood, I'll avoid anything with peanuts for Sofia.
+Rafael: I'm flying to Berlin next Tuesday for a robotics conference, back on the 15th.
+OMNI: Safe travels.
+Rafael: Oh and the workshop 3D printer is out of filament — I need to reorder PLA this week.
+OMNI: I'll remember that.
+Rafael: Cool, thanks. Talk later.

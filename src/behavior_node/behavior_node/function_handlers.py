@@ -174,6 +174,27 @@ OMNI_TOOLS = [
                 ),
             ),
 
+            genai_types.FunctionDeclaration(
+                name='remember_person',
+                description=(
+                    'Save the face of the person you are talking to under their name '
+                    'so you recognise them next time. Call this as soon as you learn '
+                    'the name of someone you do not already recognise — whether you '
+                    'asked for it or they offered it. Do NOT call it for people you '
+                    'already recognise by name.'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        'name': genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="The person's first name, e.g. \"rafael\".",
+                        )
+                    },
+                    required=['name'],
+                ),
+            ),
+
         ]
     )
 ]
@@ -207,6 +228,7 @@ class FunctionHandlers:
             'explore_area':     self._explore_area,
             'save_location':    self._save_location,
             'clear_fault':      self._clear_fault,
+            'remember_person':  self._remember_person,
         }
         handler = handlers.get(function_name)
         if handler is None:
@@ -505,3 +527,20 @@ class FunctionHandlers:
                 "All active safety faults have been cleared. "
                 "I am standing by for your next instruction — how refreshing."
             )
+
+    def _remember_person(self, args: dict) -> str:
+        # Keep the identity a single clean token (first name).
+        raw = args.get('name', '').strip().lower()
+        name = ''.join(ch for ch in raw if ch.isalnum() or ch in ('_', '-'))
+        if not name:
+            return "I didn't quite catch a name to remember. Might I ask it again?"
+        ok = self._node.learn_person(name)
+        if ok:
+            return (
+                f"A pleasure — I shall remember your face now, {name.capitalize()}. "
+                f"Do go on."
+            )
+        return (
+            f"I should like to remember you as {name.capitalize()}, but face "
+            f"recognition is not available at the moment."
+        )

@@ -1,0 +1,10 @@
+# Ingest a conversation transcript: summarize into discrete memories and store them.
+string transcript          # raw conversation transcript
+string person              # optional; "" = unknown/general. Fills records the model didn't attribute.
+string session_id          # optional; "" = none. Groups memories from one conversation.
+string source              # optional; "" -> "conversation"
+---
+bool success
+int32 stored_count         # number of memory records stored
+string[] ids               # ids of the stored records
+string message             # human-readable status / error

@@ -1,0 +1,6 @@
+# runtime
+supabase>=2.0
+google-genai>=2.0        # embeddings (Step 2) + summarizer (Step 3)
+
+# test
+pytest>=8.0

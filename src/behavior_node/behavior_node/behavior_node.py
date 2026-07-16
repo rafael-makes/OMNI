@@ -34,6 +34,7 @@ THREAD SAFETY (read this before editing):
 import os
 import threading
 import time
+import uuid
 
 import yaml
 
@@ -51,6 +52,8 @@ from vision_msgs.msg import Detection2DArray
 from behavior_node.audio_handler import AudioHandler
 from behavior_node.function_handlers import FunctionHandlers, VALID_STATES
 from behavior_node.gemini_bridge import GeminiBridge
+from behavior_node.memory_client import MemoryClient
+from behavior_node.memory_format import wrap_memory_context
 from behavior_node.wake_word import WakeWordDetector
 
 # States that cause the Gemini stream to close (robot is busy, can't converse)
@@ -78,6 +81,20 @@ class BehaviorNode(Node):
         self.declare_parameter('mic_device_index',    0)
         self.declare_parameter('speaker_device_index', 0)
         self.declare_parameter('tcp_mic_port',        0)
+        # ── Persistent memory (Step 5) — soft dependency on the omni_memory node ─
+        self.declare_parameter('memory_enabled',         True)
+        self.declare_parameter('memory_retrieve_k',      5)
+        self.declare_parameter('memory_service_timeout', 2.0)
+        self.declare_parameter(
+            'memory_seed_query',
+            'important preferences, facts, habits, and recent events about the people here',
+        )
+        # ── Per-person memory keying (Step 6) ────────────────────────────────────
+        # Identity of the person OMNI is talking to comes from the Jetson recognizer
+        # on /camera/identity (a resolved name or stable 'unknown_N', '' = none).
+        self.declare_parameter('person_keying_enabled', True)
+        self.declare_parameter('identity_topic',        '/camera/identity')
+        self.declare_parameter('identity_timeout',      5.0)   # seconds an id stays "fresh"
 
         model           = self.get_parameter('gemini_model').value
         voice           = self.get_parameter('gemini_voice').value
@@ -90,6 +107,13 @@ class BehaviorNode(Node):
         tcp_mic_port    = self.get_parameter('tcp_mic_port').value
         self._conv_timeout     = self.get_parameter('conversation_timeout').value
         self._presence_timeout = self.get_parameter('presence_timeout').value
+        self._memory_enabled     = self.get_parameter('memory_enabled').value
+        self._memory_k           = int(self.get_parameter('memory_retrieve_k').value)
+        self._memory_seed_query  = self.get_parameter('memory_seed_query').value
+        memory_timeout           = self.get_parameter('memory_service_timeout').value
+        self._person_keying      = self.get_parameter('person_keying_enabled').value
+        identity_topic           = self.get_parameter('identity_topic').value
+        self._identity_timeout   = self.get_parameter('identity_timeout').value
 
         # ── Gemini API key ─────────────────────────────────────────────────────
         # Loaded from environment — never hardcoded. Set in ~/.bashrc:
@@ -202,6 +226,28 @@ class BehaviorNode(Node):
         )
         self._audio.start()
 
+        # ── Persistent memory client (Step 5) ───────────────────────────────────
+        # Soft dependency: if the omni_memory node is down, retrieve()/store() are
+        # no-ops and OMNI converses normally. _session_id groups one conversation's
+        # memories; assigned per wake-word event.
+        self._memory = MemoryClient(
+            self, enabled=self._memory_enabled, service_timeout=memory_timeout
+        )
+        self._session_id = None
+        # Step 6: latest recognized identity + when it arrived (monotonic). Written
+        # by the /camera/identity callback, read at wake time. _session_person is the
+        # person latched for the CURRENT conversation so a mid-chat identity change
+        # doesn't re-key the store.
+        self._current_person      = None
+        self._current_person_time = 0.0
+        self._session_person      = None
+        self._enroll_pub          = None
+        if self._person_keying:
+            self.create_subscription(String, identity_topic, self._on_identity, 10)
+            # Step 6 on-the-fly learning: ask the Jetson recognizer to enroll the
+            # face it currently sees under a name (published by learn_person()).
+            self._enroll_pub = self.create_publisher(String, '/camera/enroll_request', 10)
+
         # ── Function handlers ──────────────────────────────────────────────────
         self._fn = FunctionHandlers(self)
 
@@ -281,6 +327,11 @@ class BehaviorNode(Node):
         # and gets ALSA error -9985 (Device unavailable).
         if new_state == 'IDLE':
             self._last_activity_time = time.monotonic()
+            # Conversation ended → persist it to memory (Step 5). Pops the bridge's
+            # transcript buffer (empty if nothing was said) and stores it via the
+            # omni_memory service. Non-blocking and best-effort. Done before the
+            # close_session() below; the buffer survives session close regardless.
+            self._flush_conversation_to_memory()
             # Enforce the IDLE invariant (see module docstring): the Gemini stream
             # must be closed in IDLE. Routes like the conversation timeout close it
             # themselves, but reaching IDLE any other way — notably Gemini calling
@@ -315,6 +366,69 @@ class BehaviorNode(Node):
         Float assignment is atomic in CPython (GIL), so no lock needed.
         """
         self._last_activity_time = time.monotonic()
+
+    def _on_identity(self, msg: String):
+        """
+        Latest recognized identity from the Jetson recognizer (/camera/identity).
+        Payload is a resolved person id — a known name or a stable 'unknown_N',
+        or '' when no face is recognized. String assignment is atomic under the GIL.
+        """
+        person = (msg.data or '').strip().lower()
+        self._current_person = person or None
+        self._current_person_time = time.monotonic()
+
+    def _current_identity(self):
+        """The recognized person if the identity is still fresh, else None."""
+        if not self._person_keying or self._current_person is None:
+            return None
+        if time.monotonic() - self._current_person_time > self._identity_timeout:
+            return None   # stale — treat as unknown/general
+        return self._current_person
+
+    def learn_person(self, name: str) -> bool:
+        """Enroll the currently-seen face under `name` (Step 6 on-the-fly learning),
+        called from the remember_person Gemini tool. Publishes an enroll request to
+        the Jetson recognizer and re-keys THIS conversation to the name — because
+        the transcript is stored at conversation end, that alone attributes all of
+        it to the real person (no DB re-keying needed within the session).
+        Returns False if person keying is disabled."""
+        if not self._person_keying or self._enroll_pub is None:
+            return False
+        name = (name or '').strip().lower()
+        if not name:
+            return False
+        self._enroll_pub.publish(String(data=name))
+        prev = self._session_person
+        # Carry over this person's existing memories: if they were an anonymous
+        # unknown_N, re-label those records to the new name (persisted unknowns keep
+        # the same id across reboots, so this merges their whole history).
+        if prev and prev.startswith('unknown') and self._memory_enabled:
+            self._memory.rekey_person(prev, name)
+        self._session_person = name
+        # Treat them as recognized for the rest of the session, too.
+        self._current_person = name
+        self._current_person_time = time.monotonic()
+        self.get_logger().info(f'Learning person on the fly: {name} (was {prev!r})')
+        return True
+
+    def _flush_conversation_to_memory(self):
+        """
+        On conversation end, hand the accumulated transcript to omni_memory to be
+        summarized and stored. Best-effort and non-blocking:
+          • pop_transcript() returns '' if nothing was said → store is a no-op.
+          • MemoryClient.store_transcript() drops silently if the service is down.
+        Person is unknown until Step 6, so memories are stored as general/household.
+        Safe from any thread (store uses call_async, no spinning here).
+        """
+        if not self._memory_enabled:
+            return
+        transcript = self._bridge.pop_transcript()
+        if not transcript.strip():
+            return
+        self._memory.store_transcript(
+            transcript, person=self._session_person,
+            session_id=self._session_id, source='conversation'
+        )
 
     def _check_conversation_timeout(self):
         """
@@ -419,8 +533,37 @@ class BehaviorNode(Node):
         self._reset_conversation_timeout()
         # Detector has released the mic — start capture before opening the session
         self._audio.start_capture()
+
+        # New conversation id, and retrieve remembered context to inject (Step 5).
+        # retrieve blocks up to memory_service_timeout on THIS wake-word thread
+        # (never the ROS executor); if omni_memory is down it returns '' fast-ish
+        # and we open the session without memory.
+        self._session_id = uuid.uuid4().hex
+        # Latch the recognized person for this whole conversation (Step 6): retrieval
+        # is scoped to this person + general memories, and the end-of-chat store is
+        # attributed to them. None when no fresh identity → general/household.
+        self._session_person = self._current_identity()
+        if self._session_person:
+            self.get_logger().info(f'Conversation person: {self._session_person}')
+        memory_context = ''
+        if self._memory_enabled:
+            block = self._memory.retrieve_context(
+                self._memory_seed_query, k=self._memory_k, person=self._session_person
+            )
+            memory_context = wrap_memory_context(block)
+        # If this person isn't recognized yet, nudge OMNI to learn them (Step 6).
+        if self._person_keying and (
+            not self._session_person or self._session_person.startswith('unknown')
+        ):
+            hint = (
+                '[MEMORY] You do not recognise this person yet. If it fits naturally, '
+                'ask their name, and once you learn it call remember_person(name) so '
+                'you know their face next time.'
+            )
+            memory_context = f'{memory_context}\n\n{hint}' if memory_context else hint
+
         # open_session() uses call_soon_threadsafe internally — safe from any thread
-        self._bridge.open_session()
+        self._bridge.open_session(memory_context=memory_context)
 
     # ── Safety fault callbacks ─────────────────────────────────────────────────
 
@@ -764,6 +907,7 @@ def main(args=None):
         node._audio.stop()
         node._bridge.stop()
         node._wake.stop()
+        node._memory.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

@@ -37,6 +37,7 @@ from google.genai import types as genai_types
 
 from behavior_node.audio_handler import _PCM_IN_RATE
 from behavior_node.function_handlers import OMNI_TOOLS
+from behavior_node.memory_format import coalesce_transcript
 
 _RECONNECT_DELAY   = 5.0    # seconds to wait before reconnecting after a drop
 _STATES_BLOCK_AUDIO = {'NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'}
@@ -84,6 +85,18 @@ class GeminiBridge:
         # with no race between open_session() and inject_context().
         self._pending_prompt: str | None = None
 
+        # Memory context (Step 5): a block of remembered facts, injected as part
+        # of the FIRST message so OMNI knows them from the start of the chat.
+        # Set by open_session(memory_context=...); consumed once per session.
+        self._memory_context: str = ''
+
+        # Conversation transcript (Step 5): (speaker, text_fragment) pairs captured
+        # from Gemini input/output transcription, flushed to memory at chat end.
+        # Written from the asyncio recv loop, read/cleared from the ROS thread —
+        # guarded by _transcript_lock.
+        self._transcript_lock = threading.Lock()
+        self._transcript_segments: list[tuple[str, str]] = []
+
         self._running = False
 
     # ── Lifecycle — called from the ROS2 thread ────────────────────────────────
@@ -104,7 +117,7 @@ class GeminiBridge:
         self._loop_thread.start()
         self._node.get_logger().info('GeminiBridge asyncio loop started')
 
-    def open_session(self, initial_prompt: str | None = None):
+    def open_session(self, initial_prompt: str | None = None, memory_context: str | None = None):
         """
         Schedule a new Gemini Live session on the asyncio loop.
         Returns immediately — the session opens asynchronously.
@@ -114,6 +127,11 @@ class GeminiBridge:
         text on the next session open. Used by _on_safety_fault so the fault is
         the very first thing Gemini sees, eliminating the race between scheduling
         open_session() and calling inject_context() a moment later.
+
+        memory_context — optional remembered-facts block (already wrapped for the
+        model). Prepended to the greeting on the next session open so OMNI knows
+        the facts from the first word. Ignored when initial_prompt is set (faults
+        stay clean/urgent).
         """
         def _schedule():
             # Guard: only block if the session is both task-running AND logically active.
@@ -128,6 +146,12 @@ class GeminiBridge:
                 return
             self._greeting_sent  = False        # new wake-word event → fresh greeting
             self._pending_prompt = initial_prompt  # None clears any leftover fault prompt
+            self._memory_context = memory_context or ''  # None clears any leftover context
+            # New conversation → start with a clean transcript buffer. (Reconnects
+            # go through _session_with_reconnect, not open_session, so a mid-chat
+            # drop does not wipe what was said before it.)
+            with self._transcript_lock:
+                self._transcript_segments = []
             self._session_task = self._loop.create_task(self._session_with_reconnect())
 
         self._loop.call_soon_threadsafe(_schedule)
@@ -171,6 +195,24 @@ class GeminiBridge:
                 self._node.get_logger().error(f'inject_context failed: {exc}')
 
         asyncio.run_coroutine_threadsafe(_inject(), self._loop)
+
+    def pop_transcript(self) -> str:
+        """Return the accumulated conversation transcript and clear the buffer.
+
+        Called from the ROS thread when a conversation ends, to hand the text to
+        the memory store. Safe to call anytime; returns '' when empty.
+        """
+        with self._transcript_lock:
+            segments = self._transcript_segments
+            self._transcript_segments = []
+        return coalesce_transcript(segments)
+
+    def _append_transcript(self, speaker: str, text: str) -> None:
+        """Record a streamed transcription fragment (called from the recv loop)."""
+        if not text:
+            return
+        with self._transcript_lock:
+            self._transcript_segments.append((speaker, text))
 
     def stop(self):
         """Shut down the asyncio loop entirely. Call during node shutdown."""
@@ -273,6 +315,10 @@ class GeminiBridge:
             # Request transcription of OMNI's audio output — shows in logs and
             # lets us publish /audio/text if needed in future.
             output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+            # Request transcription of the USER's speech too (Step 5). Both are
+            # accumulated into the conversation transcript that gets summarized
+            # and stored to memory at the end of the chat.
+            input_audio_transcription=genai_types.AudioTranscriptionConfig(),
             speech_config=genai_types.SpeechConfig(
                 voice_config=genai_types.VoiceConfig(
                     prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
@@ -324,6 +370,11 @@ class GeminiBridge:
                             f'Say a single brief {period} greeting in character — '
                             f'one sentence only — then stop and wait for their request.'
                         )
+                        # Prepend remembered facts (Step 5) so OMNI knows them
+                        # from the first word. Consumed once per session.
+                        if self._memory_context:
+                            opening = f'{self._memory_context}\n\n{opening}'
+                            self._memory_context = ''
                     await session.send(input=opening, end_of_turn=True)
                     self._greeting_sent = True
 
@@ -583,10 +634,16 @@ class GeminiBridge:
                         self._loop.create_task(self._await_playback_and_set_listening())
                         speaking_triggered = False
 
-                    if hasattr(sc, 'output_transcription') and sc.output_transcription:
-                        text = sc.output_transcription.text
-                        if text:
-                            self._node.get_logger().debug(f'Gemini said: {text}')
+                    # Transcription fragments (Step 5) — accumulate both sides of
+                    # the conversation for the end-of-chat memory store. Streamed
+                    # in small pieces; coalesce_transcript() reassembles them.
+                    if getattr(sc, 'input_transcription', None) and sc.input_transcription.text:
+                        self._append_transcript('User', sc.input_transcription.text)
+                    if getattr(sc, 'output_transcription', None) and sc.output_transcription.text:
+                        self._append_transcript('OMNI', sc.output_transcription.text)
+                        self._node.get_logger().debug(
+                            f'Gemini said: {sc.output_transcription.text}'
+                        )
 
             # receive() exhausted without turn_complete — barge-in or interruption.
             # If we had started speaking, still need to drain the speaker queue.

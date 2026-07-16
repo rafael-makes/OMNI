@@ -50,6 +50,11 @@ from std_msgs.msg import String
 from sensor_msgs.msg import CompressedImage
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
+try:
+    from head_detector.face_recognizer import FaceRecognizer
+except Exception:  # noqa: BLE001 - identity is optional; never block detection
+    FaceRecognizer = None
+
 import tensorrt as trt
 from cuda.bindings import runtime as cudart
 
@@ -175,7 +180,10 @@ class YuNetFace:
             if w2 <= 1 or h2 <= 1:
                 continue
             out.append({'score': float(score), 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                        'cx': x1 + w2 / 2, 'cy': y1 + h2 / 2, 'bw': w2, 'bh': h2})
+                        'cx': x1 + w2 / 2, 'cy': y1 + h2 / 2, 'bw': w2, 'bh': h2,
+                        # raw YuNet row (box + 5 landmarks, capture-space) for SFace
+                        # alignment; ignored by the publish path.
+                        '_raw': f})
         return out
 
 
@@ -223,6 +231,15 @@ class HeadDetectorNode(Node):
         self.declare_parameter('face_score_threshold',  0.6)
         self.declare_parameter('face_nms_threshold',    0.3)
         self.declare_parameter('face_top_k',            50)
+        # ── Face recognition (Step 6) — publishes /camera/identity for the Pi's
+        # per-person memory. OFF by default: turn on with publish_identity:=true.
+        # Requires publish_faces (needs YuNet landmarks) + an SFace model + a
+        # gallery of enrolled photos. Fail-safe: any error disables identity only.
+        self.declare_parameter('publish_identity',      False)
+        self.declare_parameter('sface_model_path',      '')     # '' -> engine dir/sface.onnx
+        self.declare_parameter('face_gallery_dir',      '/home/Omni/head_detector/faces')
+        self.declare_parameter('face_unknown_dir',      '/home/Omni/head_detector/unknown_faces')
+        self.declare_parameter('recognition_threshold', 0.363)  # SFace cosine
         # Debug feed: publish the annotated frame as CompressedImage (JPEG) on
         # /camera/image_annotated/compressed so you can watch it in Foxglove from a
         # PC. Off by default (saves USB/net + CPU); turn on with -p publish_debug_image:=true.
@@ -254,6 +271,11 @@ class HeadDetectorNode(Node):
         self._face_score    = float(gp('face_score_threshold'))
         self._face_nms      = float(gp('face_nms_threshold'))
         self._face_top_k    = int(gp('face_top_k'))
+        self._publish_identity = bool(gp('publish_identity')) and self._publish_faces
+        self._sface_path    = str(gp('sface_model_path'))
+        self._gallery_dir   = str(gp('face_gallery_dir'))
+        self._unknown_dir   = str(gp('face_unknown_dir'))
+        self._recog_thr     = float(gp('recognition_threshold'))
 
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -270,6 +292,10 @@ class HeadDetectorNode(Node):
         self._trt = None
         self._yunet = None                     # YuNetFace, built in the capture thread
         self._latest_frame = None              # newest BGR frame, for the debug feed
+        self._recognizer = None                # FaceRecognizer, built in the capture thread
+        self._latest_identity = ''             # resolved primary-face person id ('' = none)
+        self._enroll_frame = None              # newest frame + primary face for on-the-fly
+        self._enroll_face = None               # enrollment (Step 6 remember_person)
 
         # ── Publishers (match old camera_node QoS) ───────────────────────────
         sensor_qos = QoSProfile(depth=10,
@@ -280,6 +306,15 @@ class HeadDetectorNode(Node):
             self.create_publisher(Detection2DArray, '/camera/faces', sensor_qos)
             if self._publish_faces else None)
         self._status_pub = self.create_publisher(String, '/camera/status', 10)
+        self._identity_pub = (
+            self.create_publisher(String, '/camera/identity', 10)
+            if self._publish_identity else None)
+        # On-the-fly enrollment (Step 6): Pi publishes a name -> we save the face
+        # currently in view under it. Result echoed on /camera/enroll_result.
+        self._enroll_result_pub = None
+        if self._publish_identity:
+            self._enroll_result_pub = self.create_publisher(String, '/camera/enroll_result', 10)
+            self.create_subscription(String, '/camera/enroll_request', self._on_enroll_request, 10)
         self._debug_pub = (
             self.create_publisher(CompressedImage, '/camera/image_annotated/compressed', 1)
             if self._debug_image else None)
@@ -478,6 +513,27 @@ class HeadDetectorNode(Node):
                     f'YuNet load failed ({e}) — face detection disabled, '
                     f'person detection continues')
 
+        # Face recognition (Step 6). Built here (capture thread) alongside YuNet.
+        # Fail-safe: on any problem, identity stays '' and detection is unaffected.
+        if self._publish_identity and self._yunet is not None and FaceRecognizer is not None:
+            try:
+                import os
+                sface = self._sface_path or os.path.join(
+                    os.path.dirname(self._engine_path), 'sface.onnx')
+                yunet_model = self._yunet_path or os.path.join(
+                    os.path.dirname(self._engine_path), 'yunet_face.onnx')
+                self._recognizer = FaceRecognizer(
+                    sface, yunet_model, self._gallery_dir, self.get_logger(),
+                    unknown_dir=self._unknown_dir,
+                    match_threshold=self._recog_thr, unknown_threshold=self._recog_thr)
+                if not self._recognizer.ok:
+                    self._recognizer = None
+            except Exception as e:  # noqa: BLE001
+                self._recognizer = None
+                self.get_logger().error(
+                    f'FaceRecognizer load failed ({e}) — identity disabled, '
+                    f'detection continues')
+
         cap = None
         while not self._stop.is_set():
             if cap is None:
@@ -531,9 +587,28 @@ class HeadDetectorNode(Node):
                     self.get_logger().warn(f'YuNet detect error: {e}',
                                            throttle_duration_sec=5.0)
 
+            # ── Face recognition (Step 6) — resolve the PRIMARY (largest) face ─
+            # to a person id for /camera/identity. Fail-safe; '' when no face.
+            identity = ''
+            if self._recognizer is not None and faces:
+                try:
+                    identity = self._recognizer.identify(frame, faces[0]['_raw'])
+                except Exception as e:  # noqa: BLE001
+                    self.get_logger().warn(f'recognition error: {e}',
+                                           throttle_duration_sec=5.0)
+
             with self._lock:
                 self._latest_detections = confirmed[:self._max_det]
                 self._latest_faces = faces
+                self._latest_identity = identity
+                # Keep the current primary face + frame so a concurrent enroll
+                # request can learn whoever is in view right now.
+                if self._recognizer is not None and faces:
+                    self._enroll_frame = frame
+                    self._enroll_face = faces[0]['_raw']
+                else:
+                    self._enroll_frame = None
+                    self._enroll_face = None
                 self._frame_count += 1
                 if self._debug_image:
                     self._latest_frame = frame
@@ -548,11 +623,14 @@ class HeadDetectorNode(Node):
             frames = self._frame_count
             infer_ms = self._infer_ms
             face_ms = self._face_ms
+            identity = self._latest_identity
             frame = self._latest_frame if self._debug_pub is not None else None
 
         self._det_pub.publish(self._build_array(now, dets, 'person'))
         if self._face_pub is not None:
             self._face_pub.publish(self._build_array(now, faces, 'face'))
+        if self._identity_pub is not None:
+            self._identity_pub.publish(String(data=identity))
 
         self._status_ticks += 1
         if self._status_ticks % max(1, round(self._det_fps)) == 0:
@@ -583,6 +661,31 @@ class HeadDetectorNode(Node):
             det.bbox.size_y = d['bh']
             arr.detections.append(det)
         return arr
+
+    def _on_enroll_request(self, msg):
+        """Learn the face currently in view as msg.data (a name). Fail-safe."""
+        name = (msg.data or '').strip().lower()
+        with self._lock:
+            frame = self._enroll_frame
+            face = self._enroll_face
+        ok = False
+        detail = ''
+        if self._recognizer is None:
+            detail = 'recognizer unavailable'
+        elif not name:
+            detail = 'empty name'
+        elif frame is None or face is None:
+            detail = 'no face in view'
+        else:
+            try:
+                ok = self._recognizer.enroll(name, frame, face)
+                detail = 'enrolled' if ok else 'enroll failed'
+            except Exception as e:  # noqa: BLE001
+                detail = f'error: {e}'
+        self.get_logger().info(f"enroll_request '{name}': {detail}")
+        if self._enroll_result_pub is not None:
+            self._enroll_result_pub.publish(String(data=json.dumps(
+                {'name': name, 'ok': bool(ok), 'detail': detail})))
 
     def _publish_annotated(self, stamp, frame, dets, faces):
         """Draw person boxes (green) + face boxes (cyan) on the frame, JPEG it."""

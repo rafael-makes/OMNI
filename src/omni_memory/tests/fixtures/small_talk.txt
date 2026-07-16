@@ -1,0 +1,8 @@
+Rafael: Hey OMNI, how's it going?
+OMNI: All systems nominal. How are you doing today?
+Rafael: Pretty good, just a little tired. Nice weather out there, huh?
+OMNI: It does look pleasant outside.
+Rafael: Yeah. Anyway, just wanted to say hi while I grabbed a glass of water.
+OMNI: Always good to hear from you.
+Rafael: Alright, talk to you later.
+OMNI: See you, Rafael.

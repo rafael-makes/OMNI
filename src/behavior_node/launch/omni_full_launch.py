@@ -12,6 +12,8 @@ Starts the full stack in dependency order:
   t=8s     └─ activate  ← /map and map→odom TF live from here
   t=12s  Nav2 stack        — bt_navigator + planner + controller + behavior + smoother
   t=0s   behavior_node     — Gemini Live brain (wake word active immediately)
+  t=0s   omni_memory       — persistent memory layer (Supabase over WireGuard);
+                             behavior_node retrieves on wake / stores at chat end
 
 TF tree:
   map → odom             slam_toolbox (async_slam_toolbox_node)
@@ -163,6 +165,17 @@ def generate_launch_description():
         'tcp_mic_port',
         default_value='0',
         description='TCP port to receive stereo PCM from Pi Zero mic (0 = use local mic)',
+    )
+    memory_enabled_arg = DeclareLaunchArgument(
+        'memory_enabled',
+        default_value='true',
+        description='Enable persistent memory (retrieve on wake / store at chat end). '
+                    'false skips all memory calls (no omni_memory dependency).',
+    )
+    memory_env_file_arg = DeclareLaunchArgument(
+        'memory_env_file',
+        default_value='/home/pi/omni_ws/src/omni_memory/.env',
+        description='.env with SUPABASE_URL/SUPABASE_SERVICE_KEY for the omni_memory node',
     )
 
     # ── Static transforms ──────────────────────────────────────────────────────
@@ -468,6 +481,22 @@ def generate_launch_description():
             'mic_device_index':           LaunchConfiguration('mic_device_index'),
             'speaker_device_index':       LaunchConfiguration('speaker_device_index'),
             'tcp_mic_port':               LaunchConfiguration('tcp_mic_port'),
+            'memory_enabled':             LaunchConfiguration('memory_enabled'),
+        }],
+    )
+
+    # ── omni_memory ────────────────────────────────────────────────────────────
+    # Persistent memory layer (Supabase/pgvector over WireGuard). behavior_node is
+    # a SOFT client — if this node is absent, OMNI still converses. Kept as a plain
+    # t=0 node so it's discovered well before the first wake word.
+    omni_memory_node = Node(
+        package='omni_memory',
+        executable='omni_memory_node',
+        name='omni_memory',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'env_file': LaunchConfiguration('memory_env_file'),
         }],
     )
 
@@ -492,6 +521,8 @@ def generate_launch_description():
         mic_index_arg,
         speaker_index_arg,
         tcp_mic_arg,
+        memory_enabled_arg,
+        memory_env_file_arg,
         # Static TF
         LogInfo(msg='[omni_full] Starting OMNI full stack — localization mode'),
         imu_tf,
@@ -522,6 +553,8 @@ def generate_launch_description():
         nav_delayed,
         # Brain (t=0 — wake word active immediately)
         behavior_node,
+        # Persistent memory (t=0 — soft dependency of behavior_node)
+        omni_memory_node,
         # Tools
         foxglove_node,
         tof_viz_node,

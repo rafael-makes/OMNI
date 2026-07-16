@@ -1,0 +1,8 @@
+# Re-label all memories from one person id to another. Used when a previously
+# unknown person (unknown_N) is given a name — their existing memories carry over.
+string from_person         # current person id (e.g. "unknown_3")
+string to_person           # new person id (e.g. "rafael")
+---
+bool success
+int32 updated              # number of memory records re-labeled
+string message

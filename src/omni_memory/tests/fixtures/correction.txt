@@ -1,0 +1,5 @@
+Rafael: OMNI, set my usual morning coffee for 6 AM.
+OMNI: Sure — coffee at 6 AM.
+Rafael: Actually, wait — make it 6:30 from now on, not 6. I've been getting up a bit later these days.
+OMNI: Got it, I'll plan on coffee at 6:30 going forward.
+Rafael: Perfect, thanks.

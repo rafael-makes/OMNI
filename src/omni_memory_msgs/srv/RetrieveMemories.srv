@@ -1,0 +1,9 @@
+# Retrieve relevant memories for a query, formatted for context injection.
+string query               # search text (e.g. the user's first utterance)
+int32 k                    # max results; 0 -> node default
+string person              # optional; "" = unknown. Restricts to this person + general records.
+---
+bool success
+string context_block       # plain-text block of memory statements (empty if none)
+int32 count                # number of memories in the block
+string message             # human-readable status / error
