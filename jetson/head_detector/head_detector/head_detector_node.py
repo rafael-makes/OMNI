@@ -51,9 +51,10 @@ from sensor_msgs.msg import CompressedImage
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 try:
-    from head_detector.face_recognizer import FaceRecognizer
+    from head_detector.face_recognizer import FaceRecognizer, IdentitySmoother
 except Exception:  # noqa: BLE001 - identity is optional; never block detection
     FaceRecognizer = None
+    IdentitySmoother = None
 
 import tensorrt as trt
 from cuda.bindings import runtime as cudart
@@ -240,6 +241,20 @@ class HeadDetectorNode(Node):
         self.declare_parameter('face_gallery_dir',      '/home/Omni/head_detector/faces')
         self.declare_parameter('face_unknown_dir',      '/home/Omni/head_detector/unknown_faces')
         self.declare_parameter('recognition_threshold', 0.363)  # SFace cosine
+        # Quality gate — a turned/tiny/low-confidence face embeds poorly, so it must
+        # not mint a new unknown_N (that produced endless junk ids). Frontality is
+        # judged from the YuNet landmarks (nose offset vs eye separation).
+        self.declare_parameter('recognition_min_score',   0.80)
+        self.declare_parameter('recognition_min_face_px', 80)
+        self.declare_parameter('recognition_max_nose_off', 0.40)
+        # Hysteresis — majority vote over a sliding window so a single bad frame
+        # doesn't flip the published identity.
+        self.declare_parameter('identity_smooth_window', 15)
+        self.declare_parameter('identity_switch_ratio',  0.6)
+        # Multi-crop enrolment: keep capturing good frames briefly after an enrol
+        # request so a person matches across poses, not just one dead-on shot.
+        self.declare_parameter('enroll_samples',  5)
+        self.declare_parameter('enroll_seconds',  2.0)
         # Debug feed: publish the annotated frame as CompressedImage (JPEG) on
         # /camera/image_annotated/compressed so you can watch it in Foxglove from a
         # PC. Off by default (saves USB/net + CPU); turn on with -p publish_debug_image:=true.
@@ -276,6 +291,13 @@ class HeadDetectorNode(Node):
         self._gallery_dir   = str(gp('face_gallery_dir'))
         self._unknown_dir   = str(gp('face_unknown_dir'))
         self._recog_thr     = float(gp('recognition_threshold'))
+        self._recog_min_score   = float(gp('recognition_min_score'))
+        self._recog_min_face_px = float(gp('recognition_min_face_px'))
+        self._recog_max_nose_off = float(gp('recognition_max_nose_off'))
+        self._smooth_window = int(gp('identity_smooth_window'))
+        self._switch_ratio  = float(gp('identity_switch_ratio'))
+        self._enroll_samples = int(gp('enroll_samples'))
+        self._enroll_seconds = float(gp('enroll_seconds'))
 
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -293,9 +315,14 @@ class HeadDetectorNode(Node):
         self._yunet = None                     # YuNetFace, built in the capture thread
         self._latest_frame = None              # newest BGR frame, for the debug feed
         self._recognizer = None                # FaceRecognizer, built in the capture thread
-        self._latest_identity = ''             # resolved primary-face person id ('' = none)
+        self._latest_identity = ''             # SMOOTHED primary-face person id ('' = none)
         self._enroll_frame = None              # newest frame + primary face for on-the-fly
         self._enroll_face = None               # enrollment (Step 6 remember_person)
+        # Hysteresis over raw per-frame recognition (built with the recognizer).
+        self._smoother = None
+        # Multi-crop enrolment in progress: {'name', 'deadline', 'left'} or None.
+        # Written by the enrol callback (ROS thread), consumed by the capture thread.
+        self._enroll_pending = None
 
         # ── Publishers (match old camera_node QoS) ───────────────────────────
         sensor_qos = QoSProfile(depth=10,
@@ -525,9 +552,15 @@ class HeadDetectorNode(Node):
                 self._recognizer = FaceRecognizer(
                     sface, yunet_model, self._gallery_dir, self.get_logger(),
                     unknown_dir=self._unknown_dir,
-                    match_threshold=self._recog_thr, unknown_threshold=self._recog_thr)
+                    match_threshold=self._recog_thr, unknown_threshold=self._recog_thr,
+                    min_score=self._recog_min_score,
+                    min_face_px=self._recog_min_face_px,
+                    max_nose_off=self._recog_max_nose_off)
                 if not self._recognizer.ok:
                     self._recognizer = None
+                else:
+                    self._smoother = IdentitySmoother(
+                        window=self._smooth_window, switch_ratio=self._switch_ratio)
             except Exception as e:  # noqa: BLE001
                 self._recognizer = None
                 self.get_logger().error(
@@ -590,12 +623,19 @@ class HeadDetectorNode(Node):
             # ── Face recognition (Step 6) — resolve the PRIMARY (largest) face ─
             # to a person id for /camera/identity. Fail-safe; '' when no face.
             identity = ''
-            if self._recognizer is not None and faces:
-                try:
-                    identity = self._recognizer.identify(frame, faces[0]['_raw'])
-                except Exception as e:  # noqa: BLE001
-                    self.get_logger().warn(f'recognition error: {e}',
-                                           throttle_duration_sec=5.0)
+            if self._recognizer is not None:
+                raw_id = ''
+                if faces:
+                    try:
+                        raw_id = self._recognizer.identify(frame, faces[0]['_raw'])
+                    except Exception as e:  # noqa: BLE001
+                        self.get_logger().warn(f'recognition error: {e}',
+                                               throttle_duration_sec=5.0)
+                    self._service_pending_enroll(frame, faces[0]['_raw'])
+                # Hysteresis: publish the smoothed id, so one off-angle or blank
+                # frame can't flip identity (raw_id flickers; the vote doesn't).
+                identity = (self._smoother.update(raw_id)
+                            if self._smoother is not None else raw_id)
 
             with self._lock:
                 self._latest_detections = confirmed[:self._max_det]
@@ -662,8 +702,42 @@ class HeadDetectorNode(Node):
             arr.detections.append(det)
         return arr
 
+    def _service_pending_enroll(self, frame, raw_face):
+        """Multi-crop enrolment (capture thread): after an enrol request, keep adding
+        good frames for a short window so the person matches across poses rather than
+        one dead-on shot. Only frontal, confident faces are sampled."""
+        pending = self._enroll_pending
+        if not pending or self._recognizer is None:
+            return
+        now = time.monotonic()
+        if now > pending['deadline'] or pending['left'] <= 0:
+            self._enroll_pending = None
+            self.get_logger().info(
+                f"enrol '{pending['name']}': {pending['taken']} sample(s) captured")
+            return
+        if now < pending['next_at'] or not self._recognizer.quality_ok(raw_face):
+            return
+        try:
+            if self._recognizer.enroll(pending['name'], frame, raw_face):
+                pending['left'] -= 1
+                pending['taken'] += 1
+                pending['next_at'] = now + pending['interval']
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f'enrol sample error: {e}', throttle_duration_sec=5.0)
+
+    def _start_pending_enroll(self, name, taken):
+        now = time.monotonic()
+        interval = self._enroll_seconds / max(1, self._enroll_samples)
+        self._enroll_pending = {
+            'name': name, 'taken': taken, 'left': max(0, self._enroll_samples - taken),
+            'deadline': now + self._enroll_seconds,
+            'next_at': now + interval, 'interval': interval,
+        }
+
     def _on_enroll_request(self, msg):
-        """Learn the face currently in view as msg.data (a name). Fail-safe."""
+        """Learn the face currently in view as msg.data (a name). Fail-safe.
+        Takes one sample now (if the face is good) and collects a few more over the
+        next couple of seconds for pose robustness."""
         name = (msg.data or '').strip().lower()
         with self._lock:
             frame = self._enroll_frame
@@ -678,8 +752,16 @@ class HeadDetectorNode(Node):
             detail = 'no face in view'
         else:
             try:
-                ok = self._recognizer.enroll(name, frame, face)
-                detail = 'enrolled' if ok else 'enroll failed'
+                if self._recognizer.quality_ok(face):
+                    ok = self._recognizer.enroll(name, frame, face)
+                    detail = 'enrolled' if ok else 'enroll failed'
+                else:
+                    # Face present but turned/small — let the collection window catch
+                    # a good frame instead of enrolling a poor reference.
+                    ok = True
+                    detail = 'face not frontal enough — collecting'
+                if ok and self._enroll_samples > 1:
+                    self._start_pending_enroll(name, 1 if detail == 'enrolled' else 0)
             except Exception as e:  # noqa: BLE001
                 detail = f'error: {e}'
         self.get_logger().info(f"enroll_request '{name}': {detail}")
