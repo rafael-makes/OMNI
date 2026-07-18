@@ -551,16 +551,25 @@ class BehaviorNode(Node):
                 self._memory_seed_query, k=self._memory_k, person=self._session_person
             )
             memory_context = wrap_memory_context(block)
-        # If this person isn't recognized yet, nudge OMNI to learn them (Step 6).
-        if self._person_keying and (
-            not self._session_person or self._session_person.startswith('unknown')
-        ):
-            hint = (
-                '[MEMORY] You do not recognise this person yet. If it fits naturally, '
-                'ask their name, and once you learn it call remember_person(name) so '
-                'you know their face next time.'
-            )
-            memory_context = f'{memory_context}\n\n{hint}' if memory_context else hint
+        # Tell OMNI WHO it is talking to (Step 6). Without this it only ever sees the
+        # memory statements and has no idea of the person's name — retrieval is keyed
+        # by identity, but the model was never told the identity.
+        if self._person_keying:
+            known = self._session_person and not self._session_person.startswith('unknown')
+            if known:
+                who = (
+                    f'[MEMORY] You recognise the person in front of you: their name is '
+                    f'{self._session_person.capitalize()}. Address them by name naturally '
+                    f'when it fits; do not announce that you recognised their face.'
+                )
+                memory_context = f'{who}\n\n{memory_context}' if memory_context else who
+            else:
+                hint = (
+                    '[MEMORY] You do not recognise this person yet. If it fits naturally, '
+                    'ask their name, and once you learn it call remember_person(name) so '
+                    'you know their face next time.'
+                )
+                memory_context = f'{memory_context}\n\n{hint}' if memory_context else hint
 
         # open_session() uses call_soon_threadsafe internally — safe from any thread
         self._bridge.open_session(memory_context=memory_context)

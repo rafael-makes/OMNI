@@ -21,9 +21,11 @@ DEFAULT_TEXT_MODEL = "gemini-2.5-flash"
 # the provided default_person (the recognized speaker's identity).
 _GENERIC_SPEAKERS = {"user", "the user", "speaker", "me", "i", "omni's user"}
 
-# Bounded retry for transient 429s (free tier is 5 req/min for flash). Not meant
-# to mask sustained quota exhaustion — just to ride out short rate-limit bursts.
-_RATE_LIMIT_RETRIES = 3
+# Bounded retry for TRANSIENT failures: 429 rate limits and 5xx server blips (Gemini
+# returns 503 "experiencing high demand" under load). Both are temporary, and a
+# dropped summarize would silently lose a whole conversation's memories. Not meant to
+# mask sustained quota exhaustion or a real outage — just to ride out short bursts.
+_TRANSIENT_RETRIES = 3
 _RETRY_CAP_SECONDS = 30.0
 
 SYSTEM_PROMPT = """You extract durable, long-term memories from a conversation \
@@ -96,6 +98,18 @@ class GeminiSummarizer(Summarizer):
             return []
         from google.genai import types  # lazy
 
+        # A live transcript labels the speaker generically ("User:"), so without this
+        # the model writes "The user prefers ..." — not self-contained, and OMNI ends
+        # up thinking the person is literally called "user". When we know who is
+        # speaking, name them so records read "Rafael prefers ..." per the SPEC rules.
+        if default_person and not default_person.startswith("unknown"):
+            who = default_person.capitalize()
+            text = (
+                f'[Context: the speaker labelled "User" is named {who}. Write their '
+                f'facts using that name — e.g. "{who} prefers ..." — never "the user".]'
+                f"\n\n{text}"
+            )
+
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -110,8 +124,8 @@ class GeminiSummarizer(Summarizer):
                     model=self.model, contents=text, config=config
                 )
                 break
-            except Exception as exc:  # noqa: BLE001 - narrow via _is_rate_limit
-                if not (_is_rate_limit(exc) and attempt < _RATE_LIMIT_RETRIES):
+            except Exception as exc:  # noqa: BLE001 - narrowed via _is_transient
+                if not (_is_transient(exc) and attempt < _TRANSIENT_RETRIES):
                     raise
                 time.sleep(_retry_delay(exc, default=6.0 * (attempt + 1)))
                 attempt += 1
@@ -144,9 +158,14 @@ def summarize_transcript(
     return engine.summarize(text, session_id=session_id, default_person=default_person)
 
 
-def _is_rate_limit(exc: Exception) -> bool:
+def _is_transient(exc: Exception) -> bool:
+    """True for retryable blips: 429 (rate limit) or any 5xx (e.g. Gemini 503
+    'high demand'). Everything else — bad key, bad request — should fail fast."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and (code == 429 or 500 <= code <= 599):
+        return True
     text = str(exc)
-    return getattr(exc, "code", None) == 429 or "429" in text or "RESOURCE_EXHAUSTED" in text
+    return any(m in text for m in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "429", "503"))
 
 
 def _retry_delay(exc: Exception, default: float) -> float:
