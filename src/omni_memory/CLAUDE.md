@@ -45,7 +45,10 @@ relevant memories retrieved and injected into the Gemini Live session context.
 - [x] Step 5: Gemini Live integration. Lives in behavior_node (memory_client.py,
       memory_format.py, gemini_bridge.py, behavior_node.py). Gate:
       behavior_node/scripts/step5_service_gate.sh (auto) + step5_manual_gate.md (live).
-- [ ] Step 6: per-person keying via face recognition.
+- [x] Step 6: per-person keying via face recognition. Recognizer on the Jetson
+      (head_detector), consumed by the Pi. Gate: recognised across a restart +
+      `behavior_node/scripts/step6_service_gate.sh`. Multi-face identification and
+      targeted enrolment landed 2026-07-18 — see SPEC.md "Identity contracts".
 
 ## Running the Step 1 gate
 ```
