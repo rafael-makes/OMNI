@@ -241,6 +241,7 @@ class BehaviorNode(Node):
         self._current_person      = None
         self._current_person_time = 0.0
         self._session_person      = None
+        self._late_bind_done      = False   # one late identity adoption per chat
         self._enroll_pub          = None
         if self._person_keying:
             self.create_subscription(String, identity_topic, self._on_identity, 10)
@@ -376,6 +377,62 @@ class BehaviorNode(Node):
         person = (msg.data or '').strip().lower()
         self._current_person = person or None
         self._current_person_time = time.monotonic()
+        # Someone may walk into frame AFTER the wake word (e.g. you wake OMNI from
+        # off-camera). Adopt them mid-conversation instead of staying "stranger".
+        self._maybe_late_bind(self._current_person)
+
+    def _maybe_late_bind(self, person):
+        """Bind a person recognised DURING a conversation that started without one.
+
+        _session_person is latched at wake so mid-chat identity noise can't re-key the
+        store — but if nobody was in frame at wake, that left the whole conversation
+        anonymous even once the person appeared. Upgrade only in the safe direction
+        (nobody/unknown -> a real name), never name -> different name.
+        """
+        if not self._person_keying or self._late_bind_done or not person:
+            return
+        with self._state_lock:
+            state = self._current_state
+        if state not in ('LISTENING', 'SPEAKING'):
+            return                                   # no live conversation
+        have = self._session_person
+        if have and not have.startswith('unknown'):
+            return                                   # already know who this is
+        if person.startswith('unknown'):
+            # Still anonymous, but key the conversation to them if we had nobody.
+            if not have:
+                self._session_person = person
+            return
+        self._late_bind_done = True
+        prev = have
+        self._session_person = person
+        self.get_logger().info(
+            f'Late-bound conversation person: {person} (was {prev!r})'
+        )
+        # Fetching memories blocks, so do it off the executor thread, then tell OMNI
+        # who it is now looking at — otherwise it keeps treating them as a stranger.
+        threading.Thread(
+            target=self._inject_late_identity, args=(person,), daemon=True
+        ).start()
+
+    def _inject_late_identity(self, person):
+        try:
+            block = ''
+            if self._memory_enabled:
+                block = self._memory.retrieve_context(
+                    self._memory_seed_query, k=self._memory_k, person=person
+                )
+            msg = (
+                f'[MEMORY] You can now see who you are talking to: '
+                f'{person.capitalize()}. Greet them by name naturally — you no longer '
+                f'need to ask their name.'
+            )
+            wrapped = wrap_memory_context(block)
+            if wrapped:
+                msg = f'{msg}\n\n{wrapped}'
+            self._bridge.inject_context(msg, alert=False)
+        except Exception as exc:  # noqa: BLE001 - best effort, never break the chat
+            self.get_logger().warn(f'late identity inject failed: {exc}')
 
     def _current_identity(self):
         """The recognized person if the identity is still fresh, else None."""
@@ -543,6 +600,9 @@ class BehaviorNode(Node):
         # is scoped to this person + general memories, and the end-of-chat store is
         # attributed to them. None when no fresh identity → general/household.
         self._session_person = self._current_identity()
+        # Re-arm late binding for this conversation (see _maybe_late_bind): if nobody
+        # is in frame at wake, whoever appears next gets adopted.
+        self._late_bind_done = False
         if self._session_person:
             self.get_logger().info(f'Conversation person: {self._session_person}')
         memory_context = ''
