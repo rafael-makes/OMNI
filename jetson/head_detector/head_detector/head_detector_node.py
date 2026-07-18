@@ -196,10 +196,12 @@ class HeadDetectorNode(Node):
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter('engine_path',
                                '/home/Omni/head_detector/models/yolo26n_fp16.engine')
-        # 'csi' -> nvarguscamerasrc (IMX219 on the Jetson CSI port);
-        # 'usb' -> a UVC/USB webcam via v4l2src (opens `usb_device`);
+        # 'usb' -> a UVC/USB webcam via v4l2src (opens `usb_device`)  [OMNI's camera];
+        # 'csi' -> nvarguscamerasrc (IMX219 on the Jetson CSI port)  [REMOVED from OMNI];
         # any other value is treated as an image file path looped for offline validation.
-        self.declare_parameter('source',               'csi')
+        # Defaults to 'usb': the IMX219 was removed, so a 'csi' default can only fail
+        # here ("No cameras available" + an endless reopen loop).
+        self.declare_parameter('source',               'usb')
         self.declare_parameter('sensor_id',            0)
         # For source=='usb': the V4L2 device to open. Default is the HHWei head cam by
         # its STABLE /dev/v4l/by-id path so it never swaps /dev/videoN with the rear cam.
@@ -207,10 +209,14 @@ class HeadDetectorNode(Node):
             '/dev/v4l/by-id/usb-HHWei_Technology_Co.__Ltd._USB_Camera_HHW001-video-index0')
         self.declare_parameter('capture_width',        1280)
         self.declare_parameter('capture_height',       720)
-        # IMX219 has NO native 1280x720@30 mode — the only 720p mode is @60 (mode 4).
-        # Requesting 30 makes Argus negotiate an ambiguous mode -> INVALID_SETTINGS
-        # halts, so 60 is the correct default for the 1280x720 capture above.
-        self.declare_parameter('capture_fps',          60)
+        # 30 for the USB webcams: both attached cams max out at 30fps MJPG, so a 60
+        # request cannot negotiate a pipeline and the capture loop spins on
+        # "frame read failed".
+        # HISTORY (why this was 60): with the old IMX219 CSI camera, 60 was CORRECT —
+        # it had no native 1280x720@30 mode, and asking for 30 made Argus negotiate an
+        # ambiguous mode -> INVALID_SETTINGS. If a CSI camera is ever fitted again,
+        # set source:=csi AND capture_fps:=60 together.
+        self.declare_parameter('capture_fps',          30)
         self.declare_parameter('image_width',          1280)   # published coord space
         self.declare_parameter('image_height',         720)
         self.declare_parameter('detection_fps',        10.0)
