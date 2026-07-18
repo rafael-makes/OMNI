@@ -72,9 +72,16 @@ def main():
             from omni_memory import MemoryStore, load_env
             load_env("/home/pi/omni_ws/src/omni_memory/.env")
             s = MemoryStore()
-            for p in (ALICE, BOB):
-                s.client.table(s.table).delete().eq("person", p).execute()
-            print("   cleaned up test rows")
+            # Clean up by SESSION_ID, never by person: the summarizer normalises a
+            # person name (alice<ts> -> "alice"), so a person-based delete both MISSES
+            # the stored rows (they orphan) and could match a REAL person of that name.
+            # session_id is stored verbatim, so it is exact and safe.
+            deleted = 0
+            for sid in (f"s6-{ALICE}", f"s6-{BOB}"):
+                deleted += len(
+                    s.client.table(s.table).delete().eq("session_id", sid).execute().data or []
+                )
+            print(f"   cleaned up {deleted} test row(s)")
         except Exception as exc:  # noqa: BLE001
             print(f"   cleanup warning: {exc}")
         mem.shutdown()          # stop the dedicated memory executor cleanly
