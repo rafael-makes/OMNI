@@ -121,6 +121,7 @@ class FaceRecognizer:
             self._yn = cv2.FaceDetectorYN.create(yunet_model, "", (320, 320), 0.6, 0.3, 5000)
             self._load_gallery(gallery_dir)
             self._load_unknowns()
+            self.consolidate()
             self._ok = True
             self._log.info(
                 f"FaceRecognizer ready — {len(self._gallery)} known "
@@ -137,6 +138,7 @@ class FaceRecognizer:
     # ── enrollment ──────────────────────────────────────────────────────────────
 
     def _embed_file(self, path):
+        """Detect + align + embed a stored image. Returns None if no face is found."""
         img = cv2.imread(path)
         if img is None:
             return None
@@ -147,6 +149,35 @@ class FaceRecognizer:
             return None
         faces = sorted(faces, key=lambda f: -(f[2] * f[3]))  # largest face
         return self._sf.feature(self._sf.alignCrop(img, faces[0])).flatten()
+
+    @staticmethod
+    def _feat_path(img_path):
+        return os.path.splitext(img_path)[0] + ".npy"
+
+    def _embed_ref(self, path):
+        """Embedding for a stored reference, preferring a cached .npy.
+
+        We persist the ALIGNED 112x112 crop, which is a tight face fill with no
+        margin — YuNet cannot reliably re-detect a face in it, so re-embedding at
+        boot silently loses references (observed: 7 of 13 stored unknowns failed to
+        reload). For a named person that would mean quietly no longer recognising
+        them, with no error. Caching the embedding removes the re-detection step
+        entirely; the crop is kept only for human inspection. Older crops without a
+        cached vector are re-embedded once and the cache written, so this self-heals.
+        """
+        npy = self._feat_path(path)
+        if os.path.isfile(npy):
+            try:
+                return np.load(npy)
+            except Exception as e:  # noqa: BLE001 - fall back to re-embedding
+                self._log.warn(f"FaceRecognizer: unreadable cache {npy} ({e})")
+        feat = self._embed_file(path)
+        if feat is not None:
+            try:
+                np.save(npy, feat)
+            except Exception:  # noqa: BLE001 - caching is best-effort
+                pass
+        return feat
 
     def _load_gallery(self, gallery_dir):
         if not gallery_dir or not os.path.isdir(gallery_dir):
@@ -163,7 +194,7 @@ class FaceRecognizer:
                 files = [path]
             if not name:
                 continue
-            embs = [e for e in (self._embed_file(f) for f in sorted(files)) if e is not None]
+            embs = [e for e in (self._embed_ref(f) for f in sorted(files)) if e is not None]
             if embs:
                 self._gallery[name] = embs
             else:
@@ -185,19 +216,26 @@ class FaceRecognizer:
             files = []
             for ext in ("jpg", "jpeg", "png"):
                 files += glob.glob(os.path.join(path, f"*.{ext}"))
-            embs = [e for e in (self._embed_file(f) for f in sorted(files)) if e is not None]
+            embs = [e for e in (self._embed_ref(f) for f in sorted(files)) if e is not None]
             if embs:
                 self._unknowns[uid] = embs
                 self._next_unknown = max(self._next_unknown, uid + 1)
 
-    def _save_crop(self, base_dir, label, aligned):
-        """Persist an aligned face crop under base_dir/label/<ts>.jpg; return path/None."""
+    def _save_crop(self, base_dir, label, aligned, feat=None):
+        """Persist an aligned face crop under base_dir/label/<ts>.jpg, plus its
+        embedding as a sibling .npy so reloading never depends on re-detecting a
+        face in the tight crop (see _embed_ref). Returns the image path or None."""
         try:
             import time as _t
             d = os.path.join(base_dir, label)
             os.makedirs(d, exist_ok=True)
             path = os.path.join(d, f"{int(_t.time() * 1000)}.jpg")
             cv2.imwrite(path, aligned)
+            if feat is not None:
+                try:
+                    np.save(self._feat_path(path), feat)
+                except Exception:  # noqa: BLE001 - cache is an optimisation
+                    pass
             return path
         except Exception as e:  # noqa: BLE001
             self._log.warn(f"FaceRecognizer: crop save failed for {label}: {e}")
@@ -239,10 +277,65 @@ class FaceRecognizer:
         self._unknowns[uid] = [feat]
         try:
             self._save_crop(self._unknown_dir, f"unknown_{uid}",
-                            self._sf.alignCrop(frame, raw_face))
+                            self._sf.alignCrop(frame, raw_face), feat)
         except Exception as e:  # noqa: BLE001 - in-memory unknown still registered
             self._log.warn(f"FaceRecognizer: unknown_{uid} crop save failed: {e}")
         return f"unknown_{uid}"
+
+    def consolidate(self):
+        """Tidy the persisted unknowns against the current gallery. Run at startup.
+
+        Two kinds of stale entry accumulate:
+          * Unknowns that ARE a now-enrolled person. A person registers as unknown_N
+            before enrolment (or at a pose their early references missed); as their
+            gallery grows those entries start matching them, but merging only ran
+            during an enrolment, so they lingered and kept being published INSTEAD of
+            the person's name. Observed: three unknowns scoring 0.40-0.44 against a
+            gallery whose match bar is 0.363.
+          * Folders whose crops yield no embedding at all (pre-embedding-cache junk),
+            which can never match anything.
+
+        Returns (merged, pruned) counts. Only ever removes anonymous entries — named
+        gallery people are never touched.
+        """
+        import shutil
+        merged = pruned = 0
+        if not os.path.isdir(self._unknown_dir):
+            return (0, 0)
+
+        # 1) Unknowns that now match a known person are redundant — drop them.
+        for uid in sorted(self._unknowns):
+            refs = self._unknowns[uid]
+            best_name, best = None, -1.0
+            for name, grefs in self._gallery.items():
+                sim = max(_cosine(r, g) for r in refs for g in grefs)
+                if sim > best:
+                    best_name, best = name, sim
+            if best_name is not None and best >= self._match_thr:
+                self._unknowns.pop(uid, None)
+                shutil.rmtree(os.path.join(self._unknown_dir, f"unknown_{uid}"),
+                              ignore_errors=True)
+                merged += 1
+                self._log.info(
+                    f"FaceRecognizer: consolidated unknown_{uid} into "
+                    f"'{best_name}' (cos {best:.3f})"
+                )
+
+        # 2) Unusable folders — present on disk but produced no embedding on load.
+        for entry in sorted(os.listdir(self._unknown_dir)):
+            path = os.path.join(self._unknown_dir, entry)
+            if not (os.path.isdir(path) and entry.startswith("unknown_")):
+                continue
+            try:
+                uid = int(entry.split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if uid not in self._unknowns:
+                shutil.rmtree(path, ignore_errors=True)
+                pruned += 1
+        if pruned:
+            self._log.info(f"FaceRecognizer: pruned {pruned} unusable unknown folder(s)")
+        return (merged, pruned)
 
     def quality_ok(self, raw_face):
         """Is this face good enough to enrol / register as a new identity?"""
@@ -265,7 +358,7 @@ class FaceRecognizer:
             self._log.warn(f"FaceRecognizer.enroll embed error: {e}")
             return False
         self._gallery.setdefault(name, []).append(feat)  # recognised immediately
-        path = self._save_crop(self._gallery_dir, name, aligned)
+        path = self._save_crop(self._gallery_dir, name, aligned, feat)
         self._log.info(f"FaceRecognizer: enrolled '{name}'" + (f" -> {path}" if path else " (memory only)"))
         # This face is no longer anonymous — drop any matching persisted unknown so
         # it isn't double-counted. (behavior_node re-keys that unknown's memories.)
