@@ -24,6 +24,7 @@ def generate_launch_description():
     source = LaunchConfiguration('source')
     capture_fps = LaunchConfiguration('capture_fps')
     publish_identity = LaunchConfiguration('publish_identity')
+    publish_clean_image = LaunchConfiguration('publish_clean_image')
     return LaunchDescription([
         DeclareLaunchArgument('source', default_value='usb',
                               description="'usb' for a UVC webcam, 'csi' for nvarguscamerasrc, "
@@ -34,6 +35,11 @@ def generate_launch_description():
         DeclareLaunchArgument('publish_identity', default_value='true',
                               description='Publish /camera/identity (SFace face recognition) '
                                           'for per-person memory. false disables recognition.'),
+        DeclareLaunchArgument('publish_clean_image', default_value='false',
+                              description='Publish the undrawn frame on '
+                                          '/camera/image_clean/compressed. Required by '
+                                          'frame_server for scene description; costs a '
+                                          'JPEG encode at clean_image_fps (2 Hz).'),
         Node(
             package='head_detector',
             executable='head_detector_node',
@@ -44,6 +50,7 @@ def generate_launch_description():
                 'source': source,
                 'capture_fps': capture_fps,
                 'publish_identity': publish_identity,
+                'publish_clean_image': publish_clean_image,
             }],
         ),
         # base_link -> camera_link (head IMX219). PLACEHOLDER offsets.

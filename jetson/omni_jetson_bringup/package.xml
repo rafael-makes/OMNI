@@ -15,6 +15,8 @@
 
   <exec_depend>depthai_ros_driver</exec_depend>
   <exec_depend>depthimage_to_laserscan</exec_depend>
+  <exec_depend>frame_server</exec_depend>
+  <exec_depend>head_detector</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 

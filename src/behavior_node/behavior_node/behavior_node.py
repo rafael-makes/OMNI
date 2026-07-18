@@ -39,6 +39,7 @@ import uuid
 import yaml
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSPresetProfiles
@@ -52,8 +53,10 @@ from vision_msgs.msg import Detection2DArray
 from behavior_node.audio_handler import AudioHandler
 from behavior_node.function_handlers import FunctionHandlers, VALID_STATES
 from behavior_node.gemini_bridge import GeminiBridge
+from behavior_node.frame_client import FrameClient
 from behavior_node.memory_client import MemoryClient
 from behavior_node.memory_format import wrap_memory_context
+from behavior_node.scene_describer import SceneDescriber
 from behavior_node.wake_word import WakeWordDetector
 
 # States that cause the Gemini stream to close (robot is busy, can't converse)
@@ -95,6 +98,21 @@ class BehaviorNode(Node):
         self.declare_parameter('person_keying_enabled', True)
         self.declare_parameter('identity_topic',        '/camera/identity')
         self.declare_parameter('identity_timeout',      5.0)   # seconds an id stays "fresh"
+
+        # ── Scene description — soft dependency on the Jetson's frame_server ─────
+        # describe_scene() fetches a JPEG from the Orin and sends it to the Gemini
+        # vision endpoint. Whole path must fit inside a spoken exchange, hence the
+        # tight service timeout; if the Jetson is down OMNI just says it cannot see.
+        self.declare_parameter('scene_enabled',         True)
+        self.declare_parameter('scene_service_timeout', 2.5)
+        self.declare_parameter('scene_camera_id',       'head')
+        # Vision model. NOT the Live model above — this is a one-shot generateContent
+        # call. flash-lite with thinking disabled is the fastest option that still
+        # returns a complete sentence (see scene_describer for why that matters).
+        self.declare_parameter('scene_model',           'gemini-3.1-flash-lite')
+        self.declare_parameter('scene_max_sentences',   2)
+        # '' -> config/scene_prompt.txt from this package's share dir.
+        self.declare_parameter('scene_prompt_path',     '')
 
         model           = self.get_parameter('gemini_model').value
         voice           = self.get_parameter('gemini_voice').value
@@ -234,6 +252,45 @@ class BehaviorNode(Node):
             self, enabled=self._memory_enabled, service_timeout=memory_timeout
         )
         self._session_id = None
+
+        # ── Scene description client + describer ────────────────────────────────
+        # Both are soft: a missing Jetson or a missing API key degrades to OMNI
+        # saying it cannot see, never to a crash or a silence.
+        self._scene_enabled = bool(self.get_parameter('scene_enabled').value)
+        self._scene_camera_id = str(self.get_parameter('scene_camera_id').value)
+        self._frames = FrameClient(
+            self,
+            enabled=self._scene_enabled,
+            service_timeout=float(self.get_parameter('scene_service_timeout').value),
+        )
+        self._scene = None
+        if self._scene_enabled:
+            prompt_path = str(self.get_parameter('scene_prompt_path').value)
+            if not prompt_path:
+                prompt_path = os.path.join(
+                    get_package_share_directory('behavior_node'),
+                    'config', 'scene_prompt.txt')
+            if not os.path.exists(prompt_path):
+                self.get_logger().warn(
+                    f'scene: prompt file not found at {prompt_path} — using the '
+                    f'built-in default prompt')
+            self._scene = SceneDescriber(
+                model=str(self.get_parameter('scene_model').value),
+                prompt_path=prompt_path,
+                max_sentences=int(self.get_parameter('scene_max_sentences').value),
+            )
+            self.get_logger().info(
+                f'scene description enabled '
+                f'(model={self.get_parameter("scene_model").value}, prompt={prompt_path})')
+
+            # Warm the vision endpoint in the background. The first call in a process
+            # pays ~3.4s of connection setup vs ~0.7s thereafter, and without this it
+            # is the user's first "what do you see?" that pays it. Daemon thread so a
+            # slow or failed warmup never delays startup — describe_scene works either
+            # way, it is just slower the first time.
+            threading.Thread(
+                target=self._warm_scene, name='scene-warmup', daemon=True
+            ).start()
         # Step 6: latest recognized identity + when it arrived (monotonic). Written
         # by the /camera/identity callback, read at wake time. _session_person is the
         # person latched for the CURRENT conversation so a mid-chat identity change
@@ -467,6 +524,20 @@ class BehaviorNode(Node):
         self._current_person_time = time.monotonic()
         self.get_logger().info(f'Learning person on the fly: {name} (was {prev!r})')
         return True
+
+    def _warm_scene(self):
+        """Background: prime the vision endpoint so the first describe_scene is fast."""
+        started = time.monotonic()
+        if self._scene.warmup():
+            self.get_logger().info(
+                f'scene: vision endpoint warmed up in {time.monotonic() - started:.2f}s'
+            )
+        else:
+            # Not fatal — the first real call just pays the setup cost instead.
+            self.get_logger().warn(
+                'scene: vision warmup failed (check GEMINI_API_KEY / network) — '
+                'the first description will be slower'
+            )
 
     def _flush_conversation_to_memory(self):
         """
@@ -977,6 +1048,7 @@ def main(args=None):
         node._bridge.stop()
         node._wake.stop()
         node._memory.shutdown()
+        node._frames.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

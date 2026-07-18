@@ -266,6 +266,31 @@ class HeadDetectorNode(Node):
         # PC. Off by default (saves USB/net + CPU); turn on with -p publish_debug_image:=true.
         self.declare_parameter('publish_debug_image',   False)
         self.declare_parameter('debug_jpeg_quality',    60)
+        # Clean feed: the UNDRAWN frame as CompressedImage (JPEG) on
+        # /camera/image_clean/compressed. This is what frame_server caches and
+        # serves to the Pi for scene description — the annotated feed above is no
+        # use there, because the vision model ends up describing the green boxes
+        # and confidence numbers instead of the room. Off by default; enable with
+        # -p publish_clean_image:=true. Throttled independently of detection_fps:
+        # scene description asks for a frame every few minutes at most, so
+        # encoding at the full detection rate is wasted Jetson CPU.
+        # Face detection runs on a frame downscaled to this width, INDEPENDENT of
+        # capture size. Measured 2026-07-18: raising capture 848->1280 left YOLO flat
+        # at ~21ms (it letterboxes to 640^2 regardless) but doubled YuNet 35->75ms,
+        # dragging the pipeline to 9.7fps -- under the 10Hz detection target. Scene
+        # description is the only consumer that actually wants those extra pixels, so
+        # detection gets a downscaled copy and the clean feed keeps full resolution.
+        # SFace still crops from the FULL-res frame (see the _raw rescale below), so
+        # recognition quality improves with capture size rather than being capped here.
+        # 0 disables the downscale.
+        self.declare_parameter('detect_max_width',      848)
+        self.declare_parameter('publish_clean_image',   False)
+        self.declare_parameter('clean_jpeg_quality',    75)
+        self.declare_parameter('clean_image_fps',       2.0)
+        # Longest edge of the published clean frame. 640 is ample for scene
+        # description and measurably faster through the vision API than 1280
+        # (see _publish_clean). 0 = publish at capture resolution.
+        self.declare_parameter('clean_max_width',       640)
 
         gp = lambda n: self.get_parameter(n).value
         self._engine_path = gp('engine_path')
@@ -287,6 +312,12 @@ class HeadDetectorNode(Node):
         self._persist_iou = float(gp('persist_iou'))
         self._debug_image = bool(gp('publish_debug_image'))
         self._jpeg_quality = int(gp('debug_jpeg_quality'))
+        self._clean_image   = bool(gp('publish_clean_image'))
+        self._clean_quality = int(gp('clean_jpeg_quality'))
+        self._clean_fps     = float(gp('clean_image_fps'))
+        self._clean_max_w   = int(gp('clean_max_width'))
+        self._detect_max_w  = int(gp('detect_max_width'))
+        self._clean_last    = 0.0   # monotonic stamp of the last clean publish
         self._publish_faces = bool(gp('publish_faces'))
         self._yunet_path    = str(gp('yunet_model_path'))
         self._face_score    = float(gp('face_score_threshold'))
@@ -351,6 +382,11 @@ class HeadDetectorNode(Node):
         self._debug_pub = (
             self.create_publisher(CompressedImage, '/camera/image_annotated/compressed', 1)
             if self._debug_image else None)
+        # depth 1 + VOLATILE: frame_server only ever wants the newest frame, and a
+        # backlog of stale JPEGs is worse than a drop.
+        self._clean_pub = (
+            self.create_publisher(CompressedImage, '/camera/image_clean/compressed', 1)
+            if self._clean_image else None)
 
         # ── Capture+inference thread + publish timer ─────────────────────────
         self._thread = threading.Thread(target=self._capture_loop, daemon=True,
@@ -617,7 +653,25 @@ class HeadDetectorNode(Node):
                 try:
                     self._yunet.set_score_threshold(self._face_score)
                     tf = time.monotonic()
-                    faces = self._yunet.detect(frame)
+                    # Detect on a downscaled copy — YuNet gains nothing from the
+                    # extra pixels but pays roughly linearly for them.
+                    det_frame, det_scale = frame, 1.0
+                    if 0 < self._detect_max_w < frame.shape[1]:
+                        det_scale = self._detect_max_w / float(frame.shape[1])
+                        det_frame = cv2.resize(frame, None, fx=det_scale, fy=det_scale,
+                                               interpolation=cv2.INTER_AREA)
+                    faces = self._yunet.detect(det_frame)
+                    # detect() already maps the PUBLISHED box coords into publish
+                    # space, but '_raw' (box + 5 landmarks) comes back in det_frame
+                    # space, and SFace uses it to crop/align out of the full frame.
+                    # Rescale it or every recognition crop lands in the wrong place —
+                    # faces would silently stop matching. Index 14 is the score and is
+                    # deliberately left alone.
+                    if det_scale != 1.0:
+                        inv = 1.0 / det_scale
+                        for _d in faces:
+                            _d['_raw'] = _d['_raw'].copy()
+                            _d['_raw'][:14] *= inv
                     self._face_ms = (time.monotonic() - tf) * 1000.0
                     # largest face first — the closest person's face wins tracking
                     faces.sort(key=lambda d: -(d['bw'] * d['bh']))
@@ -687,6 +741,9 @@ class HeadDetectorNode(Node):
 
         if self._debug_pub is not None and frame is not None:
             self._publish_annotated(now, frame, dets, faces)
+
+        if self._clean_pub is not None and frame is not None:
+            self._publish_clean(now, frame)
 
     def _build_array(self, stamp, items, class_id):
         """Pack a box-dict list into a Detection2DArray with the given class_id."""

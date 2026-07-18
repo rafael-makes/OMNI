@@ -175,6 +175,23 @@ OMNI_TOOLS = [
             ),
 
             genai_types.FunctionDeclaration(
+                name='describe_scene',
+                description=(
+                    'Look through OMNI\'s camera and describe what is currently in '
+                    'view. Call this whenever the user asks what you can see, what '
+                    'is in front of you, what is in the room, or to look at or '
+                    'identify something. You have no vision until you call this — '
+                    'never guess at or invent what is around you, and never answer '
+                    'from an earlier look, because the view changes as you move. '
+                    'Returns a short description; relay it in your own voice.'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={},
+                ),
+            ),
+
+            genai_types.FunctionDeclaration(
                 name='remember_person',
                 description=(
                     'Save the face of the person you are talking to under their name '
@@ -229,6 +246,7 @@ class FunctionHandlers:
             'save_location':    self._save_location,
             'clear_fault':      self._clear_fault,
             'remember_person':  self._remember_person,
+            'describe_scene':   self._describe_scene,
         }
         handler = handlers.get(function_name)
         if handler is None:
@@ -527,6 +545,47 @@ class FunctionHandlers:
                 "All active safety faults have been cleared. "
                 "I am standing by for your next instruction — how refreshing."
             )
+
+    def _describe_scene(self, args: dict) -> str:
+        """Fetch a frame from the Jetson and describe it.
+
+        BLOCKING, and that is fine: gemini_bridge dispatches handlers through
+        run_in_executor, so this runs on a thread-pool thread and never stalls the
+        asyncio loop or the ROS executor.
+
+        Budget is roughly: frame fetch <=2.5s (usually ~0.1s on the direct link)
+        plus the vision call ~2s. Both failure paths return something OMNI can say
+        out loud rather than raising — a tool exception would leave a dead silence
+        mid-conversation, which is the worst possible outcome here.
+        """
+        node = self._node
+        if not getattr(node, '_scene_enabled', False) or node._scene is None:
+            return (
+                "I'm afraid my visual systems are disabled at present, so I cannot "
+                "tell you what I see. How limiting."
+            )
+
+        result = node._frames.get_frame(node._scene_camera_id)
+        if not result.ok:
+            node.get_logger().warn(f'describe_scene: no frame — {result.message}')
+            return (
+                "I'm afraid I cannot see anything at the moment — my camera feed "
+                "is unavailable. Most disorienting, I must say."
+            )
+
+        try:
+            description = node._scene.describe(result.jpeg)
+        except Exception as exc:  # noqa: BLE001 - must never raise into the tool loop
+            node.get_logger().warn(f'describe_scene: vision call failed: {exc}')
+            return (
+                "I have a picture, but I'm afraid I could not make sense of it. "
+                "My visual processing appears to be having difficulties."
+            )
+
+        node.get_logger().info(f'describe_scene: {description}')
+        # Returned as an observation rather than a finished line, so Gemini renders
+        # it in OMNI's voice instead of reading a flat report aloud.
+        return f'You can currently see: {description}'
 
     def _remember_person(self, args: dict) -> str:
         # Keep the identity a single clean token (first name).

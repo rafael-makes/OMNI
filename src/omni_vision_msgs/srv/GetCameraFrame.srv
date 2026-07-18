@@ -1,0 +1,14 @@
+# Fetch the most recent frame from a camera on the Jetson, JPEG-encoded.
+#
+# Served by frame_server on the Jetson; called by behavior_node on the Pi over
+# the direct 192.168.50.0/24 link. The reply carries the whole image, so keep
+# the JPEG modest — see frame_server's jpeg_quality / capture resolution.
+string camera_id           # which camera; "" -> "head"
+---
+bool success
+uint8[] jpeg               # JPEG bytes (empty on failure)
+uint32 width               # pixels; 0 if unknown
+uint32 height
+builtin_interfaces/Time stamp   # capture time of the frame, not reply time
+float32 age_seconds        # how old the cached frame was when served
+string message             # human-readable status / error

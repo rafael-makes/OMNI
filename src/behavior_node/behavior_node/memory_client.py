@@ -15,6 +15,14 @@ DEDICATED NODE + EXECUTOR (important):
   on one node's clients + wait set). So MemoryClient runs its OWN node on its OWN
   single-threaded executor thread; a lock serializes call submission. This isolates
   all memory ROS traffic from behavior_node entirely.
+
+LAZY IMPORT (see also frame_client):
+  The omni_memory_msgs import lives inside __init__, not at module scope. At module
+  scope it runs during `import behavior_node.behavior_node` — before main() executes
+  — so an unbuilt or unsourced omni_memory_msgs would kill the WHOLE robot with a
+  ModuleNotFoundError. The SPEC says memory is a soft dependency ("if omni_memory is
+  down, OMNI still converses"); an eager import quietly broke that promise, since a
+  missing srv package is exactly the case it was meant to survive. Do not hoist it up.
 """
 from __future__ import annotations
 
@@ -24,14 +32,42 @@ import time
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 
-from omni_memory_msgs.srv import RekeyPerson, RetrieveMemories, StoreTranscript
-
 
 class MemoryClient:
     def __init__(self, parent_node, *, enabled: bool = True, service_timeout: float = 2.0):
         self._log = parent_node.get_logger()
         self.enabled = enabled
         self._timeout = service_timeout
+
+        # Set before any early return so shutdown() and the call paths stay safe.
+        self._node = None
+        self._exec = None
+        self._spin_thread = None
+        self._retrieve_cli = self._store_cli = self._rekey_cli = None
+        self._srv_retrieve = self._srv_store = self._srv_rekey = None
+        self._lock = threading.Lock()  # serialize call_async submissions
+        self._warmed = threading.Event()
+
+        # LAZY IMPORT — see the module docstring. Memory is a soft dependency;
+        # a missing omni_memory_msgs must not stop OMNI from starting.
+        try:
+            from omni_memory_msgs.srv import (
+                RekeyPerson,
+                RetrieveMemories,
+                StoreTranscript,
+            )
+        except ImportError as exc:
+            self._log.warn(
+                f"memory: omni_memory_msgs unavailable ({exc}) — persistent memory "
+                f"disabled. Build it and re-source the workspace (a shell sourced "
+                f"before the package was built will not see it)."
+            )
+            self.enabled = False
+            self._warmed.set()   # release anyone waiting on warmup
+            return
+        self._srv_retrieve = RetrieveMemories
+        self._srv_store = StoreTranscript
+        self._srv_rekey = RekeyPerson
 
         # Own node + executor, spun on a dedicated daemon thread.
         self._node = rclpy.create_node("behavior_memory_client")
@@ -44,8 +80,6 @@ class MemoryClient:
         self._rekey_cli = self._node.create_client(
             RekeyPerson, "/omni_memory/rekey_person"
         )
-        self._lock = threading.Lock()  # serialize call_async submissions
-        self._warmed = threading.Event()  # set once the DDS paths are established
         self._exec = SingleThreadedExecutor()
         self._exec.add_node(self._node)
         self._spin_thread = threading.Thread(
@@ -80,8 +114,19 @@ class MemoryClient:
             self._warmed.set()
 
     def shutdown(self) -> None:
+        """Stop the executor, WAIT for the spin thread to exit, then destroy the node.
+
+        The join is load-bearing — see FrameClient.shutdown for the full note.
+        executor.shutdown() returns before the spin loop has actually stopped, and
+        destroying the node underneath a live spin thread aborts the process.
+        """
+        # _node/_exec are None if the lazy import failed — nothing to tear down.
+        if self._node is None:
+            return
         try:
             self._exec.shutdown()
+            if self._spin_thread is not None:
+                self._spin_thread.join(timeout=2.0)
             self._node.destroy_node()
         except Exception:  # noqa: BLE001 - best effort on teardown
             pass
@@ -112,7 +157,7 @@ class MemoryClient:
                 "memory: retrieve_memories service unavailable — continuing without memory"
             )
             return ""
-        req = RetrieveMemories.Request(query=query, k=int(k), person=person or "")
+        req = self._srv_retrieve.Request(query=query, k=int(k), person=person or "")
         with self._lock:
             future = self._retrieve_cli.call_async(req)
         done = threading.Event()
@@ -165,7 +210,7 @@ class MemoryClient:
                 "(conversation not persisted)"
             )
             return
-        req = StoreTranscript.Request(
+        req = self._srv_store.Request(
             transcript=transcript, person=person, session_id=session_id, source=source
         )
         with self._lock:
@@ -185,7 +230,7 @@ class MemoryClient:
         if not self._ready(self._rekey_cli):
             self._log.warn("memory: rekey_person service unavailable — memories not merged")
             return
-        req = RekeyPerson.Request(from_person=from_person, to_person=to_person)
+        req = self._srv_rekey.Request(from_person=from_person, to_person=to_person)
         with self._lock:
             future = self._rekey_cli.call_async(req)
 

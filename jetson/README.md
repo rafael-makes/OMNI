@@ -10,16 +10,30 @@ source; the Jetson runs copies under `~/omni_jetson_ws/src/`.
   native TensorRT engine, and publishes `vision_msgs/Detection2DArray` on
   `/camera/detections` (+ `/camera/status`, and an optional annotated
   `/camera/image_annotated/compressed` when `publish_debug_image:=true`).
+- **`frame_server`** — serves the newest head-camera frame as JPEG on the
+  `/vision/get_camera_frame` service (`omni_vision_msgs/srv/GetCameraFrame`). The Pi's
+  behavior_node calls it across the direct link when Gemini invokes `describe_scene`
+  ("what do you see?"). Subscribes to head_detector's clean feed Jetson-locally, so only
+  the service reply crosses the wire. Needs `head_detector` running with
+  `publish_clean_image:=true` (the bringup launch does this).
 - **`omni_jetson_bringup`** — launch + config:
-  - `head_detector.launch.py` — head USB cam detector (848x480 MJPG, HHWei by-id).
+  - `head_detector.launch.py` — head USB cam detector (1280x720 MJPG, HHWei by-id) +
+    `frame_server`. Capture resolution is DECOUPLED from detection: `detect_max_width`
+    (848) is what YOLO/YuNet see, while the scene-description feed gets the full capture
+    frame. Raising capture without that split doubled YuNet's cost and pushed the
+    pipeline under its 10 Hz target.
   - `oak_scan.launch.py` — OAK-D Lite depth → `/oak/scan` (via `depthimage_to_laserscan`)
     for the Pi's Nav2 obstacle layer; publishes `base_link -> oak` TF.
   - `config/oak_lite_depth.yaml` — depth-only OAK pipeline + mount TF.
 
 ## Deploy to the Jetson
 ```bash
-rsync -a --exclude __pycache__ jetson/head_detector       Omni@<jetson>:~/omni_jetson_ws/src/
+rsync -a --exclude __pycache__ jetson/head_detector        Omni@<jetson>:~/omni_jetson_ws/src/
 rsync -a --exclude __pycache__ jetson/omni_jetson_bringup  Omni@<jetson>:~/omni_jetson_ws/src/
+rsync -a --exclude __pycache__ jetson/frame_server         Omni@<jetson>:~/omni_jetson_ws/src/
+# Shared srv package — lives in src/ (the Pi builds it too) and MUST exist on both
+# machines, or the Pi's behavior_node cannot talk to frame_server.
+rsync -a --exclude __pycache__ src/omni_vision_msgs        Omni@<jetson>:~/omni_jetson_ws/src/
 ssh Omni@<jetson> 'source /opt/ros/jazzy/setup.bash && cd ~/omni_jetson_ws && colcon build --symlink-install'
 ```
 
