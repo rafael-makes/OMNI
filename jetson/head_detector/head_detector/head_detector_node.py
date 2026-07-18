@@ -16,6 +16,22 @@ image_width x image_height — default 1280x720 — matching head_tracking_node)
 
   * score : float in [0, 1]  <-- ONE convention, end-to-end (both topics)
 
+Face recognition (when publish_identity:=true) adds two std_msgs/String topics:
+
+  * /camera/identity   — the PRIMARY (largest) face's smoothed person id: a known
+    name, a stable 'unknown_N', or ''. behavior_node keys a conversation off this.
+    Unchanged contract: one conversation belongs to one person.
+  * /camera/identities — JSON {"faces": [{track, identity, raw, primary,
+    cx, cy, bw, bh}, ...]}, largest face first: EVERY visible face, for callers
+    that need group awareness or want to enrol someone who isn't the closest.
+
+Faces are tracked frame-to-frame by IoU and each track carries its own identity
+vote, so a passer-by cannot flip the identity of the person being spoken to.
+/camera/enroll_request accepts a bare name (= the primary face, as before) or JSON
+{"name": ..., "target": "unknown_3"} / {"name": ..., "track": N} to name WHICH face
+to learn — an off-screen target is refused rather than silently enrolling whoever
+happens to be nearest.
+
 YOLO inference: YOLO26n exported to ONNX and built into an FP16 TensorRT engine
 with trtexec against the on-board CUDA 13.2 / TRT 10.16 toolchain. The engine is
 END-TO-END (NMS-free): output is [1, 300, 6] rows of [x1,y1,x2,y2,score,cls] in
@@ -51,10 +67,13 @@ from sensor_msgs.msg import CompressedImage
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 try:
-    from head_detector.face_recognizer import FaceRecognizer, IdentitySmoother
+    from head_detector.face_recognizer import (FaceRecognizer, FaceTracker,
+                                                parse_enroll_request, resolve_target)
 except Exception:  # noqa: BLE001 - identity is optional; never block detection
     FaceRecognizer = None
-    IdentitySmoother = None
+    FaceTracker = None
+    resolve_target = None
+    parse_enroll_request = None
 
 import tensorrt as trt
 from cuda.bindings import runtime as cudart
@@ -254,9 +273,24 @@ class HeadDetectorNode(Node):
         self.declare_parameter('recognition_min_face_px', 80)
         self.declare_parameter('recognition_max_nose_off', 0.40)
         # Hysteresis — majority vote over a sliding window so a single bad frame
-        # doesn't flip the published identity.
+        # doesn't flip the published identity. Applied PER TRACKED FACE, so a second
+        # person in frame cannot vote in the first person's window.
         self.declare_parameter('identity_smooth_window', 15)
         self.declare_parameter('identity_switch_ratio',  0.6)
+        # Face tracking — associates faces frame-to-frame so each one keeps a stable
+        # track id (and its own identity vote). track_iou is the match bar between
+        # frames; track_max_missed is how many frames a face may vanish for before its
+        # track is forgotten (covers blinks/turns without stranding stale tracks).
+        self.declare_parameter('track_iou',         0.3)
+        self.declare_parameter('track_max_missed',  8)
+        # Frames the primary id may coast after a track handover before falling back
+        # to ''. Keeps /camera/identity as steady as it was pre-tracking; too high
+        # would keep naming someone who has left.
+        self.declare_parameter('identity_primary_hold', 12)
+        # Cap on faces resolved per frame. Recognition is the expensive part (one
+        # SFace embed each), so a crowd must not stall the capture loop; the largest
+        # N faces are identified and any beyond that are reported id-less.
+        self.declare_parameter('identity_max_faces', 3)
         # Multi-crop enrolment: keep capturing good frames briefly after an enrol
         # request so a person matches across poses, not just one dead-on shot.
         self.declare_parameter('enroll_samples',  5)
@@ -333,6 +367,10 @@ class HeadDetectorNode(Node):
         self._recog_max_nose_off = float(gp('recognition_max_nose_off'))
         self._smooth_window = int(gp('identity_smooth_window'))
         self._switch_ratio  = float(gp('identity_switch_ratio'))
+        self._track_iou     = float(gp('track_iou'))
+        self._track_max_missed = int(gp('track_max_missed'))
+        self._primary_hold  = int(gp('identity_primary_hold'))
+        self._id_max_faces  = max(1, int(gp('identity_max_faces')))
         self._enroll_samples = int(gp('enroll_samples'))
         self._enroll_seconds = float(gp('enroll_seconds'))
 
@@ -353,10 +391,11 @@ class HeadDetectorNode(Node):
         self._latest_frame = None              # newest BGR frame, for the debug feed
         self._recognizer = None                # FaceRecognizer, built in the capture thread
         self._latest_identity = ''             # SMOOTHED primary-face person id ('' = none)
-        self._enroll_frame = None              # newest frame + primary face for on-the-fly
-        self._enroll_face = None               # enrollment (Step 6 remember_person)
-        # Hysteresis over raw per-frame recognition (built with the recognizer).
-        self._smoother = None
+        self._latest_rows = []                 # per-face identity rows (all faces)
+        self._enroll_frame = None              # newest frame, paired with _latest_rows,
+                                               # for on-the-fly enrollment (remember_person)
+        # Frame-to-frame face tracking + per-track hysteresis (built with the recognizer).
+        self._tracker = None
         # Multi-crop enrolment in progress: {'name', 'deadline', 'left'} or None.
         # Written by the enrol callback (ROS thread), consumed by the capture thread.
         self._enroll_pending = None
@@ -372,6 +411,14 @@ class HeadDetectorNode(Node):
         self._status_pub = self.create_publisher(String, '/camera/status', 10)
         self._identity_pub = (
             self.create_publisher(String, '/camera/identity', 10)
+            if self._publish_identity else None)
+        # Every visible face, not just the closest one: JSON
+        # {"faces": [{"track", "identity", "raw", "primary", "cx","cy","bw","bh"}, ...]}.
+        # /camera/identity above still carries the PRIMARY face alone and is unchanged —
+        # behavior_node keys a conversation off one person, and this feed is additive
+        # for callers that need group awareness or want to enrol a non-primary face.
+        self._identities_pub = (
+            self.create_publisher(String, '/camera/identities', 10)
             if self._publish_identity else None)
         # On-the-fly enrollment (Step 6): Pi publishes a name -> we save the face
         # currently in view under it. Result echoed on /camera/enroll_result.
@@ -601,8 +648,11 @@ class HeadDetectorNode(Node):
                 if not self._recognizer.ok:
                     self._recognizer = None
                 else:
-                    self._smoother = IdentitySmoother(
-                        window=self._smooth_window, switch_ratio=self._switch_ratio)
+                    self._tracker = FaceTracker(
+                        iou_threshold=self._track_iou,
+                        max_missed=self._track_max_missed,
+                        window=self._smooth_window, switch_ratio=self._switch_ratio,
+                        primary_hold=self._primary_hold)
             except Exception as e:  # noqa: BLE001
                 self._recognizer = None
                 self.get_logger().error(
@@ -680,37 +730,51 @@ class HeadDetectorNode(Node):
                     self.get_logger().warn(f'YuNet detect error: {e}',
                                            throttle_duration_sec=5.0)
 
-            # ── Face recognition (Step 6) — resolve the PRIMARY (largest) face ─
-            # to a person id for /camera/identity. Fail-safe; '' when no face.
-            identity = ''
-            if self._recognizer is not None:
-                raw_id = ''
-                if faces:
+            # ── Face recognition (Step 6) — resolve EVERY face to a person id ──
+            # Each face is tracked across frames and votes only in its own window,
+            # so a passer-by can't flip the identity of the person being talked to.
+            # Fail-safe throughout; identity is '' when nothing is resolved.
+            identity, rows = '', []
+            if self._recognizer is not None and self._tracker is not None:
+                # Recognition costs one SFace embed per face — cap it, largest first.
+                ranked = sorted(faces, key=lambda d: -(d['bw'] * d['bh']))
+                resolved = set(id(f) for f in ranked[:self._id_max_faces])
+                # Only the largest face may REGISTER a new unknown; the others are
+                # matched against people we already know. Without this, every
+                # marginal secondary detection mints a junk identity.
+                primary_id = id(ranked[0]) if ranked else None
+
+                def identify_face(face, _frame=frame, _keep=resolved, _pri=primary_id):
+                    if id(face) not in _keep:
+                        return ''
                     try:
-                        raw_id = self._recognizer.identify(frame, faces[0]['_raw'])
+                        return self._recognizer.identify(_frame, face['_raw'],
+                                                         register=(id(face) == _pri))
                     except Exception as e:  # noqa: BLE001
                         self.get_logger().warn(f'recognition error: {e}',
                                                throttle_duration_sec=5.0)
-                    self._service_pending_enroll(frame, faces[0]['_raw'])
-                # Hysteresis: publish the smoothed id, so one off-angle or blank
-                # frame can't flip identity (raw_id flickers; the vote doesn't).
-                identity = (self._smoother.update(raw_id)
-                            if self._smoother is not None else raw_id)
+                        return ''
+
+                try:
+                    rows = self._tracker.update(faces, identify_face)
+                    identity = self._tracker.primary_identity()
+                except Exception as e:  # noqa: BLE001 - tracking must never stop detection
+                    self.get_logger().warn(f'face tracking error: {e}',
+                                           throttle_duration_sec=5.0)
+                    rows = []
+                if rows:
+                    self._service_pending_enroll(frame, rows)
 
             with self._lock:
                 self._latest_detections = confirmed[:self._max_det]
                 self._latest_faces = faces
                 self._latest_identity = identity
-                # Keep the current primary face + frame so a concurrent enroll
-                # request can learn whoever is in view right now.
-                if self._recognizer is not None and faces:
-                    self._enroll_frame = frame
-                    self._enroll_face = faces[0]['_raw']
-                else:
-                    self._enroll_frame = None
-                    self._enroll_face = None
+                self._latest_rows = rows
+                # Keep this frame alongside the rows so a concurrent enroll request
+                # can learn a NAMED face in view, not merely the closest one.
+                self._enroll_frame = frame if rows else None
                 self._frame_count += 1
-                if self._debug_image:
+                if self._debug_image or self._clean_image:
                     self._latest_frame = frame
 
     # ── Detection publish ─────────────────────────────────────────────────────
@@ -724,13 +788,25 @@ class HeadDetectorNode(Node):
             infer_ms = self._infer_ms
             face_ms = self._face_ms
             identity = self._latest_identity
-            frame = self._latest_frame if self._debug_pub is not None else None
+            rows = list(self._latest_rows)
+            # Needed by EITHER image feed — gating on _debug_pub alone left the
+            # clean feed with frame=None forever when only it was enabled.
+            frame = (self._latest_frame
+                     if (self._debug_pub is not None or self._clean_pub is not None)
+                     else None)
 
         self._det_pub.publish(self._build_array(now, dets, 'person'))
         if self._face_pub is not None:
             self._face_pub.publish(self._build_array(now, faces, 'face'))
         if self._identity_pub is not None:
             self._identity_pub.publish(String(data=identity))
+        if self._identities_pub is not None:
+            self._identities_pub.publish(String(data=json.dumps({
+                'faces': [{'track': r['track'], 'identity': r['identity'],
+                           'raw': r['raw'], 'primary': r['primary'],
+                           'cx': round(r['face']['cx'], 1), 'cy': round(r['face']['cy'], 1),
+                           'bw': round(r['face']['bw'], 1), 'bh': round(r['face']['bh'], 1)}
+                          for r in rows]})))
 
         self._status_ticks += 1
         if self._status_ticks % max(1, round(self._det_fps)) == 0:
@@ -765,10 +841,15 @@ class HeadDetectorNode(Node):
             arr.detections.append(det)
         return arr
 
-    def _service_pending_enroll(self, frame, raw_face):
+    def _service_pending_enroll(self, frame, rows):
         """Multi-crop enrolment (capture thread): after an enrol request, keep adding
         good frames for a short window so the person matches across poses rather than
-        one dead-on shot. Only frontal, confident faces are sampled."""
+        one dead-on shot. Only frontal, confident faces are sampled.
+
+        Follows the LATCHED TRACK from the original request, so if someone else steps
+        in closer mid-window their face is not learned under the wrong name. If the
+        tracked face isn't in this frame we simply wait — the deadline still applies.
+        """
         pending = self._enroll_pending
         if not pending or self._recognizer is None:
             return
@@ -778,7 +859,11 @@ class HeadDetectorNode(Node):
             self.get_logger().info(
                 f"enrol '{pending['name']}': {pending['taken']} sample(s) captured")
             return
-        if now < pending['next_at'] or not self._recognizer.quality_ok(raw_face):
+        row = resolve_target(rows, pending['track'])
+        if row is None or now < pending['next_at']:
+            return
+        raw_face = row['face']['_raw']
+        if not self._recognizer.quality_ok(raw_face):
             return
         try:
             if self._recognizer.enroll(pending['name'], frame, raw_face):
@@ -788,32 +873,40 @@ class HeadDetectorNode(Node):
         except Exception as e:  # noqa: BLE001
             self.get_logger().warn(f'enrol sample error: {e}', throttle_duration_sec=5.0)
 
-    def _start_pending_enroll(self, name, taken):
+    def _start_pending_enroll(self, name, taken, track):
         now = time.monotonic()
         interval = self._enroll_seconds / max(1, self._enroll_samples)
         self._enroll_pending = {
             'name': name, 'taken': taken, 'left': max(0, self._enroll_samples - taken),
-            'deadline': now + self._enroll_seconds,
+            'deadline': now + self._enroll_seconds, 'track': track,
             'next_at': now + interval, 'interval': interval,
         }
 
     def _on_enroll_request(self, msg):
-        """Learn the face currently in view as msg.data (a name). Fail-safe.
+        """Learn a face currently in view as a name. Fail-safe.
         Takes one sample now (if the face is good) and collects a few more over the
         next couple of seconds for pose robustness."""
-        name = (msg.data or '').strip().lower()
+        name, target = parse_enroll_request(msg.data)
         with self._lock:
             frame = self._enroll_frame
-            face = self._enroll_face
+            rows = list(self._latest_rows)
         ok = False
         detail = ''
+        row = None
+        # Guard order matters: resolve_target is undefined if the face_recognizer
+        # import failed, and that path must still answer cleanly rather than raise.
         if self._recognizer is None:
             detail = 'recognizer unavailable'
         elif not name:
             detail = 'empty name'
-        elif frame is None or face is None:
+        elif frame is None or not rows:
             detail = 'no face in view'
+        elif (row := resolve_target(rows, target)) is None:
+            # Requested person isn't on screen. Refusing is the whole point: the old
+            # code would have enrolled whoever was closest under this name.
+            detail = f'target {target!r} not in view'
         else:
+            face = row['face']['_raw']
             try:
                 if self._recognizer.quality_ok(face):
                     ok = self._recognizer.enroll(name, frame, face)
@@ -824,13 +917,58 @@ class HeadDetectorNode(Node):
                     ok = True
                     detail = 'face not frontal enough — collecting'
                 if ok and self._enroll_samples > 1:
-                    self._start_pending_enroll(name, 1 if detail == 'enrolled' else 0)
+                    self._start_pending_enroll(
+                        name, 1 if detail == 'enrolled' else 0, row['track'])
             except Exception as e:  # noqa: BLE001
                 detail = f'error: {e}'
-        self.get_logger().info(f"enroll_request '{name}': {detail}")
+        self.get_logger().info(
+            f"enroll_request '{name}'"
+            + (f" (target {target!r})" if target is not None else '')
+            + f": {detail}")
         if self._enroll_result_pub is not None:
             self._enroll_result_pub.publish(String(data=json.dumps(
-                {'name': name, 'ok': bool(ok), 'detail': detail})))
+                {'name': name, 'ok': bool(ok), 'detail': detail,
+                 'track': row['track'] if row else None})))
+
+    def _publish_clean(self, stamp, frame):
+        """JPEG the frame with NOTHING drawn on it, throttled to clean_image_fps.
+
+        Deliberately does not copy the frame — unlike _publish_annotated we never
+        mutate it, and cv2.imencode does not either.
+        """
+        if self._clean_fps > 0.0:
+            nowm = time.monotonic()
+            if (nowm - self._clean_last) < (1.0 / self._clean_fps):
+                return
+            self._clean_last = nowm
+
+        # Downscale before encoding. INTER_AREA is the right filter for shrinking.
+        # 0 disables.
+        #
+        # Sizing measured 2026-07-18 by interleaved A/B on IDENTICAL frames (so API
+        # drift hits both arms equally):
+        #   1280px/100KB ~2.0s   848px/55KB 0.99s median   640px/36KB 0.77s median
+        # Production runs 848 (= native capture, no downscale): +0.22s over 640 buys
+        # 1.8x the pixels, which is the difference between reading a drink can label
+        # at desk distance and just seeing a cylinder. Small objects were the real
+        # constraint here, not room-scale description -- both sizes describe a room
+        # equally well, so the earlier 640 default looked fine until someone asked
+        # about something small.
+        if self._clean_max_w > 0 and frame.shape[1] > self._clean_max_w:
+            scale = self._clean_max_w / float(frame.shape[1])
+            frame = cv2.resize(frame, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA)
+
+        ok, buf = cv2.imencode('.jpg', frame,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), self._clean_quality])
+        if not ok:
+            return
+        m = CompressedImage()
+        m.header.stamp = stamp
+        m.header.frame_id = self._frame_id
+        m.format = 'jpeg'
+        m.data = buf.tobytes()
+        self._clean_pub.publish(m)
 
     def _publish_annotated(self, stamp, frame, dets, faces):
         """Draw person boxes (green) + face boxes (cyan) on the frame, JPEG it."""

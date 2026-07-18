@@ -31,6 +31,7 @@ THREAD SAFETY (read this before editing):
   call _set_state() and nav action client methods — all thread-safe.
 """
 
+import json
 import os
 import threading
 import time
@@ -511,8 +512,19 @@ class BehaviorNode(Node):
         name = (name or '').strip().lower()
         if not name:
             return False
-        self._enroll_pub.publish(String(data=name))
         prev = self._session_person
+        # Target the person we are TALKING TO, not whoever is closest to the camera.
+        # remember_person means "the one I'm conversing with is called X"; with two
+        # people in frame the speaker often isn't the largest face, and a bare name
+        # tells the recognizer to grab the primary face. That is how a daughter's
+        # name was learned onto her father's face — he was simply nearer the lens.
+        # Only an anonymous unknown_N is a meaningful target; otherwise fall back to
+        # the legacy bare-name (primary face) form.
+        if prev and prev.startswith('unknown'):
+            request = json.dumps({'name': name, 'target': prev})
+        else:
+            request = name
+        self._enroll_pub.publish(String(data=request))
         # Carry over this person's existing memories: if they were an anonymous
         # unknown_N, re-label those records to the new name (persisted unknowns keep
         # the same id across reboots, so this merges their whole history).

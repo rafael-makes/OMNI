@@ -94,6 +94,223 @@ class IdentitySmoother:
         return self._current
 
 
+def _box_iou(a, b):
+    """Intersection-over-union of two face dicts ({x1,y1,x2,y2,bw,bh})."""
+    ix1, iy1 = max(a['x1'], b['x1']), max(a['y1'], b['y1'])
+    ix2, iy2 = min(a['x2'], b['x2']), min(a['y2'], b['y2'])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = a['bw'] * a['bh'] + b['bw'] * b['bh'] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def clean_person_name(value):
+    """Normalise an enrol name, or return '' if it isn't usable as one.
+
+    A name becomes a DIRECTORY under the gallery dir, so this is a safety boundary as
+    much as a tidy-up: anything with a path separator, '..', or other punctuation is
+    rejected rather than sanitised, so a malformed request can never write outside the
+    gallery or enrol a junk label like '[1,2,3]'.
+    """
+    text = str(value or '').strip().lower()
+    if not text or len(text) > 64:
+        return ''
+    if not all(c.isalnum() or c in (' ', '_', '-') for c in text):
+        return ''
+    if not any(c.isalnum() for c in text):
+        return ''
+    # 'unknown' is the anonymous id space (unknown_N), not a person. The model will
+    # happily call remember_person("unknown") as a placeholder when it never caught a
+    # name — that created a real gallery entry named 'unknown' holding a real face.
+    if text == 'unknown' or text.startswith('unknown_'):
+        return ''
+    return text
+
+
+def parse_enroll_request(data):
+    """Parse a /camera/enroll_request payload into (name, target).
+
+    Accepts either a bare name — legacy form, meaning 'enrol the primary face' —
+    or JSON naming WHICH visible face to learn:
+        "alice"                              -> ('alice', None)
+        {"name": "alice", "target": "unknown_3"}  -> ('alice', 'unknown_3')
+        {"name": "alice", "track": 2}            -> ('alice', 2)
+    A malformed payload yields ('', None), which callers reject as an empty name.
+    """
+    import json as _json
+    text = (data or '').strip()
+    if not text.startswith('{'):
+        return clean_person_name(text), None
+    try:
+        obj = _json.loads(text)
+    except ValueError:
+        return '', None
+    if not isinstance(obj, dict):
+        return '', None
+    name = clean_person_name(obj.get('name'))
+    if obj.get('track') is not None:
+        try:
+            return name, int(obj['track'])
+        except (TypeError, ValueError):
+            return name, None
+    target = obj.get('target')
+    return name, (str(target).strip().lower() if target else None)
+
+
+def resolve_target(rows, target):
+    """Pick the face row a caller means: an identity (str), a track id (int), or —
+    when target is None — the primary (largest) face.
+
+    Returns None when the requested person is NOT among `rows`. Callers must treat
+    None as 'refuse'; substituting the closest face is precisely the wrong-person
+    enrolment bug this lookup exists to prevent.
+
+    Lives at module level because both the tracker and the node's enrol path (which
+    works on a locked snapshot of rows) need exactly this rule.
+    """
+    if not rows:
+        return None
+    if target is None or target == '':
+        return rows[0]                      # rows are largest-face-first
+    key = 'track' if isinstance(target, int) and not isinstance(target, bool) else 'identity'
+    for row in rows:
+        if row[key] == target:
+            return row
+    return None
+
+
+class _Track:
+    """One face followed across frames, with its OWN identity vote."""
+
+    __slots__ = ('id', 'face', 'smoother', 'missed', 'raw')
+
+    def __init__(self, tid, face, window, switch_ratio):
+        self.id = tid
+        self.face = face
+        self.smoother = IdentitySmoother(window=window, switch_ratio=switch_ratio)
+        self.missed = 0
+        self.raw = ''
+
+
+class FaceTracker:
+    """Associates faces frame-to-frame by IoU and smooths each track separately.
+
+    Why per-track: a single global IdentitySmoother implicitly assumes ONE face in
+    frame. With two people the votes interleave in one window, so whoever happens to
+    be recognised more often that second wins — a second person walking past could
+    flip the published identity of the person actually talking. Each track now votes
+    only on its own recognitions.
+
+    This also gives every visible face a stable handle, which is what lets enrolment
+    name a SPECIFIC person instead of whoever is closest to the camera.
+
+    The identify step is injected (identify_fn) so this class stays free of SFace and
+    can be unit-tested without models or a camera.
+    """
+
+    def __init__(self, iou_threshold=0.3, max_missed=8, window=15, switch_ratio=0.6,
+                 primary_hold=12):
+        self._iou_thr = float(iou_threshold)
+        self._max_missed = int(max_missed)
+        self._window = int(window)
+        self._ratio = float(switch_ratio)
+        self._primary_hold = int(primary_hold)
+        self._tracks = []          # list[_Track], live
+        self._next_id = 1
+        self._latest = []          # last update()'s result rows, largest face first
+        # Last confident primary id + how many frames we've coasted on it. A face
+        # whose box jumps far enough to fail IoU lands on a NEW track with an empty
+        # vote; without this the published identity would blink to '' on every such
+        # handover (seen live as short-lived tracks beside a stable one).
+        self._held_id = ''
+        self._held_frames = 0
+
+    def update(self, faces, identify_fn):
+        """Advance one frame.
+
+        faces: list of face dicts (largest-first order is imposed here, not assumed).
+        identify_fn(face) -> raw id string for that face this frame.
+
+        Returns rows [{'track', 'identity', 'raw', 'face', 'primary'}], largest face
+        first; 'identity' is that track's SMOOTHED id, 'raw' this frame's unsmoothed
+        one. The single largest face is flagged primary — that is the one whose id
+        goes out on /camera/identity, preserving the pre-multi-face contract.
+        """
+        ordered = sorted(faces, key=lambda f: -(f['bw'] * f['bh']))
+        unmatched = list(self._tracks)
+        rows = []
+
+        for face in ordered:
+            best, best_iou = None, self._iou_thr
+            for track in unmatched:
+                iou = _box_iou(face, track.face)
+                if iou >= best_iou:
+                    best, best_iou = track, iou
+            if best is None:
+                best = _Track(self._next_id, face, self._window, self._ratio)
+                self._next_id += 1
+                self._tracks.append(best)
+            else:
+                unmatched.remove(best)
+            best.face = face
+            best.missed = 0
+            try:
+                best.raw = identify_fn(face) or ''
+            except Exception:  # noqa: BLE001 - a bad frame must not kill tracking
+                best.raw = ''
+            rows.append({'track': best.id, 'identity': best.smoother.update(best.raw),
+                         'raw': best.raw, 'face': face, 'primary': False})
+
+        # Tracks nobody matched this frame: tolerate a short dropout (a blink, a turn)
+        # before forgetting them, so a track id survives brief detection gaps.
+        for track in unmatched:
+            track.missed += 1
+        self._tracks = [t for t in self._tracks if t.missed <= self._max_missed]
+
+        if rows:
+            rows[0]['primary'] = True
+        self._latest = rows
+
+        # Carry the last confident primary id across a track handover, but only for a
+        # bounded number of frames so a person who actually leaves is released.
+        primary = rows[0]['identity'] if rows else ''
+        if primary:
+            self._held_id, self._held_frames = primary, 0
+        elif self._held_id:
+            self._held_frames += 1
+            if self._held_frames > self._primary_hold:
+                self._held_id, self._held_frames = '', 0
+        return rows
+
+    def primary_identity(self):
+        """Smoothed id of the largest face, or '' when nobody is resolved.
+
+        Briefly holds the previous id across a track handover (see _held_id) so this —
+        the value published on /camera/identity — stays as steady as it was before
+        faces were tracked individually.
+        """
+        if self._latest and self._latest[0]['identity']:
+            return self._latest[0]['identity']
+        return self._held_id
+
+    def find(self, target):
+        """Locate a currently-visible face by identity (str) or track id (int).
+
+        Returns its row, or None when that person is not in view — callers must treat
+        None as 'refuse', never as 'fall back to the closest face'. Unlike
+        resolve_target(), an empty target matches nothing here: find() is always a
+        lookup for someone SPECIFIC.
+        """
+        if target is None or target == '':
+            return None
+        return resolve_target(self._latest, target)
+
+    @property
+    def rows(self):
+        """Last frame's rows (largest face first)."""
+        return list(self._latest)
+
+
 class FaceRecognizer:
     def __init__(self, sface_model, yunet_model, gallery_dir, logger,
                  *, unknown_dir=None, match_threshold=_DEFAULT_THRESHOLD,
@@ -243,9 +460,16 @@ class FaceRecognizer:
 
     # ── live recognition ────────────────────────────────────────────────────────
 
-    def identify(self, frame, raw_face):
+    def identify(self, frame, raw_face, register=True):
         """Resolve a face (a raw YuNet row, [15]) in `frame` to a person id.
-        Returns a known name, a stable 'unknown_N', or '' on any failure."""
+        Returns a known name, a stable 'unknown_N', or '' on any failure.
+
+        register=False resolves against people we already know but never mints a new
+        unknown_N. Callers pass False for non-primary faces: once every visible face
+        is identified (not just the closest), marginal and spurious detections would
+        otherwise each mint a junk identity — measured at ~10 new unknowns in 4
+        minutes with a single real person in the room.
+        """
         if not self._ok:
             return ""
         try:
@@ -269,8 +493,9 @@ class FaceRecognizer:
                 return f"unknown_{uid}"
 
         # No match. Only mint a NEW unknown for a good, frontal face — a turned or
-        # distant face embeds poorly and would otherwise spawn endless junk ids.
-        if not self.quality_ok(raw_face):
+        # distant face embeds poorly and would otherwise spawn endless junk ids —
+        # and only for the primary face (see `register`).
+        if not register or not self.quality_ok(raw_face):
             return ""
         uid = self._next_unknown
         self._next_unknown += 1
