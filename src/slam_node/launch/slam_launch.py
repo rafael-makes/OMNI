@@ -161,7 +161,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'slam_params_file', default_value=params_file,
             description='Path to slam_toolbox params YAML'),
-        LogInfo(msg='OMNI slam_node starting — map→odom→base_link, LiDAR z=0.38m'),
+        LogInfo(msg='OMNI slam_node starting — map→odom→base_link, LiDAR z=1.210m'),
         lidar_tf,
         # oak_tf removed — Jetson depthai driver now publishes base_link->oak (see above)
         *tof_tfs,

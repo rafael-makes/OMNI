@@ -32,11 +32,15 @@ def generate_launch_description():
     use_sim_time         = LaunchConfiguration('use_sim_time', default='false')
     map_file             = LaunchConfiguration('map_file', default=DEFAULT_MAP)
 
+    # Must stay in sync with slam_launch.py's base_to_lidar. Raised 0.825 -> 1.210
+    # on 2026-07-19 to match; the 2026-07-07 mast change updated slam_launch.py only,
+    # so normal bring-up (which includes THIS file, not slam_launch.py) had been
+    # publishing the pre-change height for ~12 days.
     lidar_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='base_to_lidar',
-        arguments=['0', '0', '0.825', '0', '0', '0',
+        arguments=['0', '0', '1.210', '0', '0', '0',
                    'base_link', 'lidar_link'],
         output='screen',
     )
