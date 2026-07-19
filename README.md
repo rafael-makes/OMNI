@@ -59,7 +59,24 @@ lgpio
 picamera2   # only needed by the decommissioned camera_node
 ```
 
-Build the workspace (on the Pi — `jetson/` is skipped via `COLCON_IGNORE`):
+### External ROS2 packages
+
+Upstream sources (Nav2, slam_toolbox, BehaviorTree.CPP, foxglove_bridge, …) live in
+`src/` but are **not tracked here** — they have their own git repos. `omni.repos` pins
+what each was built from. From a fresh clone:
+
+```bash
+cd ~/omni_ws
+vcs import src < omni.repos                                    # sudo apt install python3-vcstool
+patch -d src/slam_toolbox -p1 < patches/slam_toolbox-headless.patch
+```
+
+The slam_toolbox patch is **not optional** — it makes the RViz2 plugin conditional so
+the package configures without Qt5/rviz2, which the headless Pi doesn't have.
+
+### Build
+
+On the Pi (`jetson/` is skipped via `COLCON_IGNORE`):
 
 ```bash
 cd ~/omni_ws

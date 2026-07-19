@@ -1,0 +1,231 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3880aa7..d7384e2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,14 +29,19 @@ find_package(lifecycle_msgs REQUIRED)
+ find_package(bondcpp REQUIRED)
+ find_package(bond REQUIRED)
+ find_package(rclcpp_lifecycle REQUIRED)
+-find_package(rviz_common REQUIRED)
+-find_package(rviz_default_plugins REQUIRED)
+-find_package(rviz_ogre_vendor REQUIRED)
+-find_package(rviz_rendering REQUIRED)
+-find_package(interactive_markers REQUIRED)
+-find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets Test Concurrent)
+ find_package(rclcpp_components REQUIRED)
+ 
++# RViz plugin is optional — not needed on headless robots
++option(BUILD_RVIZ_PLUGIN "Build RViz2 plugin (requires Qt5 and rviz2)" OFF)
++if(BUILD_RVIZ_PLUGIN)
++  find_package(rviz_common REQUIRED)
++  find_package(rviz_default_plugins REQUIRED)
++  find_package(rviz_ogre_vendor REQUIRED)
++  find_package(rviz_rendering REQUIRED)
++  find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets Test Concurrent)
++endif()
++find_package(interactive_markers QUIET)
++
+ #karto_sdk lib
+ set(BUILD_SHARED_LIBS ON)
+ add_subdirectory(lib/karto_sdk)
+@@ -61,18 +66,18 @@ set(dependencies
+   bondcpp
+   bond
+   lifecycle_msgs
+-  rviz_common
+-  rviz_default_plugins
+-  rviz_ogre_vendor
+-  rviz_rendering
+-  interactive_markers
+-  Qt5
+   rclcpp_components
+ )
+ 
++if(BUILD_RVIZ_PLUGIN)
++  list(APPEND dependencies rviz_common rviz_default_plugins rviz_ogre_vendor rviz_rendering Qt5)
++endif()
++if(interactive_markers_FOUND)
++  list(APPEND dependencies interactive_markers)
++endif()
++
+ set(libraries
+     toolbox_common
+-    SlamToolboxPlugin
+     ceres_solver_plugin
+     async_slam_toolbox
+     sync_slam_toolbox
+@@ -80,6 +85,9 @@ set(libraries
+     lifelong_slam_toolbox
+     map_and_localization_slam_toolbox
+ )
++if(BUILD_RVIZ_PLUGIN)
++  list(APPEND libraries SlamToolboxPlugin)
++endif()
+ 
+ find_package(PkgConfig REQUIRED)
+ find_package(Eigen3 REQUIRED)
+@@ -90,7 +98,9 @@ find_package(LAPACK REQUIRED)
+ find_package(Ceres REQUIRED COMPONENTS SuiteSparse)
+ 
+ set(CMAKE_INCLUDE_CURRENT_DIR ON)
+-add_definitions(-DQT_NO_KEYWORDS)
++if(BUILD_RVIZ_PLUGIN)
++  add_definitions(-DQT_NO_KEYWORDS)
++endif()
+ find_package(Boost REQUIRED system serialization filesystem thread)
+ 
+ include_directories(include lib/karto_sdk/include
+@@ -117,7 +127,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
+   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs nav_msgs visualization_msgs
+ )
+ 
+-#### rviz Plugin
++#### rviz Plugin (optional — disabled on headless builds)
++if(BUILD_RVIZ_PLUGIN)
+ qt5_wrap_cpp(MOC_FILES rviz_plugin/slam_toolbox_rviz_plugin.hpp)
+ add_library(SlamToolboxPlugin SHARED
+   rviz_plugin/slam_toolbox_rviz_plugin.cpp
+@@ -135,6 +146,7 @@ target_link_libraries(SlamToolboxPlugin "${cpp_typesupport_target}")
+ target_compile_definitions(SlamToolboxPlugin PUBLIC "PLUGINLIB__DISABLE_BOOST_FUNCTIONS")
+ target_compile_definitions(SlamToolboxPlugin PRIVATE "RVIZ_DEFAULT_PLUGINS_BUILDING_LIBRARY")
+ pluginlib_export_plugin_description_file(rviz_common rviz_plugins.xml)
++endif()  # BUILD_RVIZ_PLUGIN
+ 
+ #### Ceres Plugin
+ add_library(ceres_solver_plugin solvers/ceres_solver.cpp)
+@@ -182,9 +194,11 @@ target_link_libraries(map_and_localization_slam_toolbox localization_slam_toolbo
+ add_executable(map_and_localization_slam_toolbox_node src/experimental/slam_toolbox_map_and_localization_node.cpp)
+ target_link_libraries(map_and_localization_slam_toolbox_node map_and_localization_slam_toolbox)
+ 
+-#### Merging maps tool
++#### Merging maps tool (requires interactive_markers)
++if(interactive_markers_FOUND)
+ add_executable(merge_maps_kinematic src/merge_maps_kinematic.cpp)
+ target_link_libraries(merge_maps_kinematic kartoSlamToolbox toolbox_common)
++endif()  # interactive_markers_FOUND
+ 
+ #### testing
+ #if(BUILD_TESTING)
+@@ -203,19 +217,32 @@ rclcpp_components_register_nodes(lifelong_slam_toolbox "slam_toolbox::LifelongSl
+ rclcpp_components_register_nodes(map_and_localization_slam_toolbox "slam_toolbox::MapAndLocalizationSlamToolbox")
+ 
+ #### Install
+-install(TARGETS async_slam_toolbox_node
+-                sync_slam_toolbox_node
+-                localization_slam_toolbox_node
+-                map_and_localization_slam_toolbox_node
+-                lifelong_slam_toolbox_node
+-                merge_maps_kinematic
+-                ${libraries}
+-                kartoSlamToolbox
++set(_install_targets
++  async_slam_toolbox_node
++  sync_slam_toolbox_node
++  localization_slam_toolbox_node
++  map_and_localization_slam_toolbox_node
++  lifelong_slam_toolbox_node
++  async_slam_toolbox
++  sync_slam_toolbox
++  localization_slam_toolbox
++  lifelong_slam_toolbox
++  map_and_localization_slam_toolbox
++  ceres_solver_plugin
++  toolbox_common
++  kartoSlamToolbox
++)
++if(interactive_markers_FOUND)
++  list(APPEND _install_targets merge_maps_kinematic)
++endif()
++
++install(TARGETS ${_install_targets}
+   ARCHIVE DESTINATION lib
+   LIBRARY DESTINATION lib
+   RUNTIME DESTINATION lib/${PROJECT_NAME}
+ )
+ 
++if(BUILD_RVIZ_PLUGIN)
+ install(TARGETS SlamToolboxPlugin
+   EXPORT SlamToolboxPlugin
+   ARCHIVE DESTINATION lib
+@@ -223,6 +250,7 @@ install(TARGETS SlamToolboxPlugin
+   RUNTIME DESTINATION bin
+   INCLUDES DESTINATION include
+ )
++endif()
+ 
+ install(DIRECTORY include/
+   DESTINATION include
+@@ -237,12 +265,17 @@ install(DIRECTORY config
+   DESTINATION share/${PROJECT_NAME}
+ )
+ 
+-install(FILES solver_plugins.xml rviz_plugins.xml
+-  DESTINATION share
++install(FILES solver_plugins.xml
++  DESTINATION share/${PROJECT_NAME}
+ )
++if(BUILD_RVIZ_PLUGIN)
++  install(FILES rviz_plugins.xml DESTINATION share/${PROJECT_NAME})
++endif()
+ 
+ ament_export_include_directories(include)
+ ament_export_libraries(${libraries} kartoSlamToolbox)
+ ament_export_dependencies(${dependencies})
+-ament_export_targets(SlamToolboxPlugin HAS_LIBRARY_TARGET)
++if(BUILD_RVIZ_PLUGIN)
++  ament_export_targets(SlamToolboxPlugin HAS_LIBRARY_TARGET)
++endif()
+ ament_package()
+diff --git a/package.xml b/package.xml
+index 07bfc33..fd8ff87 100644
+--- a/package.xml
++++ b/package.xml
+@@ -32,19 +32,12 @@
+   <build_depend>libceres-dev</build_depend>
+   <build_depend>tf2_geometry_msgs</build_depend>
+   <build_depend>tbb</build_depend>
+-  <build_depend>libqt5-core</build_depend>
+-  <build_depend>libqt5-widgets</build_depend>
+-  <build_depend>qtbase5-dev</build_depend>
+   <build_depend>builtin_interfaces</build_depend>
+   <build_depend>rosidl_default_generators</build_depend>
+   <build_depend>lifecycle_msgs</build_depend>
+   <build_depend>bondcpp</build_depend>
+   <build_depend>bond</build_depend>
+   <build_depend>rclcpp_lifecycle</build_depend>
+-  <depend>rviz_common</depend>
+-  <depend>rviz_default_plugins</depend>
+-  <depend>rviz_ogre_vendor</depend>
+-  <depend>rviz_rendering</depend>
+   <exec_depend>eigen</exec_depend>
+   <exec_depend>pluginlib</exec_depend>
+   <exec_depend>message_filters</exec_depend>
+@@ -64,8 +57,6 @@
+   <exec_depend>libceres-dev</exec_depend>
+   <exec_depend>tf2_geometry_msgs</exec_depend>
+   <exec_depend>tbb</exec_depend>
+-  <exec_depend>libqt5-core</exec_depend>
+-  <exec_depend>libqt5-widgets</exec_depend>
+   <exec_depend>builtin_interfaces</exec_depend>
+   <exec_depend>rosidl_default_generators</exec_depend>
+   <exec_depend>lifecycle_msgs</exec_depend>
+@@ -73,11 +64,6 @@
+   <exec_depend>bond</exec_depend>
+   <exec_depend>rclcpp_lifecycle</exec_depend>
+ 
+-  <exec_depend>libqt5-core</exec_depend>
+-  <exec_depend>libqt5-gui</exec_depend>
+-  <exec_depend>libqt5-opengl</exec_depend>
+-  <exec_depend>libqt5-widgets</exec_depend>
+-
+   <test_depend>ament_cmake_gtest</test_depend>
+   <test_depend>launch</test_depend>
+   <test_depend>launch_testing</test_depend>
+@@ -91,7 +77,6 @@
+   <export>
+     <build_type>ament_cmake</build_type>
+     <slam_toolbox plugin="${prefix}/solver_plugins.xml" />
+-    <rviz_common plugin="${prefix}/rviz_plugins.xml"/>
+   </export>
+ 
+ </package>

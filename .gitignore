@@ -4,6 +4,7 @@ install/
 log/
 
 # External dependency packages (have their own git repos)
+# Pinned versions live in omni.repos — `vcs import src < omni.repos` restores them.
 src/navigation2/
 src/slam_toolbox/
 src/BehaviorTree.CPP/
@@ -20,6 +21,8 @@ src/interactive_markers/
 src/laser_geometry/
 src/vision_msgs/
 src/apriltag_msgs/
+src/ros-foxglove-bridge/
+src/teleop_twist_keyboard/
 
 # Python
 __pycache__/
