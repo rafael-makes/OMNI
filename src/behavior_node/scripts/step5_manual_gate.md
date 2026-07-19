@@ -37,6 +37,10 @@ Confirm in the log: `omni_memory ready …` and (from behavior_node)
   `retrieve_memories service unavailable`); no hang beyond the ~2 s timeout.
 
 ## Notes
-- Person is unknown until Step 6 (face recognition); memories store as
-  general/household and retrieval is seeded by the configurable `memory_seed_query`.
-- Toggle off entirely with `memory_enabled:=false`.
+- **Step 6 has since shipped** (face recognition on the Jetson), so this gate no
+  longer runs person-less. If `head_detector` is up and recognises you, memories are
+  keyed to your person id rather than general/household. To exercise the original
+  Step 5 path in isolation, leave the Jetson vision stack down — `/camera/identity`
+  goes unpublished, person stays null, and retrieval falls back to the configurable
+  `memory_seed_query`.
+- Toggle memory off entirely with `memory_enabled:=false`.

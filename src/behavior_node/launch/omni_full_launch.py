@@ -3,10 +3,12 @@ omni_full_launch.py — Complete OMNI robot bring-up.
 
 Starts the full stack in dependency order:
 
-  t=0s   Sensor nodes      — motor_control, imu, lidar, tof
+  t=0s   Sensor nodes      — motor_control, yaw_fusion, imu, lidar, tof
                              (person detection runs on the Jetson, not here)
-  t=0s   Support nodes     — bms, safety, eye, servo, chest
+  t=0s   Support nodes     — bms, safety, stall_recovery, eye, servo, chest
   t=0s   Static TFs        — base_link→imu_link, base_link→camera_link
+  ~t=0s  Floor resolution  — AprilTag dock → BMP280 fallback picks map_file
+                             (blocks ~6s), then baro_node starts
   t=0s   slam_toolbox      — spawned but self-managed via slam_launch.py TimerActions:
   t=3s     └─ configure
   t=8s     └─ activate  ← /map and map→odom TF live from here
@@ -15,12 +17,15 @@ Starts the full stack in dependency order:
   t=0s   omni_memory       — persistent memory layer (Supabase over WireGuard);
                              behavior_node retrieves on wake / stores at chat end
 
-TF tree:
+TF tree (heights updated 2026-07-07 when OMNI was made taller):
   map → odom             slam_toolbox (async_slam_toolbox_node)
-  odom → base_link       motor_control_node (TransformBroadcaster)
-  base_link → lidar_link static_transform_publisher inside slam_launch.py (z=0.38m)
-  base_link → imu_link   static_transform_publisher (this file)
-  base_link → camera_link static_transform_publisher (this file)
+  odom → base_link       yaw_fusion_node (motor_control publish_tf=False)
+  base_link → lidar_link static_transform_publisher inside the included slam pkg
+                         launch — localization_launch.py on this path, NOT
+                         slam_launch.py (mapping). See the z-mismatch note below.
+  base_link → imu_link   static_transform_publisher (this file, z=0.625m)
+  base_link → camera_link static_transform_publisher (this file, z=1.075m)
+  base_link → oak        published by the Jetson's depthai driver
 
 cmd_vel chain (safety-gated):
   Nav2/behavior_server → /cmd_vel_raw → safety_node → /cmd_vel → motor_control_node
@@ -179,8 +184,14 @@ def generate_launch_description():
     )
 
     # ── Static transforms ──────────────────────────────────────────────────────
-    # base_link → lidar_link is handled inside slam_launch.py (z=0.38m, centred).
-    # Update x/y/z below once you measure the actual mounting positions on hardware.
+    # base_link → lidar_link is handled inside the included slam pkg launch, which on
+    # THIS path is localization_launch.py (see slam_include below), not slam_launch.py.
+    # Both slam pkg launches now publish z=1.210m. They had diverged: the 2026-07-07
+    # mast change updated slam_launch.py only, leaving localization_launch.py — the one
+    # THIS file includes — on the old 0.825m for ~12 days. Keep the two in sync.
+    #
+    # Heights below are measured, not placeholders — updated 2026-07-07. Re-measure if
+    # the mast changes again; the old map is stale.
 
     imu_tf = Node(
         package='tf2_ros',
