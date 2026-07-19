@@ -1,11 +1,23 @@
-# Fetch the most recent frame from a camera on the Jetson, JPEG-encoded.
+# Fetch the most recent frame(s) from a camera on the Jetson, JPEG-encoded.
 #
 # Served by frame_server on the Jetson; called by behavior_node on the Pi over
-# the direct 192.168.50.0/24 link. The reply carries the whole image, so keep
-# the JPEG modest — see frame_server's jpeg_quality / capture resolution.
-string camera_id           # which camera; "" -> "head"
+# the direct 192.168.50.0/24 link. The reply carries whole images, so keep the
+# JPEGs modest — see frame_server's jpeg_quality / capture resolution. An "all"
+# request returns every camera in ONE reply, which is the point: the fusion
+# prompt needs simultaneous views, and two sequential fetches would not be.
+string camera_id           # "head" | "rear" | "all"; "" -> "head"
 ---
 bool success
+
+# AUTHORITATIVE. One entry per camera served, in a stable order (head first).
+# A single-camera request returns exactly one entry.
+CameraFrame[] frames
+
+# ── Legacy single-frame fields ────────────────────────────────────────────────
+# Mirror frames[0]. Kept so a client built against the pre-multi-camera version
+# of this service keeps working unchanged against a new server — the Pi and the
+# Jetson are separate machines with separate builds, and they do not necessarily
+# get rebuilt in the same minute. New code should read frames[] instead.
 uint8[] jpeg               # JPEG bytes (empty on failure)
 uint32 width               # pixels; 0 if unknown
 uint32 height

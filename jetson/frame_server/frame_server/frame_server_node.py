@@ -1,14 +1,28 @@
-"""frame_server_node.py — serve the newest camera frame as JPEG, on demand.
+"""frame_server_node.py — serve the newest camera frame(s) as JPEG, on demand.
 
-Runs on the Jetson. head_detector owns the camera exclusively (cv2.VideoCapture),
-so this node never touches the device: it subscribes to the clean JPEG feed
-head_detector publishes, keeps only the most recent message, and hands it back
-over the GetCameraFrame service.
+Runs on the Jetson. Each camera has exactly ONE owner process that holds the
+V4L2 device (head_detector for the head cam, rear_camera for the rear cam), so
+this node never touches a device: it subscribes to the clean JPEG feeds those
+nodes publish, keeps only the most recent message per camera, and hands them
+back over the GetCameraFrame service.
 
-  /camera/image_clean/compressed  (CompressedImage) ──► [cache] ──► GetCameraFrame
+  /camera/image_clean/compressed       ──┐
+                                         ├─► [cache] ──► GetCameraFrame
+  /camera/rear/image_clean/compressed  ──┘
 
 The subscribe side is Jetson-local, so it costs nothing on the wire; only the
 service reply crosses the 192.168.50.0/24 link to the Pi.
+
+MULTI-CAMERA
+  camera_id is "head", "rear", or "all". "all" returns every camera that has a
+  live frame in ONE reply, which is the point — behavior_node's fusion prompt
+  describes the room as a single scene, and two sequential fetches would not be
+  simultaneous views. Order is stable (head first) so the fusion prompt can name
+  the views, though each frame also carries its own camera_id.
+
+  A partial "all" is a SUCCESS, not a failure: if the rear feed is down, OMNI
+  describing only what is in front of it beats OMNI saying it cannot see. The
+  reply's message names which cameras were missing so the caller can say so.
 
 WHY A CACHE RATHER THAN A GRAB
   The Pi asks for a frame in the middle of a spoken conversation, on a ~3 second
@@ -31,9 +45,17 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import CompressedImage
 
+from omni_vision_msgs.msg import CameraFrame
 from omni_vision_msgs.srv import GetCameraFrame
 
 DEFAULT_CAMERA = 'head'
+ALL_CAMERAS = 'all'
+
+# Stable, meaningful order: head first. behavior_node's fusion prompt introduces
+# the views in this order ("head camera ... rear camera"), and a caller that
+# ignores camera_id and just takes frames[0] gets the forward view, which is the
+# sane default. Cameras absent from the cache are skipped, not reordered.
+CAMERA_ORDER = ('head', 'rear')
 
 
 class FrameServerNode(Node):
@@ -41,15 +63,21 @@ class FrameServerNode(Node):
     def __init__(self):
         super().__init__('frame_server')
 
-        # camera_id -> topic. One entry today; the rear IMX219 used for dock
-        # approach is the obvious second, hence the id in the request rather
-        # than a single hardcoded camera.
+        # camera_id -> topic. Both feeds come from whichever node owns that
+        # device; this one only ever subscribes.
         self.declare_parameter('head_topic', '/camera/image_clean/compressed')
+        self.declare_parameter('rear_topic', '/camera/rear/image_clean/compressed')
+        # Set false to run head-only (e.g. rear_camera is not launched). The
+        # subscription is harmless either way, but this keeps 'rear' and 'all'
+        # honestly reporting "not configured" rather than "no frame yet".
+        self.declare_parameter('rear_enabled', True)
         # Refuse anything older than this. Slightly generous relative to the
         # default 2 Hz publish rate so a single dropped frame is not an error.
         self.declare_parameter('max_frame_age', 5.0)
 
         head_topic = str(self.get_parameter('head_topic').value)
+        rear_topic = str(self.get_parameter('rear_topic').value)
+        rear_enabled = bool(self.get_parameter('rear_enabled').value)
         self._max_age = float(self.get_parameter('max_frame_age').value)
 
         # Newest frame per camera, under a lock: the subscription callback and the
@@ -65,6 +93,8 @@ class FrameServerNode(Node):
                                 durability=DurabilityPolicy.VOLATILE)
 
         self._topics = {DEFAULT_CAMERA: head_topic}
+        if rear_enabled:
+            self._topics['rear'] = rear_topic
         for camera_id, topic in self._topics.items():
             self.create_subscription(
                 CompressedImage, topic,
@@ -89,51 +119,98 @@ class FrameServerNode(Node):
         msg_ns = stamp.sec * 10**9 + stamp.nanosec
         return (self.get_clock().now().nanoseconds - msg_ns) / 1e9
 
+    def _owner_hint(self, camera_id: str) -> str:
+        """Which node to go look at when a feed is missing.
+
+        Worth spelling out in the error: the two feeds have different owners and
+        different enabling flags, and 'no frame' otherwise sends you to the wrong
+        node entirely.
+        """
+        if camera_id == 'rear':
+            return 'is rear_camera running with publish_clean_image:=true?'
+        return 'is head_detector running with publish_clean_image:=true?'
+
+    def _take(self, camera_id: str):
+        """Newest usable frame for one camera -> (CameraFrame, age) or (None, why)."""
+        with self._lock:
+            msg = self._frames.get(camera_id)
+
+        if msg is None:
+            return None, f'no frame received yet on {self._topics[camera_id]} — ' \
+                         f'{self._owner_hint(camera_id)}'
+
+        age = self._age_seconds(msg)
+        if age > self._max_age:
+            # A cache outlives its publisher. Serving a minute-old picture would
+            # have OMNI confidently describing a room it has already left.
+            return None, (f'newest {camera_id} frame is {age:.1f}s old '
+                          f'(limit {self._max_age}s) — that feed has stopped')
+
+        frame = CameraFrame()
+        frame.camera_id = camera_id
+        frame.jpeg = msg.data
+        frame.stamp = msg.header.stamp
+        frame.age_seconds = float(age)
+        # Dimensions would need a JPEG decode to read; not worth the CPU on this
+        # path, and the caller does not need them. 0 documented as "unknown".
+        frame.width = 0
+        frame.height = 0
+        return frame, age
+
     def _on_request(self, request, response):
         camera_id = (request.camera_id or '').strip().lower() or DEFAULT_CAMERA
 
-        if camera_id not in self._topics:
-            known = ', '.join(sorted(self._topics))
+        if camera_id == ALL_CAMERAS:
+            wanted = [c for c in CAMERA_ORDER if c in self._topics]
+        elif camera_id in self._topics:
+            wanted = [camera_id]
+        else:
+            known = ', '.join(sorted(self._topics) + [ALL_CAMERAS])
             response.success = False
             response.message = f"unknown camera_id '{camera_id}' (known: {known})"
             self.get_logger().warn(f'frame_server: {response.message}')
             return response
 
-        with self._lock:
-            msg = self._frames.get(camera_id)
+        frames = []
+        problems = []
+        for cid in wanted:
+            frame, detail = self._take(cid)
+            if frame is None:
+                problems.append(str(detail))
+            else:
+                frames.append(frame)
 
-        if msg is None:
+        if not frames:
             response.success = False
-            response.message = (
-                f"no frame received yet on {self._topics[camera_id]} — is head_detector "
-                f"running with publish_clean_image:=true?")
-            self.get_logger().warn(f'frame_server: {response.message}')
-            return response
-
-        age = self._age_seconds(msg)
-        if age > self._max_age:
-            response.success = False
-            response.age_seconds = float(age)
-            response.message = (
-                f'newest frame is {age:.1f}s old (limit {self._max_age}s) — the camera '
-                f'feed has stopped')
+            response.message = '; '.join(problems) or 'no cameras configured'
             self.get_logger().warn(f'frame_server: {response.message}')
             return response
 
         response.success = True
-        response.jpeg = msg.data
-        response.stamp = msg.header.stamp
-        response.age_seconds = float(age)
-        # Dimensions would need a JPEG decode to read; not worth the CPU on this
-        # path, and the caller does not need them. 0 documented as "unknown".
-        response.width = 0
-        response.height = 0
-        response.message = f'ok ({len(msg.data)} bytes, {age:.2f}s old)'
+        response.frames = frames
+
+        # Legacy mirror. A Pi built against the single-frame version of this
+        # service reads these and nothing else, so they must always be populated
+        # — and always from frames[0], the forward view.
+        first = frames[0]
+        response.jpeg = first.jpeg
+        response.stamp = first.stamp
+        response.age_seconds = first.age_seconds
+        response.width = first.width
+        response.height = first.height
+
+        served = ', '.join(f'{f.camera_id} {len(f.jpeg) / 1024:.0f}KB '
+                           f'{f.age_seconds:.2f}s' for f in frames)
+        # A partial 'all' still succeeds; say so plainly so the caller can decide
+        # whether to mention the missing view out loud.
+        response.message = f'ok ({served})'
+        if problems:
+            response.message += f' [missing: {"; ".join(problems)}]'
 
         self._served += 1
         self.get_logger().info(
-            f"frame_server: served '{camera_id}' "
-            f"({len(msg.data) / 1024:.0f} KB, age {age:.2f}s, total {self._served})")
+            f"frame_server: served '{camera_id}' -> {served} (total {self._served})"
+            + (f'  MISSING: {"; ".join(problems)}' if problems else ''))
         return response
 
 

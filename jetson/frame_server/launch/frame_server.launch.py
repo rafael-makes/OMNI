@@ -1,7 +1,9 @@
 """Launch frame_server alone.
 
-head_detector must be running with publish_clean_image:=true, or every request
-returns "no frame received yet". See omni_jetson_bringup for the combined launch.
+The feed owners must be running with publish_clean_image:=true, or requests for
+that camera return "no frame received yet":
+  head -> head_detector      rear -> rear_camera
+See omni_jetson_bringup for the combined launch.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -12,6 +14,9 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('head_topic', default_value='/camera/image_clean/compressed'),
+        DeclareLaunchArgument('rear_topic',
+                              default_value='/camera/rear/image_clean/compressed'),
+        DeclareLaunchArgument('rear_enabled', default_value='true'),
         DeclareLaunchArgument('max_frame_age', default_value='5.0'),
         Node(
             package='frame_server',
@@ -20,6 +25,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'head_topic': LaunchConfiguration('head_topic'),
+                'rear_topic': LaunchConfiguration('rear_topic'),
+                'rear_enabled': LaunchConfiguration('rear_enabled'),
                 'max_frame_age': LaunchConfiguration('max_frame_age'),
             }],
         ),

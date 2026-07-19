@@ -114,6 +114,13 @@ class BehaviorNode(Node):
         self.declare_parameter('scene_max_sentences',   2)
         # '' -> config/scene_prompt.txt from this package's share dir.
         self.declare_parameter('scene_prompt_path',     '')
+        # Rear-view and both-views prompts, same convention. Separate files rather
+        # than one prompt with a direction hint: the orientation rules genuinely
+        # differ ("behind me" vs "in front of me" vs "one room, two halves"), and
+        # a single prompt trying to cover all three is what makes OMNI say it can
+        # see something in front of it that is actually behind it.
+        self.declare_parameter('scene_rear_prompt_path',   '')
+        self.declare_parameter('scene_fusion_prompt_path', '')
 
         model           = self.get_parameter('gemini_model').value
         voice           = self.get_parameter('gemini_voice').value
@@ -266,18 +273,30 @@ class BehaviorNode(Node):
         )
         self._scene = None
         if self._scene_enabled:
-            prompt_path = str(self.get_parameter('scene_prompt_path').value)
-            if not prompt_path:
-                prompt_path = os.path.join(
-                    get_package_share_directory('behavior_node'),
-                    'config', 'scene_prompt.txt')
-            if not os.path.exists(prompt_path):
-                self.get_logger().warn(
-                    f'scene: prompt file not found at {prompt_path} — using the '
-                    f'built-in default prompt')
+            share_cfg = os.path.join(
+                get_package_share_directory('behavior_node'), 'config')
+
+            def _prompt_path(param: str, filename: str) -> str:
+                path = str(self.get_parameter(param).value)
+                if not path:
+                    path = os.path.join(share_cfg, filename)
+                if not os.path.exists(path):
+                    self.get_logger().warn(
+                        f'scene: prompt file not found at {path} — using the '
+                        f'built-in default prompt')
+                return path
+
+            prompt_path = _prompt_path('scene_prompt_path', 'scene_prompt.txt')
+            rear_prompt_path = _prompt_path(
+                'scene_rear_prompt_path', 'scene_rear_prompt.txt')
+            fusion_prompt_path = _prompt_path(
+                'scene_fusion_prompt_path', 'scene_fusion_prompt.txt')
+
             self._scene = SceneDescriber(
                 model=str(self.get_parameter('scene_model').value),
                 prompt_path=prompt_path,
+                rear_prompt_path=rear_prompt_path,
+                fusion_prompt_path=fusion_prompt_path,
                 max_sentences=int(self.get_parameter('scene_max_sentences').value),
             )
             self.get_logger().info(

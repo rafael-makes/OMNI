@@ -42,6 +42,30 @@ DEFAULT_PROMPT = (
 DEFAULT_MAX_TOKENS = 120
 DEFAULT_MAX_SENTENCES = 2
 
+# Fusing two views into one room description needs a little more room than a
+# single view: there are two halves to place relative to each other. Still capped
+# hard — "look around" must not turn into a monologue.
+FUSION_MAX_TOKENS = 180
+FUSION_MAX_SENTENCES = 3
+
+DEFAULT_FUSION_PROMPT = (
+    "You are the eyes of OMNI, a small indoor robot. You are shown simultaneous "
+    "views from a camera on your head (facing forward) and one on your back "
+    "(facing behind). Describe the room as ONE scene you are standing in, in at "
+    "most three short sentences, saying what is in front of you and what is "
+    "behind you. Never mention cameras, views or images."
+)
+
+# How each view is introduced to the model. The label goes in as text immediately
+# before its image, so the model can attribute objects to a direction — without
+# it, a fused description says "there is a shelf" with no idea where the shelf is.
+_VIEW_LABELS = {
+    'head': 'This is the view from the camera on your HEAD, facing FORWARD '
+            '(everything in it is IN FRONT of you):',
+    'rear': 'This is the view from the camera on your BACK, facing BEHIND '
+            '(everything in it is BEHIND you):',
+}
+
 
 # An 8x8 grey JPEG, for warmup() only. Embedded as bytes rather than generated so
 # this module keeps no image-library dependency (it must import on a bare desktop).
@@ -58,20 +82,22 @@ class SceneDescriptionError(RuntimeError):
     """The description could not be produced (API error, empty reply, ...)."""
 
 
-def load_prompt(path: str | None) -> str:
-    """Read the scene prompt from disk, falling back to DEFAULT_PROMPT.
+def load_prompt(path: str | None, default: str | None = None) -> str:
+    """Read a scene prompt from disk, falling back to a built-in default.
 
     Never raises — a missing or unreadable prompt file degrades to the built-in
-    default rather than taking the tool offline.
+    default rather than taking the tool offline. Pass `default` for prompts whose
+    fallback is not the forward-view one (the fusion prompt, notably).
     """
+    fallback = DEFAULT_PROMPT if default is None else default
     if not path:
-        return DEFAULT_PROMPT
+        return fallback
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read().strip()
-        return text or DEFAULT_PROMPT
+        return text or fallback
     except OSError:
-        return DEFAULT_PROMPT
+        return fallback
 
 
 def _cap_sentences(text: str, max_sentences: int) -> str:
@@ -101,27 +127,55 @@ class SceneDescriber:
         model: str = DEFAULT_MODEL,
         prompt: str | None = None,
         prompt_path: str | None = None,
+        rear_prompt_path: str | None = None,
+        fusion_prompt_path: str | None = None,
         max_sentences: int = DEFAULT_MAX_SENTENCES,
         max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        fusion_max_sentences: int = FUSION_MAX_SENTENCES,
+        fusion_max_output_tokens: int = FUSION_MAX_TOKENS,
     ):
         """
-        client        — pre-built genai.Client; injected by tests. If None, one is
-                        built lazily on first describe() so constructing this
-                        object never needs an API key or network.
-        prompt        — literal system prompt; wins over prompt_path.
-        prompt_path   — path to scene_prompt.txt.
-        max_sentences — hard cap applied to the reply.
+        client             — pre-built genai.Client; injected by tests. If None,
+                             one is built lazily on first describe() so
+                             constructing this object never needs an API key.
+        prompt             — literal forward-view prompt; wins over prompt_path.
+        prompt_path        — path to scene_prompt.txt (forward view).
+        rear_prompt_path   — path to scene_rear_prompt.txt. A separate prompt is
+                             not decoration: handed the forward prompt, the model
+                             narrates the rear view as "in front of me", which is
+                             a confidently wrong statement about where things are.
+        fusion_prompt_path — path to scene_fusion_prompt.txt (both views at once).
+        max_sentences      — hard cap applied to the reply.
         """
         self._client = client
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self._model = model
         self._prompt = prompt if prompt is not None else load_prompt(prompt_path)
+        # Rear falls back to the forward prompt rather than to nothing — a
+        # slightly mis-oriented description still beats no description at all.
+        self._rear_prompt = (load_prompt(rear_prompt_path)
+                             if rear_prompt_path else self._prompt)
+        # NOT load_prompt(): its fallback is the forward-view prompt, which would
+        # quietly turn a missing fusion file into two-view calls prompted to
+        # describe what is "in front of" the robot.
+        self._fusion_prompt = load_prompt(
+            fusion_prompt_path, default=DEFAULT_FUSION_PROMPT)
         self._max_sentences = max_sentences
         self._max_output_tokens = max_output_tokens
+        self._fusion_max_sentences = fusion_max_sentences
+        self._fusion_max_output_tokens = fusion_max_output_tokens
 
     @property
     def prompt(self) -> str:
         return self._prompt
+
+    @property
+    def rear_prompt(self) -> str:
+        return self._rear_prompt
+
+    @property
+    def fusion_prompt(self) -> str:
+        return self._fusion_prompt
 
     def _ensure_client(self):
         if self._client is None:
@@ -156,31 +210,75 @@ class SceneDescriber:
         except Exception:  # noqa: BLE001 - warmup is best-effort by design
             return False
 
+    @staticmethod
+    def _validate(jpeg: bytes, what: str = "image") -> None:
+        if not jpeg:
+            raise ValueError(f"{what} is empty — no frame to describe")
+        if not jpeg.startswith(_JPEG_MAGIC):
+            raise ValueError(
+                f"{what} is not JPEG (missing SOI marker) — frame_server should "
+                f"always send JPEG"
+            )
+
     def describe(self, jpeg: bytes) -> str:
         """JPEG bytes -> a short description string. Raises on failure.
 
+        The forward-view path, unchanged. warmup() and the offline test script
+        both call this, so it keeps its single-image signature.
+        """
+        return self._generate(
+            [(None, jpeg)], self._prompt,
+            self._max_output_tokens, self._max_sentences)
+
+    def describe_views(self, views, *, prompt: str, max_sentences: int | None = None,
+                       max_output_tokens: int | None = None) -> str:
+        """[(camera_id, jpeg), ...] -> one description covering all of them.
+
+        camera_id may be None (unlabelled, single view) or a key in _VIEW_LABELS.
+        With more than one view the labels are what let the model say WHERE
+        something is rather than just that it exists.
+        """
+        views = list(views)
+        if not views:
+            raise ValueError("no views to describe")
+        multi = len(views) > 1
+        return self._generate(
+            views, prompt,
+            max_output_tokens or (self._fusion_max_output_tokens if multi
+                                  else self._max_output_tokens),
+            max_sentences or (self._fusion_max_sentences if multi
+                              else self._max_sentences))
+
+    def _generate(self, views, prompt: str, max_output_tokens: int,
+                  max_sentences: int) -> str:
+        """One vision call over one or more labelled images.
+
         Validation happens before the client is built so bad input costs nothing.
         """
-        if not jpeg:
-            raise ValueError("image is empty — no frame to describe")
-        if not jpeg.startswith(_JPEG_MAGIC):
-            raise ValueError(
-                "image is not JPEG (missing SOI marker) — frame_server should "
-                "always send JPEG"
-            )
+        for camera_id, jpeg in views:
+            self._validate(jpeg, f"{camera_id or 'image'} frame")
 
         client = self._ensure_client()
         from google.genai import types as genai_types
 
+        contents = []
+        for camera_id, jpeg in views:
+            # Label only when it carries information. A lone forward view needs no
+            # preamble, and adding one changes the output of the path that already
+            # works — leave describe() bit-for-bit equivalent to what it was.
+            label = _VIEW_LABELS.get(camera_id) if len(views) > 1 else None
+            if label:
+                contents.append(genai_types.Part.from_text(text=label))
+            contents.append(
+                genai_types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"))
+
         try:
             response = client.models.generate_content(
                 model=self._model,
-                contents=[
-                    genai_types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"),
-                ],
+                contents=contents,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=self._prompt,
-                    max_output_tokens=self._max_output_tokens,
+                    system_instruction=prompt,
+                    max_output_tokens=max_output_tokens,
                     # Deterministic-ish: we want a plain report of what is there,
                     # not creative variation on every call.
                     temperature=0.2,
@@ -201,4 +299,4 @@ class SceneDescriber:
         if not text:
             raise SceneDescriptionError("the vision model returned an empty description")
 
-        return _cap_sentences(text, self._max_sentences)
+        return _cap_sentences(text, max_sentences)

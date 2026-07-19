@@ -22,12 +22,16 @@ from launch_ros.actions import Node
 
 _HEAD_CAM = ('/dev/v4l/by-id/'
              'usb-HHWei_Technology_Co.__Ltd._USB_Camera_HHW001-video-index0')
+_REAR_CAM = ('/dev/v4l/by-id/'
+             'usb-GENERAL_2K_HD_Camera-video-index0')
 
 
 def generate_launch_description():
     usb_device = LaunchConfiguration('usb_device')
+    rear_device = LaunchConfiguration('rear_device')
     publish_identity = LaunchConfiguration('publish_identity')
     scene_vision = LaunchConfiguration('scene_vision')
+    rear_vision = LaunchConfiguration('rear_vision')
     clean_max_width = LaunchConfiguration('clean_max_width')
     capture_width = LaunchConfiguration('capture_width')
     detect_max_width = LaunchConfiguration('detect_max_width')
@@ -45,6 +49,14 @@ def generate_launch_description():
             'scene_vision', default_value='true',
             description='Publish the clean frame and run frame_server, so the Pi can '
                         'answer "what do you see?". false disables scene description.'),
+        DeclareLaunchArgument(
+            'rear_device', default_value=_REAR_CAM,
+            description='V4L2 by-id path of the rear 2K camera'),
+        DeclareLaunchArgument(
+            'rear_vision', default_value='true',
+            description='Run rear_camera so "what is behind you?" works. Set false '
+                        'if you need to run the legacy dock_apriltag.launch.py, '
+                        'which opens the rear device directly and cannot share it.'),
         # Capture size feeds YOLO, YuNet AND the clean scene-description feed off a
         # single stream, so raising it costs decode+resize on EVERY frame. Baseline at
         # 848x480: infer_ms 21.4 + face_ms 35.5 = ~57ms, comfortably inside the 10 Hz
@@ -90,9 +102,36 @@ def generate_launch_description():
                 'clean_max_width': clean_max_width,
             }],
         ),
-        # Serves the newest clean frame as JPEG on /vision/get_camera_frame. The Pi's
-        # behavior_node calls this across the 192.168.50.0/24 link when Gemini invokes
-        # describe_scene. Subscribes Jetson-locally, so only the reply crosses the wire.
+        # Rear 2K cam owner, so describe_scene(direction='behind'|'all') has a
+        # cached frame to serve. Streams MJPG continuously but only DECODES at
+        # decode_fps — this camera cannot negotiate anything below 30fps on the
+        # wire (asking for 5 fails the open outright), so the throttle has to be
+        # downstream. Measured stable alongside the head cam and the OAK-D on the
+        # shared USB 2.0 bus: 25.00 fps loaded vs 24.99 unloaded, zero USB errors.
+        Node(
+            package='rear_camera',
+            executable='rear_camera_node',
+            name='rear_camera',
+            output='screen',
+            emulate_tty=True,
+            condition=IfCondition(rear_vision),
+            parameters=[{
+                'device': rear_device,
+                'capture_width': 640,
+                'capture_height': 480,
+                'capture_fps': 30,      # the ONLY MJPG rate this cam negotiates
+                'decode_fps': 5.0,
+                'publish_clean_image': True,
+                'clean_image_fps': 2.0,
+                # Raw feed is for apriltag docking only — see
+                # dock_apriltag_shared.launch.py. Off here to save CPU/DDS traffic.
+                'publish_raw_image': False,
+            }],
+        ),
+        # Serves the newest clean frame(s) as JPEG on /vision/get_camera_frame. The
+        # Pi's behavior_node calls this across the 192.168.50.0/24 link when Gemini
+        # invokes describe_scene. Subscribes Jetson-locally, so only the reply
+        # crosses the wire. camera_id: head | rear | all.
         Node(
             package='frame_server',
             executable='frame_server_node',
@@ -102,6 +141,8 @@ def generate_launch_description():
             condition=IfCondition(scene_vision),
             parameters=[{
                 'head_topic': '/camera/image_clean/compressed',
+                'rear_topic': '/camera/rear/image_clean/compressed',
+                'rear_enabled': rear_vision,
                 'max_frame_age': 5.0,
             }],
         ),

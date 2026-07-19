@@ -39,19 +39,30 @@ SERVICE_NAME = '/vision/get_camera_frame'
 
 
 class FrameResult:
-    """What get_frame() gives back. jpeg is None on failure; message says why."""
+    """What get_frame() gives back. jpeg is None on failure; message says why.
 
-    __slots__ = ('jpeg', 'age_seconds', 'message', 'ok')
+    `views` is the full reply: [(camera_id, jpeg), ...] in server order, head
+    first. For a single-camera request it holds exactly one entry and `jpeg`
+    mirrors it, so existing single-frame callers are unaffected.
+    """
 
-    def __init__(self, jpeg=None, age_seconds=0.0, message='', ok=False):
+    __slots__ = ('jpeg', 'age_seconds', 'message', 'ok', 'views')
+
+    def __init__(self, jpeg=None, age_seconds=0.0, message='', ok=False, views=None):
         self.jpeg = jpeg
         self.age_seconds = age_seconds
         self.message = message
         self.ok = ok
+        self.views = views or []
+
+    @property
+    def camera_ids(self):
+        return [cid for cid, _ in self.views]
 
     def __repr__(self):
         n = len(self.jpeg) if self.jpeg else 0
-        return f'FrameResult(ok={self.ok}, {n}B, age={self.age_seconds:.2f}s, {self.message!r})'
+        return (f'FrameResult(ok={self.ok}, {n}B, age={self.age_seconds:.2f}s, '
+                f'views={self.camera_ids}, {self.message!r})')
 
 
 class FrameClient:
@@ -184,12 +195,29 @@ class FrameClient:
             self._log.warn(f'frame_server: unsuccessful: {msg}')
             return FrameResult(message=msg)
 
-        # resp.jpeg is a uint8[] — array('B') or bytes depending on the rmw path.
+        # resp.jpeg / frame.jpeg are uint8[] — array('B') or bytes depending on
+        # the rmw path, so bytes() is not redundant.
+        #
+        # getattr on `frames`, not resp.frames directly: the Jetson may still be
+        # running a frame_server built before multi-camera existed, in which case
+        # the reply has only the legacy fields. Falling back to them keeps 'front'
+        # working against an old server instead of failing with AttributeError —
+        # the two machines are built separately and do drift apart.
+        views = []
+        for frame in getattr(resp, 'frames', None) or []:
+            views.append((frame.camera_id, bytes(frame.jpeg)))
+
         jpeg = bytes(resp.jpeg)
+        if not views and jpeg:
+            views = [(camera_id, jpeg)]
+        if not jpeg and views:
+            jpeg = views[0][1]
+
         elapsed = time.monotonic() - started
+        summary = ', '.join(f'{cid} {len(data) / 1024:.0f}KB' for cid, data in views)
         self._log.info(
-            f'frame_server: got {len(jpeg) / 1024:.0f} KB '
+            f'frame_server: got [{summary}] '
             f'(frame age {resp.age_seconds:.2f}s, fetch {elapsed:.2f}s)')
         return FrameResult(
             jpeg=jpeg, age_seconds=float(resp.age_seconds),
-            message=resp.message, ok=True)
+            message=resp.message, ok=True, views=views)

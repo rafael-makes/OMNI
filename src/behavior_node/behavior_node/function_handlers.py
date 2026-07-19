@@ -177,17 +177,40 @@ OMNI_TOOLS = [
             genai_types.FunctionDeclaration(
                 name='describe_scene',
                 description=(
-                    'Look through OMNI\'s camera and describe what is currently in '
-                    'view. Call this whenever the user asks what you can see, what '
-                    'is in front of you, what is in the room, or to look at or '
-                    'identify something. You have no vision until you call this — '
-                    'never guess at or invent what is around you, and never answer '
-                    'from an earlier look, because the view changes as you move. '
-                    'Returns a short description; relay it in your own voice.'
+                    'Look through OMNI\'s cameras and describe what is currently in '
+                    'view. OMNI has TWO fixed cameras — one facing forward on its '
+                    'head, one facing backward — so it can look behind itself '
+                    'WITHOUT turning around or moving. Call this whenever the user '
+                    'asks what you can see, what is in front of you or behind you, '
+                    'what is in the room, to look around, or to look at or identify '
+                    'something. You have no vision until you call this — never guess '
+                    'at or invent what is around you, and never answer from an '
+                    'earlier look, because the view changes as you move. Returns a '
+                    'short description; relay it in your own voice.'
                 ),
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
-                    properties={},
+                    properties={
+                        'direction': genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            enum=['front', 'behind', 'all'],
+                            description=(
+                                'Which way to look. Defaults to "front".\n'
+                                '"front" — the forward camera. Use for "what do you '
+                                'see?", "what is in front of you?", "look at this", '
+                                '"what am I holding?".\n'
+                                '"behind" — the rear camera. Use for "what is behind '
+                                'you?", "what is back there?", "look behind you", '
+                                '"is anyone behind you?". Do NOT turn the robot '
+                                'around first; the rear camera already points that '
+                                'way.\n'
+                                '"all" — both cameras at once, fused into a single '
+                                'description of the whole room. Use for "look '
+                                'around", "what is in the room?", "describe where '
+                                'you are", "what is around you?".'
+                            ),
+                        ),
+                    },
                 ),
             ),
 
@@ -546,17 +569,29 @@ class FunctionHandlers:
                 "I am standing by for your next instruction — how refreshing."
             )
 
+    # direction -> (frame_server camera_id, how the result is introduced).
+    # The lead-in matters: it is what stops Gemini narrating a rear view as though
+    # the robot had turned around to look.
+    _SCENE_DIRECTIONS = {
+        'front':  ('head', 'You can currently see, in front of you:'),
+        'behind': ('rear', 'Without turning around, your rear camera shows what is '
+                           'behind you:'),
+        'all':    ('all',  'Looking around you, the room is:'),
+    }
+
     def _describe_scene(self, args: dict) -> str:
-        """Fetch a frame from the Jetson and describe it.
+        """Fetch frame(s) from the Jetson and describe them.
 
         BLOCKING, and that is fine: gemini_bridge dispatches handlers through
         run_in_executor, so this runs on a thread-pool thread and never stalls the
         asyncio loop or the ROS executor.
 
         Budget is roughly: frame fetch <=2.5s (usually ~0.1s on the direct link)
-        plus the vision call ~2s. Both failure paths return something OMNI can say
-        out loud rather than raising — a tool exception would leave a dead silence
-        mid-conversation, which is the worst possible outcome here.
+        plus the vision call ~2s. 'all' sends two images in ONE call rather than
+        two calls, so it costs one round trip, not two — the extra latency is the
+        second image's upload, not a second request. Both failure paths return
+        something OMNI can say out loud rather than raising: a tool exception
+        would leave a dead silence mid-conversation, the worst outcome here.
         """
         node = self._node
         if not getattr(node, '_scene_enabled', False) or node._scene is None:
@@ -565,27 +600,66 @@ class FunctionHandlers:
                 "tell you what I see. How limiting."
             )
 
-        result = node._frames.get_frame(node._scene_camera_id)
+        direction = (args.get('direction') or 'front').strip().lower()
+        if direction not in self._SCENE_DIRECTIONS:
+            node.get_logger().warn(
+                f'describe_scene: unknown direction {direction!r} — using front')
+            direction = 'front'
+        camera_id, lead_in = self._SCENE_DIRECTIONS[direction]
+
+        # 'front' still honours the configured head camera id, so a rig that
+        # renames its forward camera keeps working.
+        if direction == 'front':
+            camera_id = node._scene_camera_id
+
+        result = node._frames.get_frame(camera_id)
         if not result.ok:
-            node.get_logger().warn(f'describe_scene: no frame — {result.message}')
+            node.get_logger().warn(
+                f'describe_scene({direction}): no frame — {result.message}')
+            if direction == 'behind':
+                return (
+                    "I'm afraid I cannot see behind me at the moment — my rear "
+                    "camera feed is unavailable. Most disorienting, I must say."
+                )
             return (
                 "I'm afraid I cannot see anything at the moment — my camera feed "
                 "is unavailable. Most disorienting, I must say."
             )
 
+        views = result.views or [(camera_id, result.jpeg)]
+
+        # A partial 'all' — one camera down — degrades to describing the view that
+        # did arrive, using that view's own prompt so it is still correctly
+        # oriented. Saying nothing because half the room is missing would be worse.
+        if direction == 'all' and len(views) < 2:
+            got = views[0][0] if views else None
+            node.get_logger().warn(
+                f'describe_scene(all): only {got!r} available — {result.message}')
+            direction = 'behind' if got == 'rear' else 'front'
+            _, lead_in = self._SCENE_DIRECTIONS[direction]
+
+        prompt = {
+            'front':  node._scene.prompt,
+            'behind': node._scene.rear_prompt,
+            'all':    node._scene.fusion_prompt,
+        }[direction]
+
         try:
-            description = node._scene.describe(result.jpeg)
+            description = node._scene.describe_views(views, prompt=prompt)
         except Exception as exc:  # noqa: BLE001 - must never raise into the tool loop
-            node.get_logger().warn(f'describe_scene: vision call failed: {exc}')
+            node.get_logger().warn(
+                f'describe_scene({direction}): vision call failed: {exc}')
             return (
                 "I have a picture, but I'm afraid I could not make sense of it. "
                 "My visual processing appears to be having difficulties."
             )
 
-        node.get_logger().info(f'describe_scene: {description}')
+        node.get_logger().info(
+            f'describe_scene({direction}, views={[c for c, _ in views]}): '
+            f'{description}')
         # Returned as an observation rather than a finished line, so Gemini renders
         # it in OMNI's voice instead of reading a flat report aloud.
-        return f'You can currently see: {description}'
+        return f'{lead_in} {description}'
 
     def _remember_person(self, args: dict) -> str:
         # Keep the identity a single clean token (first name).
