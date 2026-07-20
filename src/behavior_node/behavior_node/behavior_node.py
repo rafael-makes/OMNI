@@ -48,13 +48,14 @@ from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 from vision_msgs.msg import Detection2DArray
 
 from behavior_node.audio_handler import AudioHandler
 from behavior_node.function_handlers import FunctionHandlers, VALID_STATES
 from behavior_node.gemini_bridge import GeminiBridge
 from behavior_node.frame_client import FrameClient
+from behavior_node.greeting_decider import GreetingDecider
 from behavior_node.memory_client import MemoryClient
 from behavior_node.memory_format import wrap_memory_context
 from behavior_node.scene_describer import SceneDescriber
@@ -122,6 +123,23 @@ class BehaviorNode(Node):
         self.declare_parameter('scene_rear_prompt_path',   '')
         self.declare_parameter('scene_fusion_prompt_path', '')
 
+        # ── Unprompted greetings (Session 10) ────────────────────────────────────
+        # Driven by /omni/events from event_generator, which has already done all
+        # the presence debouncing — by the time person_appeared arrives, the person
+        # genuinely went away and genuinely came back. Everything here is about
+        # whether a greeting is APPROPRIATE, not whether they are really there.
+        self.declare_parameter('greeting_enabled',   True)
+        self.declare_parameter('greeting_events_topic', '/omni/events')
+        # Per-person cooldown, enforced in code and never in the prompt: a rule the
+        # model can be talked out of is not a rule. 10 minutes.
+        self.declare_parameter('greeting_cooldown',  600.0)
+        # Below this battery percentage OMNI has better things to spend power on
+        # than saying hello. bms_node also publishes /bms/low_battery at 20%.
+        self.declare_parameter('greeting_min_battery', 20.0)
+        self.declare_parameter('greeting_model',     'gemini-3.1-flash-lite')
+        # '' -> config/greeting_prompt.txt from this package's share dir.
+        self.declare_parameter('greeting_prompt_path', '')
+
         model           = self.get_parameter('gemini_model').value
         voice           = self.get_parameter('gemini_voice').value
         config_path     = os.path.expanduser(self.get_parameter('config_file_path').value)
@@ -181,6 +199,11 @@ class BehaviorNode(Node):
         # ── Cached sensor data ─────────────────────────────────────────────────
         self._battery_pct   = None   # float 0.0–100.0 or None before first message
         self._last_fault    = None   # most recent fault string, or None if clear
+        # bms_node latches this True below 20% SOC. Note it never sets
+        # BatteryState.power_supply_status (verified in bms_node.py — it builds the
+        # message field by field and that one is not among them), so "is OMNI on
+        # the charger" is NOT knowable from /battery/status. See _greeting_blocked.
+        self._low_battery   = False
 
         # ── Conversation timeout tracking ──────────────────────────────────────
         # Updated by _reset_conversation_timeout(), called by gemini_bridge on
@@ -224,6 +247,7 @@ class BehaviorNode(Node):
         self.create_subscription(String,       '/motor_status',   self._on_motor_status,  10)
         self.create_subscription(String,       '/wifi_config',    self._on_wifi_config,   10)
         self.create_subscription(String,       '/audio/say',      self._on_say,           10)
+        self.create_subscription(Bool,         '/bms/low_battery', self._on_low_battery,  10)
         # camera_node publishes with BEST_EFFORT sensor QoS — subscriber must match
         _sensor_qos = QoSPresetProfiles.SENSOR_DATA.value
         self.create_subscription(
@@ -311,6 +335,50 @@ class BehaviorNode(Node):
             threading.Thread(
                 target=self._warm_scene, name='scene-warmup', daemon=True
             ).start()
+        # ── Unprompted greetings (Session 10) ────────────────────────────────────
+        # Soft, like every other enhancement here: a missing event_generator means
+        # no events arrive and OMNI simply never greets anyone unprompted.
+        self._greeting_enabled  = bool(self.get_parameter('greeting_enabled').value)
+        self._greeting_cooldown = float(self.get_parameter('greeting_cooldown').value)
+        self._greeting_min_batt = float(self.get_parameter('greeting_min_battery').value)
+        # person -> monotonic timestamp of their last SPOKEN greeting. Guarded by
+        # _greeting_lock, which also guards _greeting_in_flight: the event callback
+        # is on the ROS executor but the work runs on a daemon thread, so two
+        # arrivals in quick succession would otherwise both pass the gate.
+        self._greeting_last     = {}
+        self._greeting_in_flight = False
+        self._greeting_lock     = threading.Lock()
+        self._greeter           = None
+        if self._greeting_enabled:
+            greet_prompt_path = str(self.get_parameter('greeting_prompt_path').value)
+            if not greet_prompt_path:
+                greet_prompt_path = os.path.join(
+                    get_package_share_directory('behavior_node'),
+                    'config', 'greeting_prompt.txt')
+            if not os.path.exists(greet_prompt_path):
+                self.get_logger().warn(
+                    f'greeting: prompt file not found at {greet_prompt_path} — '
+                    f'using the built-in default prompt')
+            self._greeter = GreetingDecider(
+                model=str(self.get_parameter('greeting_model').value),
+                prompt_path=greet_prompt_path,
+            )
+            self.create_subscription(
+                String,
+                str(self.get_parameter('greeting_events_topic').value),
+                self._on_presence_event,
+                10,
+            )
+            # Warm the text endpoint for the same reason scene description warms
+            # the vision one — except the budget here is tighter, because nobody
+            # asked for this greeting and a late one lands after they walked past.
+            threading.Thread(
+                target=self._warm_greeter, name='greeting-warmup', daemon=True
+            ).start()
+            self.get_logger().info(
+                f'unprompted greetings enabled '
+                f'(cooldown={self._greeting_cooldown}s, prompt={greet_prompt_path})')
+
         # Step 6: latest recognized identity + when it arrived (monotonic). Written
         # by the /camera/identity callback, read at wake time. _session_person is the
         # person latched for the CURRENT conversation so a mid-chat identity change
@@ -555,6 +623,233 @@ class BehaviorNode(Node):
         self._current_person_time = time.monotonic()
         self.get_logger().info(f'Learning person on the fly: {name} (was {prev!r})')
         return True
+
+    # ── Unprompted greetings ───────────────────────────────────────────────────
+
+    def _on_low_battery(self, msg: Bool):
+        """bms_node latches this True below 20% SOC."""
+        self._low_battery = bool(msg.data)
+
+    def _warm_greeter(self):
+        """Background: prime the text endpoint so the first greeting is fast."""
+        started = time.monotonic()
+        if self._greeter.warmup():
+            self.get_logger().info(
+                f'greeting: decision endpoint warmed up in '
+                f'{time.monotonic() - started:.2f}s')
+        else:
+            self.get_logger().warn(
+                'greeting: decision warmup failed (check GEMINI_API_KEY / network) '
+                '— the first greeting will be slower')
+
+    def _greeting_blocked(self) -> str | None:
+        """Why a greeting must not happen right now, or None if it may.
+
+        Every one of these is enforced HERE, in code, and none of them is
+        mentioned to the model. A suppression rule expressed as prompt text is a
+        suggestion; a suppression rule expressed as a return statement is a rule.
+        """
+        if not self._greeting_enabled or self._greeter is None:
+            return 'greetings disabled'
+
+        with self._state_lock:
+            state = self._current_state
+
+        # Busy driving, docking, or faulted. Interrupting any of these with a
+        # cheerful hello is at best noise and at worst masks something urgent.
+        if state in ('NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'):
+            return f'robot is {state}'
+
+        # Mid-conversation. LISTENING/SPEAKING mean a wake-word chat is live —
+        # the person walking in must not talk over the person already talking.
+        if state in ('LISTENING', 'SPEAKING'):
+            return f'conversation in progress ({state})'
+
+        # Belt and braces: a session can be open in a state this check would
+        # otherwise wave through (a fault session that already recovered state,
+        # an /audio/say announcement still playing). open_session() would reject
+        # us anyway — better to not fire the API call at all.
+        if self._bridge.is_session_active():
+            return 'a Gemini session is already active'
+
+        # Low power. There is no "docked" signal to test: bms_node never populates
+        # BatteryState.power_supply_status, so charging is invisible from here.
+        # DOCKING is covered by the state check above; a persistent docked/charging
+        # state can be added to this function when the docking work lands.
+        if self._low_battery:
+            return 'battery is low'
+        if self._battery_pct is not None and self._battery_pct < self._greeting_min_batt:
+            return f'battery {self._battery_pct:.0f}% below {self._greeting_min_batt:.0f}%'
+
+        return None
+
+    def _on_presence_event(self, msg: String):
+        """A semantic event from event_generator on /omni/events.
+
+        Fires on the ROS executor thread. Everything expensive — the memory
+        lookup and the decision call — is handed to a daemon thread, because both
+        block for seconds and this executor is single-threaded (see the
+        behavior_node deadlock note in feedback_behavior_node).
+        """
+        try:
+            event = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warn('unparseable /omni/events payload, ignoring')
+            return
+
+        kind = event.get('kind')
+        if kind != 'person_appeared':
+            # person_left and unknown_person_detected are published for other
+            # consumers; greeting only cares about arrivals.
+            self.get_logger().debug(f'presence event ignored: {kind}')
+            return
+
+        identity = (event.get('identity') or '').strip().lower()
+        if not identity or identity.startswith('unknown'):
+            # event_generator only emits person_appeared for named people, so this
+            # is defensive — but greeting a stranger BY NAME is impossible and
+            # greeting them generically is a different feature.
+            return
+
+        away = event.get('away_duration')
+        away = float(away) if isinstance(away, (int, float)) else None
+
+        blocked = self._greeting_blocked()
+        if blocked:
+            self.get_logger().info(
+                f'greeting: {identity} appeared but suppressed — {blocked}')
+            return
+
+        now = time.monotonic()
+        with self._greeting_lock:
+            if self._greeting_in_flight:
+                self.get_logger().info(
+                    f'greeting: {identity} appeared but another greeting is in flight')
+                return
+            last = self._greeting_last.get(identity)
+            if last is not None and (now - last) < self._greeting_cooldown:
+                self.get_logger().info(
+                    f'greeting: {identity} appeared but greeted '
+                    f'{now - last:.0f}s ago (cooldown {self._greeting_cooldown:.0f}s)')
+                return
+            self._greeting_in_flight = True
+
+        threading.Thread(
+            target=self._do_greeting, args=(identity, away),
+            name='greeting', daemon=True,
+        ).start()
+
+    def _do_greeting(self, identity: str, away_duration):
+        """Fetch this person's memories, ask Gemini to greet them or not, act.
+
+        Runs on its own daemon thread — both the memory retrieve and the decision
+        call block for up to a couple of seconds each.
+        """
+        try:
+            memory_context = ''
+            if self._memory_enabled:
+                memory_context = self._memory.retrieve_context(
+                    self._memory_seed_query, k=self._memory_k, person=identity)
+
+            hour = time.localtime().tm_hour
+            period = ('morning' if hour < 12
+                      else 'afternoon' if hour < 17 else 'evening')
+
+            started = time.monotonic()
+            decision = self._greeter.decide(
+                identity=identity,
+                away_duration=away_duration,
+                memory_context=memory_context,
+                period=period,
+            )
+            self.get_logger().info(
+                f'greeting: decision for {identity} in '
+                f'{time.monotonic() - started:.2f}s — '
+                f'{"SPEAK" if decision.speak else "SILENCE"} ({decision.reason})')
+
+            if not decision.speak:
+                return
+
+            # Re-check the gate: the decision call took a second or two, and the
+            # user may have said the wake word in the meantime. Greeting over the
+            # top of a conversation that started while we were thinking is exactly
+            # the interruption this feature must never cause.
+            blocked = self._greeting_blocked()
+            if blocked:
+                self.get_logger().info(
+                    f'greeting: {identity} line composed but dropped — {blocked}')
+                return
+
+            with self._greeting_lock:
+                self._greeting_last[identity] = time.monotonic()
+
+            self.get_logger().info(f'greeting {identity}: "{decision.line}"')
+            self._speak_unprompted(
+                f'Say exactly this out loud right now, in character, and then stop '
+                f'and wait for them to reply: "{decision.line}". Do not add '
+                f'commentary and do not repeat yourself.',
+                person=identity,
+                memory_context=memory_context,
+            )
+        except Exception as exc:  # noqa: BLE001 - a greeting must never kill the node
+            self.get_logger().warn(f'greeting failed for {identity}: {exc}')
+        finally:
+            with self._greeting_lock:
+                self._greeting_in_flight = False
+
+    def _speak_unprompted(self, prompt: str, *, person=None, memory_context=''):
+        """Open a Gemini Live session with `prompt` as the opening turn.
+
+        The shared mechanism behind /audio/say and unprompted greetings. In IDLE
+        the wake word detector owns ALSA device 0, so the handoff order is strict
+        and identical to the safety-fault path: stop the detector, let the kernel
+        release the device, then start capture. Without the sleep the capture open
+        races the release and gets ALSA -9985.
+
+        Deliberately leaves the robot in LISTENING rather than closing straight
+        after speaking: someone greeted by name will often answer, and they should
+        be able to just talk. The existing conversation timeout returns to IDLE if
+        they do not.
+
+        `memory_context` is folded into the prompt HERE rather than passed through
+        to open_session(memory_context=...), because the bridge ignores that
+        argument whenever initial_prompt is set — see the branch in
+        gemini_bridge._run_single_session. Passing it there would look correct and
+        silently deliver nothing, and the greeted person's follow-up ("did you
+        finish that board?") is exactly where those memories earn their keep.
+
+        Safe to call from any thread — _set_state, _wake and _audio are all
+        internally locked or thread-confined, and open_session marshals onto the
+        asyncio loop itself.
+        """
+        if person:
+            who = (
+                f'[MEMORY] You recognise the person in front of you: their name is '
+                f'{person.capitalize()}. Address them by name naturally; do not '
+                f'announce that you recognised their face.'
+            )
+            wrapped = wrap_memory_context(memory_context)
+            preamble = f'{who}\n\n{wrapped}' if wrapped else who
+            prompt = f'{preamble}\n\n{prompt}'
+
+        with self._state_lock:
+            state_before = self._current_state
+
+        if state_before == 'IDLE':
+            self._wake.stop()
+            time.sleep(0.1)   # 100ms for ALSA to release device 0
+        self._audio.start_capture()
+
+        # Attribute anything said in this exchange to the right person, exactly as
+        # the wake-word path does — otherwise a conversation that began with a
+        # greeting gets stored as general/household memory.
+        self._session_id = uuid.uuid4().hex
+        self._session_person = person
+        self._late_bind_done = False
+
+        self._reset_conversation_timeout()
+        self._set_state('LISTENING')
+        self._bridge.open_session(initial_prompt=prompt)
 
     def _warm_scene(self):
         """Background: prime the vision endpoint so the first describe_scene is fast."""
@@ -829,21 +1124,10 @@ class BehaviorNode(Node):
             return
 
         # No session — open one with the line as the first thing Gemini sees.
-        # Free the mic the same way the safety-fault path does: in IDLE the wake
-        # word detector owns device 0, so stop it and let ALSA release before
-        # starting capture. start_capture() is idempotent in other states.
-        with self._state_lock:
-            state_before = self._current_state
-
-        if state_before == 'IDLE':
-            self._wake.stop()
-            time.sleep(0.1)   # 100ms for ALSA to release device 0
-        self._audio.start_capture()
-        # Treat the announcement like a short conversation so the existing
-        # conversation-timeout path closes the session and returns to IDLE.
-        self._reset_conversation_timeout()
-        self._set_state('LISTENING')
-        self._bridge.open_session(initial_prompt=prompt)
+        # _speak_unprompted owns the mic handoff (the strict stop-detector →
+        # sleep → start-capture order) and leaves the robot in LISTENING so the
+        # existing conversation timeout closes the session and returns to IDLE.
+        self._speak_unprompted(prompt)
 
     # ── Sensor subscribers ─────────────────────────────────────────────────────
 
