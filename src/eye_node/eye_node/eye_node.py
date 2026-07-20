@@ -49,6 +49,19 @@ STATE_COLORS = {
 
 _DEFAULT_STATE = 'IDLE'
 
+# Dot-matrix style palette — the retro LED panel look is mostly one green, so
+# state reads from pulse speed and brightness rather than hue.  Only the states
+# that genuinely need to be distinguishable at a glance get their own colour.
+MATRIX_COLORS = {
+    'IDLE':       (  0, 255,  70),   # LED green
+    'LISTENING':  (  0, 255,  70),
+    'SPEAKING':   (  0, 255,  70),
+    'NAVIGATING': (  0, 255,  70),
+    'EXPLORING':  (  0, 255,  70),
+    'DOCKING':    (  0, 255,  70),
+    'ERROR':      (255,  40,  20),   # red — must not read as "fine"
+}
+
 # HAL 9000 glow pulse speed (rad/s) per state — state is conveyed by lens
 # colour plus how fast/urgently the core breathes.
 _PULSE_SPEED = {
@@ -205,6 +218,131 @@ def _draw_cyborg_eye(now, pulse, color):
     return Image.composite(img, black, mask)
 
 
+# ── Dot-matrix LED renderer ───────────────────────────────────────────────────
+#
+# Emulates a discrete LED panel: a square grid of round dots on black, where an
+# eye-shaped mask decides which dots light and how brightly.  Unlit cells are
+# left near-black so the panel structure only shows where the eye is, matching
+# the reference look.
+
+_GRID    = 12                    # dots per axis across the 240px display
+_PITCH   = W / _GRID             # 20 px between dot centres
+_DOT_R   = 6.4                   # lit-core radius in px (gap between dots reads)
+_GLOW_R  = 11.0                  # bloom radius — LED bleed into the black
+_EYE_R   = 0.28 * W              # radius of the eye disc — leaves a black
+                                 # margin inside the round display bezel
+
+
+def _make_dot_kernel():
+    """Pre-render one LED dot: a hard-ish core with a soft exponential bloom.
+
+    Returns a float32 array of intensity 0..1, and the offset from its centre to
+    its top-left corner, so it can be additively blitted at any dot position.
+    """
+    half = int(math.ceil(_GLOW_R))
+    size = 2 * half + 1
+    ys, xs = np.mgrid[0:size, 0:size]
+    d = np.hypot(xs - half, ys - half).astype(np.float32)
+
+    # Core: flat top, one-pixel soft edge so the dot doesn't alias into a square.
+    core = np.clip((_DOT_R + 0.5 - d) / 1.0, 0.0, 1.0)
+    # Bloom: falls off exponentially past the core, never fully reaching the core
+    # brightness so the dot keeps a defined edge.
+    bloom = 0.34 * np.exp(-np.clip(d - _DOT_R, 0.0, None) / 2.6)
+
+    return np.maximum(core, bloom).astype(np.float32), half
+
+
+_DOT_KERNEL, _DOT_HALF = _make_dot_kernel()
+
+# Grid cell centres, precomputed once.
+_CELL_XY = [
+    (( gx + 0.5) * _PITCH, (gy + 0.5) * _PITCH)
+    for gy in range(_GRID) for gx in range(_GRID)
+]
+
+
+def _blink_openness(now):
+    """Eyelid openness 0..1 — mostly 1.0, with a fast blink every few seconds.
+
+    The blink phase is derived from wall-clock time rather than stored state so
+    both eyes blink in lockstep without sharing anything.
+    """
+    period = 4.7                            # seconds between blinks
+    phase  = now % period
+    if phase > 0.22:                        # open the vast majority of the time
+        return 1.0
+    # 0.22s blink: closes over the first half, reopens over the second.
+    t = phase / 0.22
+    return abs(t - 0.5) * 2.0
+
+
+def _draw_matrix_eye(now, pulse, color, gaze=(0.0, 0.0)):
+    """Render the eye as a grid of glowing LED dots.
+
+    ``gaze`` is a (dx, dy) offset in units of the eye radius, so (-0.3, 0) looks
+    left.  Both eyes render identically — the mask is centred on the display.
+    """
+    frame = np.zeros((W, W), dtype=np.float32)
+
+    open_amt = _blink_openness(now)
+    if open_amt < 0.02:
+        open_amt = 0.02                     # avoid a divide-by-zero on full close
+
+    ecx = CX + gaze[0] * _EYE_R
+    ecy = CY + gaze[1] * _EYE_R
+    ry  = _EYE_R * open_amt                 # squash vertically to blink
+
+    breathe = 0.72 + 0.28 * pulse
+
+    for cx_, cy_ in _CELL_XY:
+        dx = (cx_ - ecx) / _EYE_R
+        dy = (cy_ - ecy) / ry
+        d  = math.hypot(dx, dy)             # 0 centre .. 1 rim
+
+        if d > 1.18:
+            continue                        # well outside the eye — dot stays dark
+
+        # Soft rim so the disc edge dithers across the outer ring of dots rather
+        # than cutting off square.
+        edge = min(1.0, max(0.0, (1.18 - d) / 0.30))
+        # Very slight centre-bright falloff keeps it from looking like flat fill.
+        lvl  = edge * (1.0 - 0.18 * d ** 2) * breathe
+        if lvl <= 0.01:
+            continue
+
+        px, py = int(round(cx_)), int(round(cy_))
+        x0, y0 = px - _DOT_HALF, py - _DOT_HALF
+        x1, y1 = x0 + _DOT_KERNEL.shape[1], y0 + _DOT_KERNEL.shape[0]
+
+        # Clip the kernel against the frame edges.
+        kx0, ky0 = max(0, -x0), max(0, -y0)
+        kx1, ky1 = _DOT_KERNEL.shape[1] - max(0, x1 - W), _DOT_KERNEL.shape[0] - max(0, y1 - W)
+        if kx1 <= kx0 or ky1 <= ky0:
+            continue
+
+        dst = frame[max(0, y0):min(W, y1), max(0, x0):min(W, x1)]
+        np.maximum(dst, _DOT_KERNEL[ky0:ky1, kx0:kx1] * lvl, out=dst)
+
+    # Colourise: intensity drives the state colour, and the hottest part of each
+    # dot washes toward white the way a saturated LED does to a camera.
+    cr, cg, cb = color
+    hot = np.clip((frame - 0.75) / 0.25, 0.0, 1.0) * 0.55
+    rgb = np.dstack([
+        frame * cr + hot * (255 - cr),
+        frame * cg + hot * (255 - cg),
+        frame * cb + hot * (255 - cb),
+    ])
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    img = Image.fromarray(rgb, 'RGB')
+
+    # Circular mask — clips to the round display.
+    mask = Image.new('L', (W, W), 0)
+    ImageDraw.Draw(mask).ellipse([2, 2, W - 2, W - 2], fill=255)
+    return Image.composite(img, Image.new('RGB', (W, W), (0, 0, 0)), mask)
+
+
 class EyeNode(Node):
 
     def __init__(self):
@@ -215,13 +353,19 @@ class EyeNode(Node):
         self._target_fps     = self.get_parameter('target_fps').value
         self._frame_interval = 1.0 / self._target_fps
 
+        # 'matrix' = retro LED dot grid, 'lens' = the original cyborg iris.
+        self.declare_parameter('eye_style', 'matrix')
+        self._eye_style = self.get_parameter('eye_style').value
+        self._palette   = (MATRIX_COLORS if self._eye_style == 'matrix'
+                           else STATE_COLORS)
+
         # ── State ────────────────────────────────────────────────────────────
         self._current_state  = _DEFAULT_STATE
         self._state_lock     = threading.Lock()
         self._stop_event     = threading.Event()
 
         # Animation variables
-        self._blended_color = list(STATE_COLORS[_DEFAULT_STATE])
+        self._blended_color = list(self._palette[_DEFAULT_STATE])
         self._pulse_speed   = _PULSE_SPEED[_DEFAULT_STATE]
 
         # ── Hardware init ─────────────────────────────────────────────────────
@@ -287,7 +431,7 @@ class EyeNode(Node):
 
     def _robot_state_cb(self, msg: String):
         state = msg.data.strip().upper()
-        if state in STATE_COLORS:
+        if state in self._palette:
             with self._state_lock:
                 self._current_state = state
             self.get_logger().info(f'robot_state → {state}')
@@ -342,7 +486,7 @@ class EyeNode(Node):
             with self._state_lock:
                 state = self._current_state
 
-            target_color = STATE_COLORS[state]
+            target_color = self._palette[state]
 
             # Smooth color transition between states
             self._blended_color = list(_lerp_color(
@@ -360,7 +504,10 @@ class EyeNode(Node):
             pulse = max(0.0, min(1.0, pulse + random.uniform(-0.04, 0.04)))
 
             try:
-                eye_img = _draw_cyborg_eye(now, pulse, color)
+                if self._eye_style == 'matrix':
+                    eye_img = _draw_matrix_eye(now, pulse, color)
+                else:
+                    eye_img = _draw_cyborg_eye(now, pulse, color)
 
                 if _HW_AVAILABLE and self._spi0 is not None:
                     self._send_frame(self._spi0, eye_img)
