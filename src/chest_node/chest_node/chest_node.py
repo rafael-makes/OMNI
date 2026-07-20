@@ -6,6 +6,9 @@ Pi → ESP32 protocol (ASCII, newline-terminated):
   <STATE>\n          — one of IDLE / LISTENING / SPEAKING / NAVIGATING / EXPLORING / DOCKING / ERROR
   AUDIO:v1,...,v16\n — 16 floats 0.0-1.0, EQ visualization, sent at 10 Hz
   BAT:<pct>\n        — integer 0-100, sent on >0.5% change
+  PULSE:<camera>\n   — transient attention flash on the LED panels, from
+                       /chest/pulse. Overlays the current state animation for
+                       ~700 ms; does NOT change the displayed state.
 
 ESP32 → Pi protocol:
   WIFI:<ssid>:<password>\n — published to /wifi_config as String("ssid:password")
@@ -30,6 +33,13 @@ _VALID_STATES = frozenset({
 
 _AUDIO_CHANNELS = 16
 
+# Camera names allowed through to the panel. The wire protocol is newline- and
+# colon-delimited ASCII, so an unsanitised payload could inject a whole fake
+# command (e.g. "x\nERROR") — an allowlist is the cheap, total fix, and the set
+# of cameras is small and known. Unknown names are dropped with a warning rather
+# than passed through.
+_PULSE_CAMERAS = frozenset({'head', 'rear'})
+
 
 class ChestNode(Node):
 
@@ -39,10 +49,18 @@ class ChestNode(Node):
         self.declare_parameter('serial_port', '/dev/ttyAMA0')
         self.declare_parameter('baud_rate',   115200)
         self.declare_parameter('audio_hz',    10.0)
+        self.declare_parameter('pulse_topic', '/chest/pulse')
+        # Floor on the gap between pulses actually sent to the panel. The UART
+        # already carries AUDIO at 10 Hz; a burst of presence events must not be
+        # able to crowd it out. Retriggering inside this window is also visually
+        # pointless — the firmware would just restart the same 700 ms animation.
+        self.declare_parameter('pulse_min_interval', 0.25)
 
         self._port     = self.get_parameter('serial_port').value
         self._baud     = self.get_parameter('baud_rate').value
         self._audio_hz = self.get_parameter('audio_hz').value
+        self._pulse_min_interval = float(
+            self.get_parameter('pulse_min_interval').value)
 
         self._ser: serial.Serial | None = None
         self._serial_lock = threading.Lock()
@@ -53,8 +71,11 @@ class ChestNode(Node):
         self._audio_lock = threading.Lock()
         self._last_battery_pct: float | None = None
         self._last_safety_str: str | None = None
+        self._last_pulse_time: float = 0.0
 
         self.create_subscription(String,            '/robot_state',    self._state_cb,   10)
+        self.create_subscription(
+            String, self.get_parameter('pulse_topic').value, self._pulse_cb, 10)
         self.create_subscription(Float32MultiArray, '/audio/levels',   self._audio_cb,   10)
         self.create_subscription(BatteryState, '/battery/status', self._battery_cb, 10)
         self.create_subscription(String,      '/safety/status',  self._safety_cb,  10)
@@ -69,7 +90,10 @@ class ChestNode(Node):
 
         self.get_logger().info(
             f'chest_node started — {self._port} @ {self._baud}, '
-            f'audio {self._audio_hz:.0f} Hz'
+            f'audio {self._audio_hz:.0f} Hz, '
+            f'pulse on {self.get_parameter("pulse_topic").value} '
+            f'(min interval {self._pulse_min_interval:.2f}s, '
+            f'cameras {sorted(_PULSE_CAMERAS)})'
         )
 
     # ── Serial connection ─────────────────────────────────────────────────────
@@ -117,6 +141,28 @@ class ChestNode(Node):
         if self._serial_write(f'{state}\n'):
             self._current_state = state
             self.get_logger().debug(f'State → ESP32: {state}')
+
+    # ── /chest/pulse callback ─────────────────────────────────────────────────
+
+    def _pulse_cb(self, msg: String):
+        """Attention flash request from head_tracking_node.
+
+        Payload is the source camera name ("head" / "rear"). This is a
+        fire-and-forget visual cue that runs alongside whatever state the panel
+        is showing — it deliberately does not touch _current_state, so a pulse
+        can never leave the chest displaying the wrong thing.
+        """
+        camera = msg.data.strip().lower()
+        if camera not in _PULSE_CAMERAS:
+            self.get_logger().warn(f'Unknown pulse camera ignored: "{msg.data}"')
+            return
+
+        now = time.monotonic()
+        if now - self._last_pulse_time < self._pulse_min_interval:
+            return
+        if self._serial_write(f'PULSE:{camera}\n'):
+            self._last_pulse_time = now
+            self.get_logger().debug(f'Pulse → ESP32: PULSE:{camera}')
 
     # ── /audio/levels callback ────────────────────────────────────────────────
 

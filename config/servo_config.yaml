@@ -32,7 +32,10 @@ servos:
   head_tilt:
     board: 0
     channel: 6          # moved from ch5 (killed by the 2026-07-09 tilt-servo overheat)
-    neutral_pw: 1500
+    # 1562 µs = head level. Was 1500, which is full-DOWN on the ch6 servo — the head
+    # rested nose-down on every launch. Matched to head_tracking_node's tilt envelope;
+    # 90° here == that node's tilt_neutral_deg. Change both together or tracking biases.
+    neutral_pw: 1562
     min_pw: 700
     max_pw: 2300
   right_shoulder:

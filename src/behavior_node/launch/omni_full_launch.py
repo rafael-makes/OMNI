@@ -316,6 +316,21 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
+    # Drives head pan/tilt off the Jetson's /camera/faces (person boxes as fallback).
+    # No parameter overrides on purpose: the defaults in the node ARE the calibrated
+    # values (gains tuned live, per-axis travel limits measured), and they stay live-
+    # tunable via `ros2 param set /head_tracking_node ...`. Its tilt envelope is
+    # coupled to head_tilt.neutral_pw in config/servo_config.yaml — see the note there.
+    # Safe at t=0: servo_node creates its /servo_commands subscription only after its
+    # one-at-a-time init sweep finishes, so nothing lands mid-sweep.
+    head_tracking_node = Node(
+        package='head_tracking_node',
+        executable='head_tracking_node',
+        name='head_tracking_node',
+        output='screen',
+        emulate_tty=True,
+    )
+
     chest_node = Node(
         package='chest_node',
         executable='chest_node',
@@ -551,6 +566,7 @@ def generate_launch_description():
         # Peripherals (t=0)
         eye_node,
         servo_node,
+        head_tracking_node,
         chest_node,
         # Boot floor resolution: AprilTag dock -> baro fallback sets map_file.
         # Blocks ~6s while it reads the tag topic + BMP280, then baro_node starts.

@@ -18,6 +18,11 @@
  *   BAT:<pct>\n           integer 0-100
  *   SAFETY:OK\n           all clear
  *   SAFETY:<faults>\n     comma-separated active fault names e.g. "watchdog,estop"
+ *   PULSE:<camera>\n      transient attention flash, e.g. "PULSE:rear". Sent by
+ *                         head_tracking_node when a person appears, at the same
+ *                         moment the head starts turning toward them. Overlays
+ *                         the current state animation for PULSE_MS and then
+ *                         disappears — it does NOT change robotState.
  *
  * ESP32 → Pi:
  *   WIFI:<ssid>:<password>\n    sent when user confirms WiFi settings menu
@@ -59,6 +64,21 @@ int        batteryPct  = 0;
 float      audio[16]   = {};  // 0.0-1.0, updated at 10 Hz from Pi
 String     safetyStatus = "OK";  // content after "SAFETY:" from Pi
 bool       safetyFault  = false; // true when status is not OK
+
+// ── Attention pulse ───────────────────────────────────────────────────────────
+// A transient overlay on the LED bars, triggered by "PULSE:<camera>" from the
+// Pi. Deliberately NOT a state: it decays on its own and leaves robotState
+// alone, so the panel keeps showing what OMNI is actually doing.
+//
+// pulseStart == 0 means "not pulsing". Elapsed time is computed as an unsigned
+// subtraction, which stays correct across the 49-day millis() wrap.
+// 1100 ms, not 700: at 700 the sweep was over in ~300 ms, too fast to perceive
+// as motion. Live test 2026-07-20 — both directions were seen, but read as the
+// same flash.
+#define PULSE_MS 1100UL
+
+uint32_t pulseStart   = 0;
+bool     pulseOutward = false;  // true = radiate from centre, false = sweep L→R
 
 // ── App mode ──────────────────────────────────────────────────────────────────
 enum AppMode {
@@ -230,17 +250,92 @@ float barLevel(int col, int side) {
     }
 }
 
+// Pulse tuning. Sweep occupies most of PULSE_MS so the motion is legible; the
+// short remainder fades the tail out. LEAD sharpens the bright head, TRAIL sets
+// how far the glow drags behind it.
+#define PULSE_SWEEP_FRAC 0.90f
+#define PULSE_LEAD       1.0f
+#define PULSE_TRAIL      2.5f
+
+// Pulse intensity (0.0-1.0) for one bar, given normalized pulse age t (0.0-1.0).
+//
+// A COMET: a bright head sweeps across the bars with a decaying tail behind it,
+// so only ~6 of the 16 bars are lit at any instant and the MOTION is the signal.
+//
+// This is the third design. v1 (moving crest under a global decay) killed the
+// wave before it crossed — far bars peaked at 0.02, half the chest never lit.
+// v2 (sweep leaving every bar lit, then fade) lit fully but both directions
+// ENDED in the identical all-lit-and-fading state, so on hardware (2026-07-20)
+// rear and head were indistinguishable. The comet keeps the panel partly lit
+// throughout, so the direction of travel stays visible the whole time.
+//
+// The two directions exist only so different cameras are visually distinct —
+// the chest faces forward, so it cannot honestly point "behind". Outward-from-
+// centre is used for rear because radiating reads as "something around me",
+// which is closer to true than a left/right arrow would be.
+float pulseAt(int col, int side, float t) {
+    float bi = (float)(col + side * 8);   // global bar index 0-15
+
+    float tw   = min(1.0f, t / PULSE_SWEEP_FRAC);
+    float fade = (t < PULSE_SWEEP_FRAC)
+        ? 1.0f
+        : 1.0f - (t - PULSE_SWEEP_FRAC) / (1.0f - PULSE_SWEEP_FRAC);
+
+    float dist, front;
+    if (pulseOutward) {
+        // Comet head starts at the centre seam and expands to both outer edges.
+        dist  = fabsf(bi - 7.5f);
+        front = tw * 8.5f;
+    } else {
+        // Comet head travels the left edge to the right edge.
+        dist  = bi;
+        front = tw * 17.0f;
+    }
+
+    // rel < 0: ahead of the head — a sharp gaussian lead-in.
+    // rel >= 0: behind the head — an exponential trailing glow.
+    float rel = front - dist;
+    float v   = (rel < 0.0f)
+        ? expf(-(rel * rel) / PULSE_LEAD)
+        : expf(-rel / PULSE_TRAIL);
+
+    return constrain(v * fade, 0.0f, 1.0f);
+}
+
 void updateLEDs() {
-    CRGB color = stateColor(robotState);
+    CRGB base = stateColor(robotState);
+
+    // Expire the pulse here rather than in loop(): this is the only place that
+    // consumes it, so it cannot be left half-applied for a frame.
+    bool  pulsing = false;
+    float t       = 0.0f;
+    if (pulseStart != 0) {
+        uint32_t elapsed = millis() - pulseStart;
+        if (elapsed >= PULSE_MS) {
+            pulseStart = 0;
+        } else {
+            pulsing = true;
+            t       = (float)elapsed / (float)PULSE_MS;
+        }
+    }
 
     for (int col = 0; col < 8; col++) {
-        int hL = constrain((int)(barLevel(col, 0) * 8.0f + 0.5f), 0, 8);
-        int hR = constrain((int)(barLevel(col, 1) * 8.0f + 0.5f), 0, 8);
+        float pL = pulsing ? pulseAt(col, 0, t) : 0.0f;
+        float pR = pulsing ? pulseAt(col, 1, t) : 0.0f;
+
+        // The pulse raises the bar (max, not sum) and washes its colour toward
+        // white. Taking the max means a loud SPEAKING bar is never dimmed by the
+        // overlay — the flash can only ever add light.
+        int hL = constrain((int)(max(barLevel(col, 0), pL) * 8.0f + 0.5f), 0, 8);
+        int hR = constrain((int)(max(barLevel(col, 1), pR) * 8.0f + 0.5f), 0, 8);
+
+        CRGB cL = (pL > 0.0f) ? blend(base, CRGB::White, (uint8_t)(pL * 255.0f)) : base;
+        CRGB cR = (pR > 0.0f) ? blend(base, CRGB::White, (uint8_t)(pR * 255.0f)) : base;
 
         for (int row = 0; row < 8; row++) {
             // row 7 = bottom of panel; bars grow upward
-            leftLEDs[ledIdx(col, row)]  = (row >= 8 - hL) ? color : CRGB::Black;
-            rightLEDs[ledIdx(col, row)] = (row >= 8 - hR) ? color : CRGB::Black;
+            leftLEDs[ledIdx(col, row)]  = (row >= 8 - hL) ? cL : CRGB::Black;
+            rightLEDs[ledIdx(col, row)] = (row >= 8 - hR) ? cR : CRGB::Black;
         }
     }
     FastLED.show();
@@ -429,6 +524,17 @@ void parseLine(const String& line) {
             batteryPct = pct;
             if (appMode == MODE_NORMAL) dispDirty = true;
         }
+    }
+    else if (line.startsWith("PULSE:")) {
+        String cam = line.substring(6);
+        cam.trim();
+        // Restarting the timer on every PULSE is intentional: two arrivals in
+        // quick succession should read as one sustained flash, not a stutter.
+        pulseOutward = (cam == "rear");
+        pulseStart   = millis();
+        if (pulseStart == 0) pulseStart = 1;  // 0 is the "not pulsing" sentinel
+        // No display redraw and no state change — the pulse lives on the LEDs
+        // only, so it cannot disturb whatever the user is doing in the menus.
     }
     else if (line.startsWith("SAFETY:")) {
         String s = line.substring(7);  // strip "SAFETY:" prefix
