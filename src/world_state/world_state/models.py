@@ -21,6 +21,12 @@ class Detection:
     ``source_track`` is the *source-side* track id, unique only within a camera.
     Supplying it is what lets an anonymous detection later be promoted when the
     recognizer puts a name to the same track.
+
+    ``map_xy`` and ``zone`` are the coarse *where*: an estimated (x, y) in the
+    map frame and the named zone it falls in. Both are computed by the ROS
+    wrapper (which knows the robot pose) and carried through untouched — the
+    tracker never does geometry. Both are None when localisation or a zone map
+    is unavailable, and the tracker degrades cleanly to identity-only "who".
     """
 
     camera: str
@@ -29,6 +35,8 @@ class Detection:
     confidence: float = 0.0
     bbox: Optional[BBox] = None
     source_track: Optional[int] = None
+    map_xy: Optional[tuple[float, float]] = None
+    zone: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.camera:
@@ -55,6 +63,10 @@ class PersonTrack:
     bbox: Optional[BBox] = None
     cameras_seen: list[str] = field(default_factory=list)
     source_track: Optional[int] = None   # binding on `camera`, for promotion
+    # Coarse location of the most recent detection that carried one. Kept even
+    # after the person goes away, so "where did I last see Rafael" is answerable.
+    map_xy: Optional[tuple[float, float]] = None
+    zone: Optional[str] = None
 
     @property
     def is_identified(self) -> bool:
@@ -74,6 +86,8 @@ class PersonTrack:
             "seconds_since_seen": round(max(0.0, now - self.last_seen), 3),
             "visible": self.visible,
             "bbox": list(self.bbox) if self.bbox else None,
+            "zone": self.zone,
+            "map_xy": [round(self.map_xy[0], 3), round(self.map_xy[1], 3)] if self.map_xy else None,
         }
 
 

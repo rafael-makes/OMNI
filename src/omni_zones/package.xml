@@ -1,21 +1,15 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>world_state</name>
+  <name>omni_zones</name>
   <version>0.1.0</version>
-  <description>OMNI world state: who is where right now — ROS-free tracker core + thin ROS2 wrapper</description>
+  <description>OMNI named zones (rooms) as map-frame polygons — a ROS-free shared library used by behavior_node and world_state</description>
   <maintainer email="pi@omni.local">pi</maintainer>
   <license>MIT</license>
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>std_srvs</depend>
-  <depend>vision_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>omni_zones</depend>
-
-  <exec_depend>launch</exec_depend>
-  <exec_depend>launch_ros</exec_depend>
+  <!-- Deliberately no rclpy dependency: this package is pure Python and must
+       import on a desktop with no ROS installed. -->
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

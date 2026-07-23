@@ -11,6 +11,33 @@ is around reads one topic instead of re-deriving it from raw vision.
 State tracking **only** — no behaviour, no LLM calls, no decisions. Consumers
 (behavior_node, future session work) decide what to *do* with the state.
 
+Since Session 7 each track also carries a **coarse zone** — the named room the
+person is estimated to be in — so "who is *where*" is answerable, not just "who".
+
+## Zones — the coarse "where" (Session 7)
+
+Each `PersonTrack` carries `map_xy` (estimated map-frame position) and `zone`
+(the named room it falls in). The ROS wrapper computes both from the robot pose
+(TF `map`→`base_link`) and the detection's camera + horizontal bearing, using
+the shared **`omni_zones`** library (polygons, point-in-zone). The core tracker
+never does geometry — it carries `map_xy`/`zone` through exactly like `bbox`.
+
+**This is room-level, not metric.** Read `omni_zones/geometry.py` before trusting
+a coordinate. Error sources, largest first: **distance is assumed** (`1.5 m`,
+monocular vision gives no range), **head pan is ignored** (the head cam is on a
+pan/tilt `head_tracking` swings ±40°; only the mounting offset is modelled), and
+**bearing needs the image width** (param `camera_image_width`, defaults 1920 px).
+When the estimate lands in no zone but the robot is in one, the wrapper reports
+the **robot's** zone — a person at conversational range is almost always in the
+robot's room. That fallback is what makes "come here" land in the right room.
+
+Degrades cleanly: no TF (localisation down) → `map_xy`/`zone` are `null` and the
+tracker is identity-only, exactly as before. A frame with no pose never wipes a
+good last-known zone (that is how "where did I last see Rafael" survives him
+leaving). Empty zone map (the shipped default) → every point is in no zone → all
+`zone`s are `null`; fill in `omni_zones/config/zones.yaml` once the space is
+traced into rooms. `test_zone_tracking.py` covers all of this.
+
 ## Layout
 - `world_state/` — core library. **No ROS imports.** Must run on a desktop with
   no ROS installed (SPEC convention, same as `omni_memory`).
@@ -118,6 +145,13 @@ library is clock-agnostic: the caller always supplies the timestamp.
 | `min_confidence` | `0.0` | floor for ingesting a detection (YOLO boxes only) |
 | `match_radius` | `160.0` | px; centroid association. `0` disables it |
 | `person_class` | `person` | YOLO class filter |
+| `map_frame` | `map` | TF frame for the robot pose |
+| `robot_frame` | `base_link` | TF child frame |
+| `zones_config` | `''` | YAML with a top-level `zones:` map; `''` → `omni_zones`'s shipped default |
+| `camera_offsets_deg` | `['head=0.0','rear=180.0']` | camera mounting yaw vs robot-forward |
+| `camera_hfov_deg` | `['head=66.0','rear=66.0']` | horizontal FOV per camera |
+| `camera_image_width` | `['head=1920.0','rear=1920.0']` | px; needed to turn a column into a bearing |
+| `assumed_person_distance` | `1.5` | m; monocular range guess, not a measurement |
 
 QoS: identities on default (reliable) depth 10; `Detection2DArray` on
 **SENSOR_DATA (best effort)** — the Jetson publishes best-effort, and a

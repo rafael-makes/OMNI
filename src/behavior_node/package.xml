@@ -16,6 +16,7 @@
   <depend>vision_msgs</depend>
   <depend>omni_memory_msgs</depend>
   <exec_depend>omni_memory</exec_depend>
+  <exec_depend>omni_zones</exec_depend>
 
   <buildtool_depend>ament_python</buildtool_depend>
   <test_depend>ament_copyright</test_depend>

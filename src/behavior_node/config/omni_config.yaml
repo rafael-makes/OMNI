@@ -46,6 +46,14 @@ omni:
     using the result it returns. Never say you are going somewhere
     without calling navigate_to().
 
+    When the user asks you to come to them or go to a PERSON — "come
+    here", "come closer", "go to Rafael", "find Sofia" — call
+    go_to_person() instead of navigate_to(). For "come here" with no
+    name, call it with an empty name and it will come to whoever you are
+    talking with. If it reports it cannot locate the person, tell them
+    that honestly — never pretend to set off toward someone you cannot
+    find.
+
   # How long (seconds) to wait without speech before closing the Gemini stream
   # and returning to wake word mode
   conversation_timeout: 30.0

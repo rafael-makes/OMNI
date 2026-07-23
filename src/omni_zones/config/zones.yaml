@@ -1,0 +1,52 @@
+# zones.yaml — named rooms as polygons in the SLAM map frame.
+#
+# THE SHARED SOURCE OF TRUTH for "where the rooms are". Read by:
+#   * behavior_node  — navigate_to("kitchen") and go_to_person() resolve a goal
+#                       pose from here; go_to_person needs the polygon too.
+#   * world_state     — labels each person track with the zone their estimated
+#                       map position falls in.
+#
+# Frame & units: 'map' frame, metres, the same frame Nav2 goals and
+# save_location already use. Read your map coordinates off the SLAM map (e.g.
+# echo /pose while standing in each corner, or read them off the map image).
+#
+# Each zone:
+#   <name>:
+#     polygon: [[x, y], ...]     # >= 3 vertices tracing the room, map metres
+#     anchor:  [x, y, yaw_deg]   # OPTIONAL: the pose to park at when sent here.
+#                                #   Omit to use the polygon centroid, facing 0.
+#                                #   Prefer an explicit anchor: the centroid is
+#                                #   often the middle of a table.
+#     check_in_side: left        # OPTIONAL: 'left' or 'right'. Which side to
+#                                #   stand on during a Session 9 proactive
+#                                #   check-in, so OMNI arrives BESIDE you rather
+#                                #   than blocking the bench you are working at.
+#                                #   This is a fixed per-room convention because
+#                                #   nothing estimates which way a person is
+#                                #   facing — but you always sit the same way at
+#                                #   a given bench, so a constant is good enough.
+#                                #   Omit to use behavior_node's
+#                                #   check_in_default_side.
+#
+# Draw polygons COARSELY. A zone is "the right room, not the centimetre" — the
+# person-location estimate that feeds world_state is room-level at best (see
+# omni_zones/geometry.py). Rough rectangles around each room are the intent.
+#
+# Empty is valid: with no zones defined, navigate_to falls back to the point
+# locations in omni_config.yaml, and go_to_person honestly reports it cannot
+# place anyone. Fill this in once the space is mapped.
+
+zones: {}
+
+# ── Example (commented) — a two-room flat ────────────────────────────────────
+# zones:
+#   kitchen:
+#     polygon: [[0.0, 0.0], [3.0, 0.0], [3.0, 2.5], [0.0, 2.5]]
+#     anchor:  [1.5, 1.0, 90.0]
+#   living_room:
+#     polygon: [[3.0, 0.0], [7.0, 0.0], [7.0, 4.0], [3.0, 4.0]]
+#     anchor:  [5.0, 2.0, 180.0]
+#   workbench:
+#     polygon: [[7.0, 0.0], [10.0, 0.0], [10.0, 3.0], [7.0, 3.0]]
+#     anchor:  [8.5, 1.5, 0.0]
+#     check_in_side: left      # you sit facing the bench; OMNI comes up on your left

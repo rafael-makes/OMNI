@@ -254,6 +254,8 @@ class WorldState:
             bbox=det.bbox,
             cameras_seen=[det.camera],
             source_track=det.source_track,
+            map_xy=det.map_xy,
+            zone=det.zone,
         )
         self._tracks[track.track_id] = track
         self._next_id += 1
@@ -271,6 +273,13 @@ class WorldState:
         track.visible = True
         if det.camera not in track.cameras_seen:
             track.cameras_seen.append(det.camera)
+        # Only overwrite the coarse location when this detection actually carries
+        # one. A frame where localisation was momentarily unavailable (map_xy is
+        # None) must not wipe a good last-known zone — "where did I last see
+        # them" should survive a gap in the TF tree.
+        if det.map_xy is not None:
+            track.map_xy = det.map_xy
+            track.zone = det.zone
 
     def _absorb(self, keep: PersonTrack, drop: PersonTrack) -> None:
         keep.first_seen = min(keep.first_seen, drop.first_seen)
