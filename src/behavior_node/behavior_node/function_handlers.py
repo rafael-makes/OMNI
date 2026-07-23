@@ -27,10 +27,20 @@ import rclpy
 import rclpy.duration
 import rclpy.time
 import yaml
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from google.genai import types as genai_types
-from nav2_msgs.action import NavigateToPose
 from tf2_ros import Buffer, TransformListener
+
+from omni_zones import standoff_pose
+
+from behavior_node.person_nav import (
+    NO_NAME,
+    NO_WORLD_STATE,
+    STALE,
+    UNKNOWN,
+    UNPLACED,
+    humanise_age,
+    plan_go_to_person,
+)
 
 # ── Valid robot states ─────────────────────────────────────────────────────────
 # ALL states that _set_state() will accept. Imported by behavior_node.py.
@@ -95,6 +105,35 @@ OMNI_TOOLS = [
                         )
                     },
                     required=['location'],
+                ),
+            ),
+
+            genai_types.FunctionDeclaration(
+                name='go_to_person',
+                description=(
+                    'Drive OMNI to a specific person by name, or to the person '
+                    'you are talking with. Call this for "come here", "come to '
+                    'me", "come closer", "go to Rafael", "find Sofia", "bring '
+                    'yourself over". OMNI works out which room they are in from '
+                    'its world model and drives to a polite standing distance '
+                    'from them — you do NOT need to call navigate_to as well. If '
+                    'the person cannot be located it returns a status saying so; '
+                    'relay that honestly rather than pretending to set off. Use '
+                    'navigate_to instead for places (rooms, saved spots), not '
+                    'people.'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        'name': genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description=(
+                                "The person's first name, e.g. \"rafael\". Leave "
+                                'empty for "come here" / "come to me" — OMNI will '
+                                'go to whoever it is currently talking with.'
+                            ),
+                        )
+                    },
                 ),
             ),
 
@@ -263,6 +302,7 @@ class FunctionHandlers:
         handlers = {
             'set_robot_state':  self._set_robot_state,
             'navigate_to':      self._navigate_to,
+            'go_to_person':     self._go_to_person,
             'stop_navigation':  self._stop_navigation,
             'report_status':    self._report_status,
             'explore_area':     self._explore_area,
@@ -300,10 +340,13 @@ class FunctionHandlers:
 
     def _navigate_to(self, args: dict) -> str:
         location = args.get('location', '').lower().strip()
-        locations = self._node._locations   # dict loaded from omni_config.yaml
 
-        if location not in locations:
-            known = ', '.join(sorted(locations.keys())) if locations else 'none programmed yet'
+        # Resolves a saved point location OR a zone anchor (Session 7) — one
+        # unified name space for "go to the kitchen".
+        pose = self._node.resolve_location(location)
+        if pose is None:
+            known_names = self._node.known_place_names()
+            known = ', '.join(known_names) if known_names else 'none programmed yet'
             self._node.get_logger().info(
                 f'navigate_to called for unknown location: {location!r} '
                 f'(known: {known})'
@@ -311,7 +354,7 @@ class FunctionHandlers:
             return (
                 f"I'm afraid '{location}' is not in my navigation database. "
                 f"I cannot, in good conscience, simply wander off without a known destination. "
-                f"{'Known locations are: ' + known + '.' if locations else 'No locations have been programmed yet.'}"
+                f"{'Known locations are: ' + known + '.' if known_names else 'No locations have been programmed yet.'}"
             )
 
         # Check Nav2 is running before we try to send a goal.
@@ -325,39 +368,129 @@ class FunctionHandlers:
                 "I cannot proceed to the destination until it is started."
             )
 
-        coords = locations[location]   # [x, y, yaw_degrees]
-        x, y   = float(coords[0]), float(coords[1])
-        yaw_deg = float(coords[2]) if len(coords) > 2 else 0.0
-
-        goal_msg      = NavigateToPose.Goal()
-        goal_msg.pose = PoseStamped()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp    = self._node.get_clock().now().to_msg()
-        goal_msg.pose.pose.position.x = x
-        goal_msg.pose.pose.position.y = y
-        goal_msg.pose.pose.position.z = 0.0
-
-        # For 2D navigation only the z and w quaternion components matter (yaw only).
-        yaw_rad = math.radians(yaw_deg)
-        goal_msg.pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
-        goal_msg.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
-
-        self._node.get_logger().info(
-            f'Sending navigation goal: {location} → x={x}, y={y}, yaw={yaw_deg}°'
-        )
-        self._node._set_state('NAVIGATING')
-
-        # send_goal_async is thread-safe — schedules the goal on the ROS2 executor.
-        # The callback stores the goal handle so stop_navigation() can cancel it.
-        send_future = self._node._nav_action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self._node._nav_feedback_callback,
-        )
-        send_future.add_done_callback(self._node._nav_goal_response_callback)
+        x, y, yaw_deg = pose
+        self._node.start_navigation(x, y, yaw_deg, intent=('place', location))
 
         return (
             f'Very well, I am setting a course for the {location}. '
             f'Navigation initiated. I shall proceed with all due care.'
+        )
+
+    def _robot_xy(self):
+        """(x, y) of the robot in the map frame, or None if TF is unavailable."""
+        pose = self.robot_pose()
+        return None if pose is None else (pose[0], pose[1])
+
+    def robot_pose(self):
+        """(x, y, yaw_deg) of the robot in the map frame, or None if TF cannot
+        answer.
+
+        Public because the Session 9 check-in needs the full pose, not just the
+        position: it snapshots where OMNI was standing so it can drive back there
+        afterwards, and a return that arrives facing the wrong way is a return
+        that looks like a malfunction. Same TF source as save_location — map →
+        base_link, available whenever localisation is up.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+        except Exception:
+            return None
+        t   = tf.transform.translation
+        ori = tf.transform.rotation
+        yaw_deg = math.degrees(2.0 * math.atan2(ori.z, ori.w))
+        return (t.x, t.y, yaw_deg)
+
+    def _go_to_person(self, args: dict) -> str:
+        """Drive to a named person's last-known room, stopping a polite distance
+        short of them. "Come here" (no name) resolves to the current interlocutor.
+
+        The decision — do I know where they are, and is it recent enough to drive
+        to — is pure logic in person_nav.plan_go_to_person (unit-tested, ROS-free).
+        This method owns only the ROS side: the standoff geometry, the Nav2 goal,
+        and the in-character line. Location from world_state is coarse (room-level
+        — see world_state/CLAUDE.md), so anything short of a confident, recent fix
+        is spoken honestly rather than driven to. The success criterion is
+        arriving in the right *room*; Session 6's head tracking does the
+        looking-at once OMNI is there.
+        """
+        node = self._node
+        plan = plan_go_to_person(
+            snapshot=node.latest_world_state(),
+            name=args.get('name', ''),
+            session_person=getattr(node, '_session_person', None),
+            stale_after=node._person_stale_after,
+        )
+        who = plan.display
+        ago = humanise_age(plan.seconds_since_seen)
+
+        if plan.outcome == NO_NAME:
+            return (
+                "I should be glad to come over, but I'm not certain who I am "
+                "speaking with — might I ask your name first?"
+            )
+        if plan.outcome == NO_WORLD_STATE:
+            return (
+                f"I'm afraid I cannot tell where {who} is — my world-tracking "
+                f"system is not reporting at the moment. Most vexing."
+            )
+        if plan.outcome == UNKNOWN:
+            return (
+                f"I'm afraid I do not know where {who} is — I have no record of "
+                f"seeing them. I cannot, in good conscience, go to someone I "
+                f"cannot find."
+            )
+        if plan.outcome == UNPLACED:
+            return (
+                f"I can account for {who}, but I never fixed their position on my "
+                f"map, so I cannot tell which room to go to. How limiting."
+            )
+        if plan.outcome == STALE:
+            where = f" in the {plan.zone}" if plan.zone else ''
+            return (
+                f"I last saw {who}{where} {ago}, but I cannot be certain they are "
+                f"still there, so I shan't set off blindly. Might you call them?"
+            )
+
+        # plan.outcome == GO
+        if not node.nav_is_ready():
+            return (
+                f"I should like to go to {who}, but my navigation systems are not "
+                f"available at present — Nav2 does not appear to be running."
+            )
+
+        # Prefer a standoff near the point estimate; fall back to the zone anchor.
+        goal = None
+        if plan.map_xy is not None:
+            person_xy = (float(plan.map_xy[0]), float(plan.map_xy[1]))
+            robot_xy = self._robot_xy()
+            if robot_xy is not None:
+                goal = standoff_pose(
+                    person_xy, robot_xy, standoff=node._person_standoff)
+            else:
+                # No robot pose to compute a standoff direction — aim at the
+                # estimate itself. Coarse, but it still lands in the right room.
+                goal = (person_xy[0], person_xy[1], 0.0)
+        if goal is None and plan.zone:
+            goal = node._zones.nav_pose(plan.zone)
+        if goal is None:
+            return (
+                f"I can tell {who} is about, but not precisely enough to navigate "
+                f"to them. How frustrating."
+            )
+
+        x, y, yaw = goal
+        node.get_logger().info(
+            f'go_to_person({plan.name}): zone={plan.zone!r} map_xy={plan.map_xy} '
+            f'seen {ago} -> goal x={x:.2f} y={y:.2f} yaw={yaw:.0f}°')
+        node.start_navigation(x, y, yaw, intent=('person', who))
+
+        where = f', in the {plan.zone},' if plan.zone else ''
+        return (
+            f'Very well, I am making my way to {who}{where} now. '
+            f'Navigation initiated — I shall approach with all due care.'
         )
 
     def _stop_navigation(self, args: dict) -> str:

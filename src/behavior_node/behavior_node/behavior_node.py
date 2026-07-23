@@ -32,6 +32,7 @@ THREAD SAFETY (read this before editing):
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -51,7 +52,19 @@ from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, Float32MultiArray, String
 from vision_msgs.msg import Detection2DArray
 
+from datetime import datetime, time as dt_time
+
+from omni_zones import load_zone_map
+
 from behavior_node.audio_handler import AudioHandler
+from behavior_node.check_in import CheckInBehavior
+from behavior_node.check_in_policy import (
+    OUTCOME_NOT_NOW,
+    OUTCOME_NO_RESPONSE,
+    OUTCOME_YES,
+    CheckInConfig,
+    CheckInPolicy,
+)
 from behavior_node.function_handlers import FunctionHandlers, VALID_STATES
 from behavior_node.gemini_bridge import GeminiBridge
 from behavior_node.frame_client import FrameClient
@@ -59,10 +72,35 @@ from behavior_node.greeting_decider import GreetingDecider
 from behavior_node.memory_client import MemoryClient
 from behavior_node.memory_format import wrap_memory_context
 from behavior_node.scene_describer import SceneDescriber
+from behavior_node.suppression import RobotStatus, interaction_blocked
 from behavior_node.wake_word import WakeWordDetector
 
 # States that cause the Gemini stream to close (robot is busy, can't converse)
 _STATES_CLOSE_STREAM = {'NAVIGATING', 'EXPLORING', 'DOCKING'}
+
+
+def _split_csv(raw) -> list:
+    """"a, b" -> ['a', 'b']; "" -> []. Also accepts a real list, so a params file
+    supplying a proper YAML sequence still works — only the *default* has to be a
+    string (see check_in_zones for why)."""
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return [part.strip() for part in str(raw or '').split(',') if part.strip()]
+
+
+def _parse_clock(text: str, *, default: dt_time) -> dt_time:
+    """Parse an "HH:MM" parameter into a time, falling back to `default`.
+
+    Never raises: a typo in quiet_hours must not stop the robot from booting. A
+    bad value falls back to the safe default (quiet hours still enforced) rather
+    than to "no quiet hours at all", because the failure that matters here is
+    OMNI talking at midnight.
+    """
+    try:
+        hh, _, mm = str(text).strip().partition(':')
+        return dt_time(int(hh), int(mm or 0))
+    except (ValueError, TypeError):
+        return default
 
 
 class BehaviorNode(Node):
@@ -140,6 +178,66 @@ class BehaviorNode(Node):
         # '' -> config/greeting_prompt.txt from this package's share dir.
         self.declare_parameter('greeting_prompt_path', '')
 
+        # ── Person zones + go_to_person (Session 7) ──────────────────────────────
+        # navigate_to() resolves zone anchors too, and go_to_person() reads who is
+        # in which room from world_state. Zones are the SHARED omni_zones config —
+        # the SAME file world_state loads. '' -> omni_zones's shipped default.
+        self.declare_parameter('zones_config_path',  '')
+        self.declare_parameter('world_state_topic',  '/omni/world_state')
+        # Beyond this age, a last-known person location is reported as uncertain
+        # rather than driven to — "go to Rafael" then honestly says it's not sure.
+        self.declare_parameter('person_location_stale_after', 120.0)
+        # How far short of a person's estimated spot to stop, metres.
+        self.declare_parameter('person_standoff_distance',    1.0)
+
+        # ── Proactive check-in (Session 9) ───────────────────────────────────────
+        # Driven by person_dwelling on /omni/events. The DECISION lives in
+        # check_in_policy (ROS-free, exhaustively tested); these are its knobs,
+        # plus the geometry and timeouts of the drive-over itself.
+        #
+        # The bar is deliberately high. Interrupting focus is how this feature
+        # gets turned off — permanently, by the person it was built for.
+        self.declare_parameter('check_in_enabled',       True)
+        # Seconds at one spot before a check-in is even considered. 60 minutes.
+        self.declare_parameter('check_in_min_dwell',     3600.0)
+        # A check-in costs a round trip across the room; the greeting floor (20%)
+        # is far too generous for that.
+        self.declare_parameter('check_in_min_battery',   40.0)
+        # Quiet hours, local time, "HH:MM". The child sleeps.
+        self.declare_parameter('check_in_quiet_start',   '21:00')
+        self.declare_parameter('check_in_quiet_end',     '08:00')
+        # Cooldowns, seconds. Global = after ANY interaction with that person.
+        # The per-zone ones are what make "no" and "not now" mean different things.
+        self.declare_parameter('check_in_global_cooldown',  7200.0)    # 2 h
+        self.declare_parameter('check_in_no_cooldown',      14400.0)   # 4 h
+        self.declare_parameter('check_in_not_now_cooldown', 3600.0)    # 1 h
+        # Zones a check-in may happen in, COMMA-SEPARATED ("workbench,computer").
+        # Empty = trust event_generator's own dwell_zones (this is a second,
+        # independent belt). A string rather than a list because an empty list
+        # default cannot be typed in rclpy — declare_parameter overwrites the
+        # descriptor type from the value, an empty list infers as BYTE_ARRAY, and
+        # any override is then rejected as "expecting type BYTE_ARRAY".
+        self.declare_parameter('check_in_zones',         '')
+        # v1.5 learning: stretch the dwell threshold in zones where declines
+        # dominate, up to this multiple of check_in_min_dwell.
+        self.declare_parameter('check_in_bias_enabled',      True)
+        self.declare_parameter('check_in_bias_min_samples',  3)
+        self.declare_parameter('check_in_bias_max_multiplier', 2.0)
+        # Approach geometry. Stand BESIDE them, not in front — blocking someone's
+        # bench to ask if they need help is its own answer.
+        self.declare_parameter('check_in_standoff_distance', 1.0)
+        self.declare_parameter('check_in_lateral_offset',    0.6)
+        # Which side to arrive on when zones.yaml does not say. See the
+        # check_in_side note in omni_zones: world_state has no facing estimate,
+        # so v1 encodes a fixed side per zone in config.
+        self.declare_parameter('check_in_default_side',      'left')
+        # Seconds of silence after the opener before it is read as "not now" and
+        # OMNI quietly leaves. Never re-asks.
+        self.declare_parameter('check_in_silence_timeout',   15.0)
+        # Hard ceiling on the whole behaviour, so a wedged state can never strand
+        # OMNI mid-room believing it is still checking in.
+        self.declare_parameter('check_in_max_duration',      300.0)
+
         model           = self.get_parameter('gemini_model').value
         voice           = self.get_parameter('gemini_voice').value
         config_path     = os.path.expanduser(self.get_parameter('config_file_path').value)
@@ -177,6 +275,23 @@ class BehaviorNode(Node):
         system_prompt = omni_cfg.get('system_prompt', '')
         self._locations  = omni_cfg.get('locations', {})   # used by navigate_to()
         self._config_path = config_path                    # used by save_location()
+
+        # ── Zones (Session 7) — named rooms as map-frame polygons ────────────────
+        # Shared with world_state via the omni_zones library. navigate_to()
+        # resolves a zone's anchor as a destination, and go_to_person() maps a
+        # person's zone to a goal. Empty map (the shipped default) is fine: it
+        # just means navigate_to falls back to point locations and go_to_person
+        # honestly reports it cannot place anyone.
+        self._zones = self._load_zones()
+        # Latest /omni/world_state snapshot (parsed JSON) + when it arrived.
+        # go_to_person reads it; None until the first message or if world_state
+        # is not running.
+        self._world_state       = None
+        self._world_state_time  = 0.0
+        self._person_stale_after = float(
+            self.get_parameter('person_location_stale_after').value)
+        self._person_standoff = float(
+            self.get_parameter('person_standoff_distance').value)
 
         if not system_prompt:
             self.get_logger().warn(
@@ -230,6 +345,8 @@ class BehaviorNode(Node):
         # by _nav_cancel_callback() or when navigation completes.
         self._nav_action_client   = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._current_goal_handle = None   # ClientGoalHandle, or None if not navigating
+        self._nav_intent          = None   # (kind, label) of the current drive, or None
+        self._nav_started         = None   # monotonic start time of the current drive
 
         # ── Publishers ─────────────────────────────────────────────────────────
         self._state_pub       = self.create_publisher(String,             '/robot_state',         10)
@@ -237,6 +354,13 @@ class BehaviorNode(Node):
         self._servo_pub       = self.create_publisher(Float32MultiArray,  '/servo_commands',      10)
         self._levels_pub      = self.create_publisher(Float32MultiArray,  '/audio/levels',        10)
         self._clear_fault_pub = self.create_publisher(String,             '/safety/clear_fault',  10)
+        # Check-in state transitions go back onto the same semantic event bus
+        # event_generator publishes on, so anything watching OMNI's behaviour
+        # (chest LEDs, logging, a future dashboard) sees them without a new
+        # topic. Reliable depth 10, matching event_generator's publisher — these
+        # are rare and meaningful. Our own callback ignores kinds it does not
+        # handle, so publishing here cannot feed back into the greeting path.
+        self._events_pub      = self.create_publisher(String,             '/omni/events',         10)
 
         # ── Subscribers ────────────────────────────────────────────────────────
         self.create_subscription(String,       '/safety/fault',   self._on_safety_fault,  10)
@@ -253,6 +377,11 @@ class BehaviorNode(Node):
         self.create_subscription(
             Detection2DArray, '/camera/detections', self._on_detections, _sensor_qos
         )
+        # world_state (Session 7): who is in which room. Cached for go_to_person.
+        self.create_subscription(
+            String, self.get_parameter('world_state_topic').value,
+            self._on_world_state, 10,
+        )
 
         # ── Timers ─────────────────────────────────────────────────────────────
         # 10Hz state publisher — fast enough that any node coming online quickly
@@ -265,6 +394,11 @@ class BehaviorNode(Node):
         # Check presence timeout every 1 second. Gives ~1s re-arm latency when a
         # person reappears, which is imperceptible in normal use.
         self.create_timer(1.0, self._check_presence_timeout)
+        # Drives the check-in mission's timeouts: the 15s silence after the
+        # opener, "they got up mid-approach", and the hard duration ceiling. 1 Hz
+        # so the silence timeout is accurate to a second — it is short, and
+        # loitering after being ignored is precisely what it exists to prevent.
+        self.create_timer(1.0, self._tick_check_in)
 
         # ── Audio handler ──────────────────────────────────────────────────────
         self._audio = AudioHandler(
@@ -379,6 +513,63 @@ class BehaviorNode(Node):
                 f'unprompted greetings enabled '
                 f'(cooldown={self._greeting_cooldown}s, prompt={greet_prompt_path})')
 
+        # ── Proactive check-in (Session 9) ───────────────────────────────────────
+        # There is still no charging signal to read (bms_node never sets
+        # power_supply_status), so this stays False until the docking work lands.
+        # It is read by robot_status(), so setting it suppresses BOTH greetings and
+        # check-ins in one move.
+        self._docked = False
+
+        self._check_in_enabled = bool(self.get_parameter('check_in_enabled').value)
+        # Both stay None when check-ins are disabled; every call site guards on
+        # `is not None`, so the feature is genuinely absent rather than inert.
+        self._check_in = None
+        self._check_in_policy = None
+        if self._check_in_enabled:
+            self._check_in_policy = CheckInPolicy(
+                CheckInConfig(
+                    enabled=True,
+                    min_dwell=float(self.get_parameter('check_in_min_dwell').value),
+                    battery_floor=float(
+                        self.get_parameter('check_in_min_battery').value),
+                    quiet_start=_parse_clock(
+                        str(self.get_parameter('check_in_quiet_start').value),
+                        default=dt_time(21, 0)),
+                    quiet_end=_parse_clock(
+                        str(self.get_parameter('check_in_quiet_end').value),
+                        default=dt_time(8, 0)),
+                    global_cooldown=float(
+                        self.get_parameter('check_in_global_cooldown').value),
+                    no_cooldown=float(
+                        self.get_parameter('check_in_no_cooldown').value),
+                    not_now_cooldown=float(
+                        self.get_parameter('check_in_not_now_cooldown').value),
+                    bias_enabled=bool(
+                        self.get_parameter('check_in_bias_enabled').value),
+                    bias_min_samples=int(
+                        self.get_parameter('check_in_bias_min_samples').value),
+                    bias_max_multiplier=float(
+                        self.get_parameter('check_in_bias_max_multiplier').value),
+                ),
+                zones=_split_csv(self.get_parameter('check_in_zones').value),
+            )
+            self._check_in = CheckInBehavior(self, self._check_in_policy)
+            # Greetings already subscribe to /omni/events; only add a second
+            # subscription if greetings are off, so a dwell event is never
+            # delivered twice to the same callback.
+            if not self._greeting_enabled:
+                self.create_subscription(
+                    String,
+                    str(self.get_parameter('greeting_events_topic').value),
+                    self._on_presence_event,
+                    10,
+                )
+            self.get_logger().info(
+                f'proactive check-ins enabled '
+                f'(min_dwell={self._check_in_policy.config.min_dwell:.0f}s, '
+                f'quiet {self._check_in_policy.config.quiet_start}–'
+                f'{self._check_in_policy.config.quiet_end})')
+
         # Step 6: latest recognized identity + when it arrived (monotonic). Written
         # by the /camera/identity callback, read at wake time. _session_person is the
         # person latched for the CURRENT conversation so a mid-chat identity change
@@ -473,6 +664,17 @@ class BehaviorNode(Node):
         # and gets ALSA error -9985 (Device unavailable).
         if new_state == 'IDLE':
             self._last_activity_time = time.monotonic()
+            # A check-in conversation just ended: classify what they said and set
+            # off home. MUST run before _flush_conversation_to_memory(), which
+            # pops the transcript buffer that on_conversation_end() reads.
+            if self._check_in is not None and self._check_in.is_active():
+                self._check_in.on_conversation_end()
+            # Any completed conversation counts as an interaction for check-in
+            # purposes — OMNI having just talked to you is the most reliable
+            # signal that it does not need to walk over and talk to you again.
+            if self._check_in_policy is not None and self._session_person:
+                self._check_in_policy.record_interaction(
+                    self._session_person, datetime.now())
             # Conversation ended → persist it to memory (Step 5). Pops the bridge's
             # transcript buffer (empty if nothing was said) and stores it via the
             # omni_memory service. Non-blocking and best-effort. Done before the
@@ -648,40 +850,42 @@ class BehaviorNode(Node):
         Every one of these is enforced HERE, in code, and none of them is
         mentioned to the model. A suppression rule expressed as prompt text is a
         suggestion; a suppression rule expressed as a return statement is a rule.
+
+        The state / session / battery rules are SHARED with the Session 9
+        check-in, via suppression.interaction_blocked(). Two copies of that list
+        would drift, and the drift would be invisible — the failure mode is not a
+        crash, it is OMNI cheerfully interrupting a conversation months from now
+        because only one copy learned about a new state. What stays here is only
+        what is genuinely greeting-specific.
         """
         if not self._greeting_enabled or self._greeter is None:
             return 'greetings disabled'
 
+        return interaction_blocked(
+            self.robot_status(), min_battery=self._greeting_min_batt)
+
+    def robot_status(self) -> RobotStatus:
+        """Snapshot everything the shared suppression rules need to see.
+
+        One builder so greetings and check-ins can never disagree about what
+        "busy" means. Takes _state_lock — do not call while already holding it.
+
+        `docked` is wired but currently always False: bms_node builds
+        BatteryState field by field and never sets power_supply_status (verified
+        in its source), so "OMNI is on the charger" is not knowable from
+        /battery/status. The transient DOCKING state is covered by the state
+        check. When the docking work lands, set self._docked and BOTH features
+        inherit the suppression at once — that is the point of the shared helper.
+        """
         with self._state_lock:
             state = self._current_state
-
-        # Busy driving, docking, or faulted. Interrupting any of these with a
-        # cheerful hello is at best noise and at worst masks something urgent.
-        if state in ('NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'):
-            return f'robot is {state}'
-
-        # Mid-conversation. LISTENING/SPEAKING mean a wake-word chat is live —
-        # the person walking in must not talk over the person already talking.
-        if state in ('LISTENING', 'SPEAKING'):
-            return f'conversation in progress ({state})'
-
-        # Belt and braces: a session can be open in a state this check would
-        # otherwise wave through (a fault session that already recovered state,
-        # an /audio/say announcement still playing). open_session() would reject
-        # us anyway — better to not fire the API call at all.
-        if self._bridge.is_session_active():
-            return 'a Gemini session is already active'
-
-        # Low power. There is no "docked" signal to test: bms_node never populates
-        # BatteryState.power_supply_status, so charging is invisible from here.
-        # DOCKING is covered by the state check above; a persistent docked/charging
-        # state can be added to this function when the docking work lands.
-        if self._low_battery:
-            return 'battery is low'
-        if self._battery_pct is not None and self._battery_pct < self._greeting_min_batt:
-            return f'battery {self._battery_pct:.0f}% below {self._greeting_min_batt:.0f}%'
-
-        return None
+        return RobotStatus(
+            state=state,
+            session_active=self._bridge.is_session_active(),
+            low_battery=self._low_battery,
+            battery_pct=self._battery_pct,
+            docked=self._docked,
+        )
 
     def _on_presence_event(self, msg: String):
         """A semantic event from event_generator on /omni/events.
@@ -698,9 +902,18 @@ class BehaviorNode(Node):
             return
 
         kind = event.get('kind')
+
+        # Session 9: someone has been settled at one spot long enough to be worth
+        # walking over to. The manners live in CheckInPolicy; this only routes.
+        if kind == 'person_dwelling':
+            if self._check_in is not None:
+                self._check_in.on_dwell_event(event)
+            return
+
         if kind != 'person_appeared':
-            # person_left and unknown_person_detected are published for other
-            # consumers; greeting only cares about arrivals.
+            # person_left, unknown_person_detected and our own check_in phase
+            # events are published for other consumers; greeting only cares about
+            # arrivals.
             self.get_logger().debug(f'presence event ignored: {kind}')
             return
 
@@ -783,6 +996,12 @@ class BehaviorNode(Node):
             with self._greeting_lock:
                 self._greeting_last[identity] = time.monotonic()
 
+            # A greeting is an interaction: it starts the check-in global
+            # cooldown, so OMNI saying hello this morning is a reason not to walk
+            # over and interrupt this afternoon.
+            if self._check_in_policy is not None:
+                self._check_in_policy.record_interaction(identity, datetime.now())
+
             self.get_logger().info(f'greeting {identity}: "{decision.line}"')
             self._speak_unprompted(
                 f'Say exactly this out loud right now, in character, and then stop '
@@ -832,10 +1051,19 @@ class BehaviorNode(Node):
             preamble = f'{who}\n\n{wrapped}' if wrapped else who
             prompt = f'{preamble}\n\n{prompt}'
 
-        with self._state_lock:
-            state_before = self._current_state
-
-        if state_before == 'IDLE':
+        # Ask the detector whether it actually holds the mic, rather than
+        # inferring it from the state being IDLE. That inference was true for
+        # every caller until Session 9 and is now wrong in both directions:
+        #
+        #   * IDLE but NOT running — presence-disarm stops the detector while
+        #     staying in IDLE, so the old check paid a pointless 100ms sleep.
+        #   * NOT IDLE but running — nothing stops the detector when navigation
+        #     starts, and a check-in is the first path that drives FROM IDLE. So
+        #     OMNI arrives beside you in NAVIGATING with the detector still on
+        #     device 0, and the old check skipped the stop entirely. The capture
+        #     open then races a device that was never released: ALSA -9985, and
+        #     the check-in arrives and says nothing at all.
+        if self._wake.is_running():
             self._wake.stop()
             time.sleep(0.1)   # 100ms for ALSA to release device 0
         self._audio.start_capture()
@@ -864,6 +1092,19 @@ class BehaviorNode(Node):
                 'scene: vision warmup failed (check GEMINI_API_KEY / network) — '
                 'the first description will be slower'
             )
+
+    def _tick_check_in(self):
+        """1 Hz timer — hands the check-in mission a chance to time out or abort.
+
+        Wrapped because a raised exception in a ROS timer callback kills the
+        timer silently, which would strand a mission with no way to end it.
+        """
+        if self._check_in is None:
+            return
+        try:
+            self._check_in.tick()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'check-in tick failed: {exc}')
 
     def _flush_conversation_to_memory(self):
         """
@@ -983,6 +1224,11 @@ class BehaviorNode(Node):
         loop rather than executing it on this thread.
         """
         self.get_logger().info('Wake word detected — opening Gemini session')
+        # A wake word outranks a check-in from any state: the person is talking to
+        # OMNI now, which is a better outcome than whatever the mission was doing.
+        # abort() deliberately does not drive home — see its docstring.
+        if self._check_in is not None and self._check_in.is_active():
+            self._check_in.abort('wake word')
         self._set_state('LISTENING')
         self._reset_conversation_timeout()
         # Detector has released the mic — start capture before opening the session
@@ -1047,6 +1293,12 @@ class BehaviorNode(Node):
         # Snapshot state BEFORE calling _set_state so we know what was happening
         with self._state_lock:
             state_before_fault = self._current_state
+
+        # An e-stop or safety fault ends a check-in immediately, from any state.
+        # Abort BEFORE cancelling the goal: the mission must not see the cancelled
+        # result and helpfully dispatch a drive home into an active fault.
+        if self._check_in is not None and self._check_in.is_active():
+            self._check_in.abort(f'safety fault: {fault_text}')
 
         self._set_state('ERROR')
 
@@ -1251,18 +1503,51 @@ class BehaviorNode(Node):
         self.get_logger().info(f'Navigation finished — status: {status_str}')
         self._current_goal_handle = None
 
+        # A check-in owns its own arrivals: reaching the person is followed by a
+        # specific opener, and getting home again is followed by silence. The
+        # generic "announce your arrival" prompt below is wrong for both, so the
+        # mission gets first refusal on the result.
+        if self._check_in is not None and self._check_in.on_nav_result(status):
+            return
+
+        # Consume the destination context once, whatever the outcome.
+        intent  = self._nav_intent
+        started = self._nav_started
+        self._nav_intent  = None
+        self._nav_started = None
+        if intent and intent[0] == 'place':
+            dest = f'the {intent[1]}'
+        elif intent and intent[0] == 'person':
+            dest = intent[1]
+        else:
+            dest = 'your destination'
+
+        # How long the drive took, phrased loosely so OMNI can drop it in if it
+        # fits the one sentence. Rounded to avoid false precision; omitted when
+        # the start time is unknown (e.g. a drive that began before this field).
+        took = ''
+        if started is not None:
+            secs = time.monotonic() - started
+            if secs < 90:
+                took = f'The trip took about {max(5, round(secs / 5) * 5)} seconds. '
+            else:
+                took = f'The trip took about {round(secs / 60)} minutes. '
+
         if status == 4:
             prompt = (
-                'You have just successfully arrived at the destination. '
-                'Announce your arrival briefly in character — one sentence.'
+                f'You have just arrived at {dest}, where the user asked you to go. '
+                f'{took}'
+                f'Announce it briefly and in character — name where you are rather '
+                f'than saying "the destination", and you may mention how long it '
+                f'took if it fits naturally. One sentence.'
             )
         elif status == 5:
             prompt = None  # cancelled by user — no announcement needed
         else:
             prompt = (
-                'Navigation has failed — you could not reach the destination. '
-                'Apologise briefly in character and mention the robot got stuck or '
-                'could not find a path. One sentence only.'
+                f'You were driving to {dest} but could not get there — you got '
+                f'stuck or found no path. Apologise briefly in character and name '
+                f'where you were headed. One sentence only.'
             )
 
         if prompt:
@@ -1291,7 +1576,122 @@ class BehaviorNode(Node):
         self.get_logger().info('Nav2 goal cancellation acknowledged')
         self._current_goal_handle = None
 
+    # ── Zones + world state (Session 7) ─────────────────────────────────────────
+
+    def _load_zones(self):
+        """Build the shared ZoneMap. Path param wins; else omni_zones' shipped
+        config. Never raises — a bad or missing file degrades to an empty map so
+        the robot still boots (navigate_to then uses point locations only)."""
+        path = os.path.expanduser(self.get_parameter('zones_config_path').value or '')
+        if not path:
+            try:
+                path = os.path.join(
+                    get_package_share_directory('omni_zones'), 'config', 'zones.yaml')
+            except Exception as exc:
+                self.get_logger().warn(f'omni_zones share dir not found: {exc}')
+                return load_zone_map({})
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            zone_map = load_zone_map(data.get('zones') or {})
+            self.get_logger().info(
+                f'Loaded {len(zone_map)} zone(s) from {path}'
+                + (f': {", ".join(zone_map.names)}' if zone_map else ' (empty)'))
+            return zone_map
+        except FileNotFoundError:
+            self.get_logger().info(
+                f'No zones file at {path} — go_to_person will report unknown '
+                f'locations and navigate_to uses point locations only.')
+            return load_zone_map({})
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to load zones from {path}: {exc}')
+            return load_zone_map({})
+
+    def _on_world_state(self, msg: String):
+        """Cache the latest world_state snapshot for go_to_person()."""
+        try:
+            self._world_state = json.loads(msg.data)
+            self._world_state_time = time.monotonic()
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warn('unparseable /omni/world_state payload, ignoring')
+
+    def latest_world_state(self):
+        """The most recent world_state snapshot dict, or None if world_state is
+        not publishing (the node is a soft dependency, exactly like memory)."""
+        return self._world_state
+
+    def known_place_names(self) -> list:
+        """Every name navigate_to can resolve: saved point locations plus zones."""
+        return sorted(set(self._locations.keys()) | set(self._zones.names))
+
+    def resolve_location(self, name: str):
+        """Resolve a named place to a goal pose (x, y, yaw_deg), or None.
+
+        Saved point locations (from save_location) win over zone anchors when a
+        name exists as both — a point the user deliberately taught is a more
+        specific intent than a room's default parking spot."""
+        name = (name or '').lower().strip()
+        loc = self._locations.get(name)
+        if loc:
+            yaw = float(loc[2]) if len(loc) > 2 else 0.0
+            return (float(loc[0]), float(loc[1]), yaw)
+        return self._zones.nav_pose(name)   # None if the zone is unknown
+
+    def start_navigation(self, x: float, y: float, yaw_deg: float,
+                         *, intent=None) -> None:
+        """Build and dispatch a Nav2 goal, and enter NAVIGATING. Shared by
+        navigate_to() and go_to_person(). Callers must have checked
+        nav_is_ready() first. Thread-safe: send_goal_async schedules on the
+        executor without blocking.
+
+        intent — optional (kind, label) describing WHERE and WHY, e.g.
+        ('place', 'kitchen') or ('person', 'Rafael'). Stashed so the arrival
+        announcement can name the destination instead of saying 'the
+        destination'. None keeps the generic prompt (e.g. the check-in drives
+        through here but owns its own arrival via _nav_result_callback)."""
+        self._nav_intent  = intent         # consumed + cleared in _nav_result_callback
+        self._nav_started = time.monotonic()
+        goal_msg      = NavigateToPose.Goal()
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp    = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = float(x)
+        goal_msg.pose.pose.position.y = float(y)
+        goal_msg.pose.pose.position.z = 0.0
+        yaw_rad = math.radians(float(yaw_deg))
+        goal_msg.pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
+
+        self.get_logger().info(
+            f'Sending navigation goal: x={x:.3f}, y={y:.3f}, yaw={yaw_deg:.1f}°')
+        self._set_state('NAVIGATING')
+        send_future = self._nav_action_client.send_goal_async(
+            goal_msg, feedback_callback=self._nav_feedback_callback)
+        send_future.add_done_callback(self._nav_goal_response_callback)
+
     # ── Nav2 readiness check ───────────────────────────────────────────────────
+
+    def cancel_navigation(self) -> bool:
+        """Cancel any in-flight Nav2 goal. Returns True if there was one.
+
+        Used by the check-in when it is aborted mid-drive: without this, a wake
+        word during APPROACH leaves OMNI still driving to the person while the
+        person is already talking to it, and the goal's eventual SUCCEEDED result
+        falls through to the generic arrival handler — which cheerfully announces
+        that it has arrived, over the top of the conversation.
+
+        Safe from any thread; cancel_goal_async schedules on the executor.
+        """
+        handle = self._current_goal_handle
+        if handle is None:
+            return False
+        self._current_goal_handle = None
+        try:
+            handle.cancel_goal_async()
+        except Exception as exc:  # noqa: BLE001 - cancelling is best-effort
+            self.get_logger().warn(f'nav cancel failed: {exc}')
+            return False
+        return True
 
     def nav_is_ready(self) -> bool:
         """
