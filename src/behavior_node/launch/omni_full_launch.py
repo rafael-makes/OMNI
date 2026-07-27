@@ -317,18 +317,29 @@ def generate_launch_description():
     )
 
     # Drives head pan/tilt off the Jetson's /camera/faces (person boxes as fallback).
-    # No parameter overrides on purpose: the defaults in the node ARE the calibrated
-    # values (gains tuned live, per-axis travel limits measured), and they stay live-
-    # tunable via `ros2 param set /head_tracking_node ...`. Its tilt envelope is
-    # coupled to head_tilt.neutral_pw in config/servo_config.yaml — see the note there.
+    # Gains/travel limits keep the node defaults (calibrated live, live-tunable via
+    # `ros2 param set /head_tracking_node ...`). Its tilt envelope is coupled to
+    # head_tilt.neutral_pw in config/servo_config.yaml — see the note there.
     # Safe at t=0: servo_node creates its /servo_commands subscription only after its
     # one-at-a-time init sweep finishes, so nothing lands mid-sweep.
+    #
+    # WANDER DISABLED 2026-07-26 — the head was in constant motion because idle drift
+    # (IDLE/LISTENING) and gaze choreography (NAVIGATING/EXPLORING) both roam the head
+    # when no real subject is tracked. Both are off here:
+    #   drift_enabled=False   → head returns to neutral and holds when nobody visible
+    #   gaze_states=''        → NAVIGATING/EXPLORING snap to neutral and hold (no roam)
+    # Real face/person tracking (tracking_states) and instant-orient on walk-ins are
+    # untouched. To restore the "alive" motion, drop these two overrides.
     head_tracking_node = Node(
         package='head_tracking_node',
         executable='head_tracking_node',
         name='head_tracking_node',
         output='screen',
         emulate_tty=True,
+        parameters=[{
+            'drift_enabled': False,
+            'gaze_states':   '',
+        }],
     )
 
     chest_node = Node(
