@@ -207,6 +207,23 @@ class GeminiBridge:
             self._transcript_segments = []
         return coalesce_transcript(segments)
 
+    def user_speech(self) -> str:
+        """Everything the USER has said this session, WITHOUT clearing the buffer.
+
+        A read-only peek, unlike pop_transcript() which empties the buffer for the
+        memory store. The Session 9 check-in needs two things from it: whether the
+        person answered at all (silence is a distinct outcome from a refusal), and
+        what they said, so "no" and "not now" can be told apart. Neither may
+        disturb the transcript that is about to be persisted.
+
+        Returns '' when they have not spoken.
+        """
+        with self._transcript_lock:
+            segments = list(self._transcript_segments)
+        return ' '.join(
+            text for speaker, text in segments if speaker == 'User' and text
+        ).strip()
+
     def _append_transcript(self, speaker: str, text: str) -> None:
         """Record a streamed transcription fragment (called from the recv loop)."""
         if not text:

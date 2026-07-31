@@ -32,6 +32,9 @@ from std_msgs.msg import String
 
 from .generator import (
     DEFAULT_ABSENCE_GRACE,
+    DEFAULT_DWELL_REFIRE_INTERVAL,
+    DEFAULT_DWELL_THRESHOLD,
+    DEFAULT_DWELL_ZONES,
     DEFAULT_NAMED_OVERLAP_RADIUS,
     DEFAULT_UNKNOWN_MIN_FACE_PX,
     DEFAULT_APPEAR_MIN_SNAPSHOTS,
@@ -39,6 +42,18 @@ from .generator import (
     DEFAULT_UNKNOWN_MIN_SNAPSHOTS,
     EventGenerator,
 )
+
+
+def _split_csv(raw) -> list:
+    """"a, b" -> ['a', 'b']; "" -> []. Tolerant of spaces and a trailing comma.
+
+    Also accepts a real list, so a params file that supplies a proper YAML
+    sequence still works — only the *default* has to be a string (see the
+    declaration for why).
+    """
+    if isinstance(raw, (list, tuple)):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return [part.strip() for part in str(raw or "").split(",") if part.strip()]
 
 
 class EventGeneratorNode(Node):
@@ -55,6 +70,27 @@ class EventGeneratorNode(Node):
             "named_overlap_radius", DEFAULT_NAMED_OVERLAP_RADIUS)
         self.declare_parameter(
             "unknown_min_face_px", DEFAULT_UNKNOWN_MIN_FACE_PX)
+        # Dwell (Session 9). dwell_zones is empty by default and MUST be set to
+        # the rooms where a check-in makes sense (e.g. ['workbench','computer']) —
+        # nothing fires otherwise. Threshold/interval are the generator's floor;
+        # the "should I actually check in" call lives in behavior_node's policy.
+        self.declare_parameter("dwell_threshold", DEFAULT_DWELL_THRESHOLD)
+        self.declare_parameter(
+            "dwell_refire_interval", DEFAULT_DWELL_REFIRE_INTERVAL)
+        # A COMMA-SEPARATED STRING, not a string array, and deliberately so.
+        #
+        # An empty *list* default cannot be typed in rclpy: declare_parameter
+        # overwrites descriptor.type from the default value, and an empty list
+        # infers as BYTE_ARRAY. The parameter then reads back uninitialized, and
+        # any later dwell_zones:="['workbench']" is rejected with "expecting type
+        # BYTE_ARRAY". Passing an explicit ParameterDescriptor does NOT help —
+        # it is overwritten. (This is the same empty-sequence trap that broke
+        # world_state's launch file; see the gotcha below.)
+        #
+        # A string has no element type to infer, so "" is a perfectly good
+        # default and dwell_zones:=workbench,computer just works — from the
+        # launch file, from ros2 run, and from a params file alike.
+        self.declare_parameter("dwell_zones", ",".join(DEFAULT_DWELL_ZONES))
         # Writes every inbound snapshot to a JSONL file. Off by default; this is
         # how the replay fixture in tests/fixtures was captured, and how the next
         # one should be.
@@ -74,6 +110,10 @@ class EventGeneratorNode(Node):
                 self.get_parameter("named_overlap_radius").value),
             unknown_min_face_px=float(
                 self.get_parameter("unknown_min_face_px").value),
+            dwell_threshold=float(self.get_parameter("dwell_threshold").value),
+            dwell_refire_interval=float(
+                self.get_parameter("dwell_refire_interval").value),
+            dwell_zones=_split_csv(self.get_parameter("dwell_zones").value),
         )
 
         self._record_path = str(self.get_parameter("record_path").value) or None
@@ -95,7 +135,9 @@ class EventGeneratorNode(Node):
             f"unknown_min_snapshots={self._gen.unknown_min_snapshots}, "
             f"unknown_cameras={sorted(self._gen.unknown_cameras)}, "
             f"named_overlap_radius={self._gen.named_overlap_radius}px, "
-            f"unknown_min_face_px={self._gen.unknown_min_face_px}px"
+            f"unknown_min_face_px={self._gen.unknown_min_face_px}px, "
+            f"dwell_threshold={self._gen.dwell_threshold}s, "
+            f"dwell_zones={sorted(self._gen.dwell_zones) or '[] (dwell OFF)'}"
         )
 
     def _on_state(self, msg: String) -> None:
@@ -119,6 +161,8 @@ class EventGeneratorNode(Node):
                 f"{event.kind}: {event.identity} ({event.camera})"
                 + (f" — away {event.away_duration:.0f}s"
                    if event.away_duration is not None else "")
+                + (f" — {event.zone} {event.dwell_duration:.0f}s"
+                   if event.dwell_duration is not None else "")
             )
 
     def destroy_node(self) -> bool:

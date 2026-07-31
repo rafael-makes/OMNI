@@ -150,6 +150,22 @@ OMNI_TOOLS = [
             ),
 
             genai_types.FunctionDeclaration(
+                name='dock',
+                description=(
+                    'Send OMNI to its docking station and back onto the dock. Call '
+                    'this when the user asks OMNI to dock, go dock, return to its '
+                    'dock, park itself, or go charge. OMNI drives to its saved '
+                    'pre-dock spot and then backs on visually — you do NOT need to '
+                    'call navigate_to as well. Returns a status message; relay it '
+                    'honestly (e.g. if no dock location is saved yet).'
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={},
+                ),
+            ),
+
+            genai_types.FunctionDeclaration(
                 name='report_status',
                 description=(
                     'Retrieve OMNI\'s current status — battery level, operating state, '
@@ -304,6 +320,7 @@ class FunctionHandlers:
             'navigate_to':      self._navigate_to,
             'go_to_person':     self._go_to_person,
             'stop_navigation':  self._stop_navigation,
+            'dock':             self._dock,
             'report_status':    self._report_status,
             'explore_area':     self._explore_area,
             'save_location':    self._save_location,
@@ -375,6 +392,11 @@ class FunctionHandlers:
             f'Very well, I am setting a course for the {location}. '
             f'Navigation initiated. I shall proceed with all due care.'
         )
+
+    def _dock(self, args: dict) -> str:
+        # Whole mission (drive to pre-dock pose → visual back-in) lives on the node;
+        # the handler is a thin pass-through, like the other navigation verbs.
+        return self._node.start_docking()
 
     def _robot_xy(self):
         """(x, y) of the robot in the map frame, or None if TF is unavailable."""

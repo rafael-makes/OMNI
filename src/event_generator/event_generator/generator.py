@@ -56,6 +56,7 @@ from typing import Iterable, Optional
 
 from .models import (
     PERSON_APPEARED,
+    PERSON_DWELLING,
     PERSON_LEFT,
     UNKNOWN_PERSON_DETECTED,
     Event,
@@ -117,6 +118,27 @@ DEFAULT_NAMED_OVERLAP_RADIUS = 160.0
 # A person far enough away to present a sub-50px face is also too far away to be
 # worth announcing as having walked in.
 DEFAULT_UNKNOWN_MIN_FACE_PX = 50.0
+
+# ── Dwell (Session 9) ────────────────────────────────────────────────────────
+# Seconds a named person must stay in ONE zone continuously before the first
+# person_dwelling fires. This is the *generator's* floor, deliberately lower than
+# the policy layer's "check in?" threshold: the generator reports that a dwell of
+# this length exists and re-fires as it grows, and check_in_policy decides which
+# firing (if any) is worth driving over for. 30 min is "settled in at a spot",
+# not "paused walking through".
+DEFAULT_DWELL_THRESHOLD = 1800.0
+
+# Once dwelling, re-emit person_dwelling every this-many seconds of *continued*
+# dwell, carrying the grown dwell_duration. This is what lets the policy layer
+# reconsider later opportunities (a "not now" an hour ago, a battery that has
+# since charged) without the generator ever deciding on its behalf.
+DEFAULT_DWELL_REFIRE_INTERVAL = 1800.0
+
+# Zones in which a dwell is worth reporting at all. EMPTY BY DEFAULT and opt-in,
+# the same posture as omni_zones' shipped-empty config: a check-in makes sense at
+# the workbench or the computer, and is a nuisance at the kitchen counter or on
+# the couch. Nothing fires until this is filled in (config `dwell_zones`).
+DEFAULT_DWELL_ZONES: tuple[str, ...] = ()
 
 # Presence states.
 _PRESENT = "present"
@@ -195,7 +217,8 @@ class _Presence:
     """Per-identity presence bookkeeping. Internal; not part of the API."""
 
     __slots__ = ("identity", "state", "last_seen", "camera", "snapshots_seen",
-                 "announced", "left_at", "bbox")
+                 "announced", "left_at", "bbox",
+                 "zone", "dwell_zone", "dwell_since", "dwell_last_fired")
 
     def __init__(self, identity: str, camera: str, last_seen: float) -> None:
         self.identity = identity
@@ -206,6 +229,22 @@ class _Presence:
         self.announced = False        # unknown_person_detected already emitted
         self.left_at: Optional[float] = None   # last_seen at the moment we gave up
         self.bbox: Optional[tuple] = None      # newest box, for overlap tests
+        # ── dwell bookkeeping (Session 9) ──
+        # Last-known NON-None zone, carried forward across face dropout exactly
+        # like bbox. world_state persists the last zone on away rows, so this
+        # rarely goes stale; a None zone in a snapshot never wipes it.
+        self.zone: Optional[str] = None
+        # The zone the current dwell is anchored to, the stamp it began, and the
+        # stamp of the last person_dwelling emitted for it. dwell_zone is None
+        # whenever the person is not currently dwelling (absent, or never placed).
+        self.dwell_zone: Optional[str] = None
+        self.dwell_since: Optional[float] = None
+        self.dwell_last_fired: Optional[float] = None
+
+    def _reset_dwell(self) -> None:
+        self.dwell_zone = None
+        self.dwell_since = None
+        self.dwell_last_fired = None
 
 
 class EventGenerator:
@@ -224,17 +263,25 @@ class EventGenerator:
         unknown_cameras: Iterable[str] = DEFAULT_UNKNOWN_CAMERAS,
         named_overlap_radius: float = DEFAULT_NAMED_OVERLAP_RADIUS,
         unknown_min_face_px: float = DEFAULT_UNKNOWN_MIN_FACE_PX,
+        dwell_threshold: float = DEFAULT_DWELL_THRESHOLD,
+        dwell_refire_interval: float = DEFAULT_DWELL_REFIRE_INTERVAL,
+        dwell_zones: Iterable[str] = DEFAULT_DWELL_ZONES,
     ) -> None:
         if absence_grace <= 0:
             raise ValueError("absence_grace must be > 0")
         if unknown_min_snapshots < 1 or appear_min_snapshots < 1:
             raise ValueError("snapshot thresholds must be >= 1")
+        if dwell_threshold <= 0 or dwell_refire_interval <= 0:
+            raise ValueError("dwell_threshold and dwell_refire_interval must be > 0")
         self.absence_grace = absence_grace
         self.unknown_min_snapshots = unknown_min_snapshots
         self.appear_min_snapshots = appear_min_snapshots
         self.unknown_cameras = frozenset(unknown_cameras)
         self.named_overlap_radius = named_overlap_radius
         self.unknown_min_face_px = unknown_min_face_px
+        self.dwell_threshold = dwell_threshold
+        self.dwell_refire_interval = dwell_refire_interval
+        self.dwell_zones = frozenset(dwell_zones)
         self._people: dict[str, _Presence] = {}
         self._last_stamp: Optional[float] = None
 
@@ -302,6 +349,14 @@ class EventGenerator:
             if camera:
                 person.camera = camera
             person.bbox = _as_bbox(row.get("bbox"))
+            # Carry the zone forward like bbox. world_state persists the last
+            # known zone on away rows, and a frame with no pose reports zone=None
+            # rather than a wrong room — so only a real, non-None zone updates our
+            # belief. A None never wipes a good last-known zone, which is what
+            # keeps a dwell continuous across a head-down face dropout.
+            row_zone = row.get("zone")
+            if isinstance(row_zone, str) and row_zone.strip():
+                person.zone = row_zone.strip()
             # last_seen only ever moves forward: an away row keeps reporting the
             # same last_seen every snapshot, and we must not let a stale row from
             # another camera pull it backwards.
@@ -336,6 +391,15 @@ class EventGenerator:
         # A row can be present-but-not-visible; that path is checked too.
         for identity in seen_this_snapshot:
             events.extend(self._check_absence(self._people[identity], stamp))
+
+        # Dwell is a duration crossing, not a transition, so it is evaluated for
+        # everyone every snapshot — including a present named person who is not in
+        # THIS snapshot's list (head-down flicker). They are still PRESENT within
+        # the grace window, still in their last-known zone, and their dwell is
+        # still accruing. This pass runs last so anyone _check_absence just moved
+        # to ABSENT (dwell already reset) is correctly skipped.
+        for person in self._people.values():
+            events.extend(self._check_dwell(person, stamp))
 
         return events
 
@@ -417,6 +481,10 @@ class EventGenerator:
         # Anchor the away clock to the last real sighting, not to now: the
         # grace period is part of how long they were gone, not a free pass.
         person.left_at = person.last_seen
+        # Sustained absence is one of the only two things that break a dwell (the
+        # other is a zone change). They have left the spot; the next dwell starts
+        # fresh when they come back and settle again.
+        person._reset_dwell()
 
         if not is_named(person.identity):
             return []   # strangers leaving is not worth an event
@@ -426,6 +494,67 @@ class EventGenerator:
             camera=person.camera,
             timestamp=stamp,
             detail=f"not seen for {gap:.0f}s",
+        )]
+
+    def _check_dwell(self, person: _Presence, stamp: float) -> list[Event]:
+        """Emit person_dwelling if this named person has now sat in one enabled
+        zone long enough, first at the threshold and then on the re-fire interval.
+
+        The continuity guarantee lives entirely in the presence machinery this
+        reads: dwell is anchored while ``state == _PRESENT``, and _PRESENT only
+        ends on ``absence_grace`` of sustained absence (which resets the dwell).
+        Face-anchored flicker never leaves _PRESENT, so it can never interrupt a
+        dwell — the exact mirror of why a flickering person cannot re-fire
+        person_appeared.
+        """
+        if person.state != _PRESENT or not is_named(person.identity):
+            return []
+
+        zone = person.zone
+        if zone is None:
+            # No zone information (localisation down, or never placed). Not a zone
+            # change — hold the current dwell anchor and simply do not fire.
+            return []
+
+        if person.dwell_zone != zone:
+            # Entered a new zone (or placed for the first time). A zone change is
+            # the second of the two dwell-breakers: the clock restarts here, so
+            # walking bench -> kitchen -> bench does not accumulate credit across
+            # the trip. Anchoring to `stamp` (first snapshot seen in this zone)
+            # honestly undercounts by at most the localisation warm-up.
+            person.dwell_zone = zone
+            person.dwell_since = stamp
+            person.dwell_last_fired = None
+            return []
+
+        if zone not in self.dwell_zones:
+            # Tracked so we notice when they leave it, but no check-in happens
+            # here (kitchen, couch, ...). Nothing to emit.
+            return []
+
+        dwell_duration = stamp - person.dwell_since
+        if dwell_duration < self.dwell_threshold:
+            return []
+
+        if person.dwell_last_fired is None:
+            first = True
+        elif stamp - person.dwell_last_fired >= self.dwell_refire_interval:
+            first = False
+        else:
+            return []
+
+        person.dwell_last_fired = stamp
+        minutes = dwell_duration / 60.0
+        return [Event(
+            kind=PERSON_DWELLING,
+            identity=person.identity,
+            camera=person.camera,
+            timestamp=stamp,
+            zone=zone,
+            dwell_duration=dwell_duration,
+            detail=(
+                f"{'settled' if first else 'still'} in {zone} for {minutes:.0f} min"
+            ),
         )]
 
     # ── query ─────────────────────────────────────────────────────────────────

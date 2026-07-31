@@ -5,9 +5,9 @@ implementation.
 
 ## What this is
 Semantic **presence events** derived from `world_state`'s snapshots:
-`person_appeared`, `person_left`, `unknown_person_detected`. It turns a 1 Hz
-stream of "who is visible right now" into the far rarer "something actually
-changed."
+`person_appeared`, `person_left`, `unknown_person_detected`, and (Session 9)
+`person_dwelling`. It turns a 1 Hz stream of "who is visible right now" into the
+far rarer "something actually changed."
 
 Derivation **only** — no behaviour, no LLM calls, no decisions. `behavior_node`
 decides whether an arrival is worth greeting; this package only says an arrival
@@ -129,6 +129,66 @@ judged on the **shorter** side — area would let a 20x200px sliver through).
 After all four filters: **65 seconds live, one seated person, exactly one event
 (`person_appeared: rafael`) and zero phantoms.**
 
+## Dwell — `person_dwelling` (Session 9)
+
+"Rafael has been at the workbench for an hour" — the trigger for a proactive
+check-in. Unlike the other three, this is **not a visibility transition**: it is
+a duration crossing, and it **re-fires** on an interval while the dwell lasts.
+
+```
+dwell anchored ──── threshold ──── re-fire ──── re-fire ────  zone change
+(first snapshot     (first          (every       ...          or sustained
+ PRESENT + placed)   firing)         interval)                 absence → reset
+```
+
+**Only two things break a dwell**, and they are exactly the two the presence
+machinery already knows about:
+
+1. **A zone change.** Bench → kitchen → bench does not accumulate credit across
+   the trip; the clock restarts on the return.
+2. **Sustained absence** — the same `absence_grace` that fires `person_left`.
+
+Everything else, and specifically **face-anchored flicker, does not**. This falls
+straight out of reusing the debounce: a dwell only accrues while the person is
+`PRESENT`, and a flickering person never leaves `PRESENT`. It is the same
+mechanism that stops flicker re-firing `person_appeared`, pointed at a different
+question.
+
+Three consequences worth knowing before changing anything:
+
+- **A dwell can fire while the person is not visible.** Last seen 20 s ago,
+  threshold crossed now, grace not exhausted → it fires mid-dropout. Correct:
+  someone bent over the bench has not stopped being at the bench. The obvious
+  "only fire while visible" tightening would break the feature on real hardware,
+  where a stationary person is invisible ~17% of frames
+  (`test_dwell_accrues_through_a_grace_covered_dropout` pins this).
+- **A `null` zone never wipes the last-known one.** `world_state` reports
+  `zone: null` on a frame with no pose rather than a wrong room, so a
+  localisation hiccup must not read as "left the zone". Only a real, different
+  zone resets the anchor.
+- **The anchor is the first snapshot seen in the zone**, so a dwell honestly
+  *undercounts* by the localisation warm-up (measured: 3 s on the replay
+  fixture). It never overcounts.
+
+**Named people only.** A stable stranger sitting still is not a check-in
+candidate — there is nobody to check in *with*.
+
+### The generator does not decide
+`dwell_threshold` here is a **floor, not the policy**. The generator reports that
+an opportunity exists and keeps reporting as it grows; `behavior_node`'s
+`CheckInPolicy` decides which firing (if any) is worth driving over for — that is
+where the ≥60 min rule, cooldowns, battery and quiet hours live. Same split as
+greetings: this package says what happened, `behavior_node` decides what to do.
+The re-fire interval exists precisely so the policy gets **later chances** (a
+"not now" an hour ago, a battery that has since charged) without this library
+ever deciding on its behalf.
+
+### Zones are opt-in and empty by default
+`dwell_zones` ships empty, so **nothing fires until it is configured** — the same
+posture as `omni_zones`' shipped-empty `zones.yaml`. A check-in makes sense at the
+workbench or the computer and is a nuisance at the kitchen counter or on the
+couch, and that judgement belongs in config, not in code.
+
 ## What is deliberately ignored — do not "fix" without asking
 
 - **Rows with no identity generate nothing.** `/camera/identities` is known to
@@ -178,6 +238,9 @@ the replay test run a ten-minute absence in a millisecond, and what stops
 | `unknown_min_snapshots` | `3` | |
 | `appear_min_snapshots` | `1` | |
 | `unknown_cameras` | `['head']` | rear publishes no identities topic yet |
+| `dwell_threshold` | `1800.0` | s in one zone before the first `person_dwelling` |
+| `dwell_refire_interval` | `1800.0` | s of continued dwell between re-firings |
+| `dwell_zones` | `[]` | **empty = dwell off.** Set to e.g. `['workbench','computer']` |
 | `record_path` | `''` | append inbound snapshots to JSONL — how fixtures are captured |
 
 ## Running
@@ -204,6 +267,20 @@ is a `world_state` bug, not one of ours.
 ## Status
 - [x] Core library + 25 debounce tests (appear / flicker / sustained absence /
       return / unknown stability / camera scope / malformed input).
+- [x] **Dwell (Session 9)**: `person_dwelling` + 20 synthetic tests
+      (flicker / zone-change reset / re-fire cadence / zone scope / null-zone /
+      unnamed / validation) and a 12-test replay gate. **79 tests green.**
+- [x] Dwell replay gate over a ~30 min zone-tagged work session: dwell fires at
+      1200 s and re-fires at 1500 s through ~300 frames of real face dropout,
+      while presence stays undisturbed (greeted once, never "left") and phantom
+      suppression still yields exactly one stranger. 4 events in half an hour.
+- [ ] **The dwell fixture is DERIVED, not recorded** — the real 129 s capture
+      tiled to 30 min (`scripts/make_dwell_fixture.py`, which documents this in
+      full). It inherits every real vision nastiness but cannot contain a dropout
+      longer than the original's worst (11 s), so **`absence_grace=90` is still
+      unvalidated against a genuine long work session**. Record 20 real minutes at
+      the bench and regenerate with `--tiles 1`.
+- [ ] Dwell has never run on hardware. It is pure offline logic so far.
 - [x] ROS2 wrapper: `/omni/world_state` -> `/omni/events`.
 - [x] **Live gate on real hardware 2026-07-19.** Jetson vision stack up, Pi
       consuming across the link: `person_appeared: rafael` fired on first

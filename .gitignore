@@ -66,3 +66,6 @@ frames_*.pdf
 jetson/models/*.engine
 jetson/**/build/
 jetson/**/install/
+
+# timestamped local backups made before edits
+*.bak-*

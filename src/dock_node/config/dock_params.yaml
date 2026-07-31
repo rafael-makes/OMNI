@@ -1,0 +1,46 @@
+dock_node:
+  ros__parameters:
+    target_tag_id: 0          # main-floor dock tag (id 1 = basement)
+    image_width: 800          # rear cam YUYV 800x600 (matches dock detector)
+    image_height: 600
+
+    # tolerances (ex = normalized pixel h-error in [-1, 1])
+    align_tol: 0.15           # |ex| within this = aligned enough to reverse
+    reverse_correct_tol: 0.30 # |ex| beyond this during REVERSE → stop & pulse-correct
+
+    # pulsed rotation — the drivetrain STALLS below ~1.1 rad/s in-place (Pico MIN_PWM=50,
+    # at the motors' physical floor; firmware can't lower it, measured 2026-07-26). So we
+    # rotate in bursts above the floor, then stop and look. See feedback_drivetrain_speed_floor.
+    pulse_speed: 1.2          # rad/s per pulse — MUST exceed the ~1.1 rad/s rotation floor
+    pulse_dur: 0.12           # s of rotation per pulse (a few degrees; tune on hardware)
+    settle_dur: 0.25          # s stopped between pulses (settle + a fresh detection frame)
+
+    # translation
+    reverse_speed: 0.18       # m/s — above the ~0.16 m/s translation floor
+
+    # ranges (m) — stop_range MUST stay above safety_node's 0.075 proximity fault
+    stop_range: 0.13          # ~2.5cm margin above 0.075 after the reverse overshoot
+
+    # final square-up: near the wall, pulse-rotate to equalise the two rear ToF
+    square_engage_range: 0.25 # begin squaring when the nearest rear ToF is within this
+    square_tol: 0.02          # |left-right| below this (m) = square enough
+    # CALIBRATE LIVE: if the square-up turns the WRONG way, flip this (may differ from steer_sign)
+    square_sign: 1.0
+
+    # timing (s)
+    # tag_timeout 0.3 -> 0.6 (2026-07-30). The rear cam is now SHARED with
+    # omni-vision.service's rear_camera (one owner per V4L2 device), and apriltag
+    # consumes that feed at ~5 Hz — not the 25 Hz we got when the dock launch owned
+    # the camera outright. At 5 Hz frames are 0.2s apart, so a 0.3s timeout calls
+    # "tag lost" after a single dropped frame. 0.6s tolerates two.
+    tag_timeout: 0.6
+    rear_fresh: 0.3
+    tag_lost_grace: 0.6
+    t_search_max: 20.0
+    t_align_max: 30.0
+    t_reverse_max: 45.0
+    t_overall_max: 120.0
+
+    # CALIBRATE LIVE: rear camera may be mirrored. If ALIGN pulses turn the wrong way,
+    # flip this to -1.0 (ros2 param set /dock_node steer_sign -1.0).
+    steer_sign: 1.0

@@ -10,6 +10,13 @@ from typing import Optional
 PERSON_APPEARED = "person_appeared"
 PERSON_LEFT = "person_left"
 UNKNOWN_PERSON_DETECTED = "unknown_person_detected"
+# A named person has stayed in one zone continuously past a threshold. Unlike the
+# three above, this is not a visibility *transition* — it is a duration crossing,
+# and it re-fires on an interval while the dwell continues. The policy layer
+# (check_in_policy in behavior_node) decides whether any given firing is worth
+# acting on; the generator only reports that the opportunity exists. See
+# generator.py "DWELL" and the package CLAUDE.md.
+PERSON_DWELLING = "person_dwelling"
 
 
 @dataclass(frozen=True)
@@ -21,6 +28,11 @@ class Event:
     the real wall-clock gap, not the gap since we admitted they had left. It is
     None on a first-ever sighting, which is the signal "no history, this is not
     a return".
+
+    ``zone`` and ``dwell_duration`` are populated only on ``person_dwelling``:
+    the named room the person has been sitting in, and how many seconds they have
+    now been there continuously. Both are None on the presence-transition events,
+    where they carry no meaning.
     """
 
     kind: str
@@ -29,6 +41,8 @@ class Event:
     timestamp: float
     away_duration: Optional[float] = None
     detail: str = ""
+    zone: Optional[str] = None
+    dwell_duration: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -40,6 +54,10 @@ class Event:
                 None if self.away_duration is None else round(self.away_duration, 3)
             ),
             "detail": self.detail,
+            "zone": self.zone,
+            "dwell_duration": (
+                None if self.dwell_duration is None else round(self.dwell_duration, 3)
+            ),
         }
 
 

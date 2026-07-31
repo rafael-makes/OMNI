@@ -63,6 +63,7 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -177,10 +178,69 @@ def generate_launch_description():
         description='Enable persistent memory (retrieve on wake / store at chat end). '
                     'false skips all memory calls (no omni_memory dependency).',
     )
+    presence_timeout_arg = DeclareLaunchArgument(
+        'presence_timeout',
+        default_value='10.0',
+        description='Seconds with no person seen before the wake word disarms. Needs the '
+                    'Jetson head_detector to see anyone; set very high (e.g. 100000) to keep '
+                    'the wake word always armed when running without person detection.',
+    )
     memory_env_file_arg = DeclareLaunchArgument(
         'memory_env_file',
         default_value='/home/pi/omni_ws/src/omni_memory/.env',
         description='.env with SUPABASE_URL/SUPABASE_SERVICE_KEY for the omni_memory node',
+    )
+
+    # ── Proactive check-in (Session 9) ─────────────────────────────────────────
+    # Exposed as launch arguments specifically so a live test does not require
+    # editing and rebuilding this file. The DEFAULTS ARE THE PRODUCTION ONES —
+    # an hour of dwell, hours of cooldown, quiet after 21:00 — which are correct
+    # for daily use and unusable for a test you want to finish today. See the
+    # test recipe in behavior_node/CLAUDE.md for the dialled-down set.
+    check_in_enabled_arg = DeclareLaunchArgument(
+        'check_in_enabled', default_value='true',
+        description='Enable proactive check-ins ("what are you working on?")',
+    )
+    check_in_min_dwell_arg = DeclareLaunchArgument(
+        'check_in_min_dwell', default_value='3600.0',
+        description='Seconds at one spot before a check-in is considered. '
+                    'Lower this for testing; 3600 is the production bar.',
+    )
+    check_in_min_battery_arg = DeclareLaunchArgument(
+        'check_in_min_battery', default_value='40.0',
+        description='Battery %% floor for a check-in (a round trip costs more '
+                    'than a greeting, so this is well above the greeting floor)',
+    )
+    check_in_quiet_start_arg = DeclareLaunchArgument(
+        'check_in_quiet_start', default_value='21:00',
+        description='HH:MM local. Set equal to check_in_quiet_end to disable '
+                    'quiet hours entirely (useful when testing in the evening).',
+    )
+    check_in_quiet_end_arg = DeclareLaunchArgument(
+        'check_in_quiet_end', default_value='08:00',
+        description='HH:MM local; the quiet window wraps midnight',
+    )
+    check_in_global_cooldown_arg = DeclareLaunchArgument(
+        'check_in_global_cooldown', default_value='7200.0',
+        description='Seconds after ANY interaction with that person',
+    )
+    check_in_no_cooldown_arg = DeclareLaunchArgument(
+        'check_in_no_cooldown', default_value='14400.0',
+        description='Seconds, per zone, after a "no"',
+    )
+    check_in_not_now_cooldown_arg = DeclareLaunchArgument(
+        'check_in_not_now_cooldown', default_value='3600.0',
+        description='Seconds, per zone, after a "not now" or silence',
+    )
+    check_in_silence_timeout_arg = DeclareLaunchArgument(
+        'check_in_silence_timeout', default_value='15.0',
+        description='Seconds of silence after the opener before OMNI reads it '
+                    'as "not now" and quietly leaves. It never re-asks.',
+    )
+    check_in_zones_arg = DeclareLaunchArgument(
+        'check_in_zones', default_value='',
+        description='COMMA-SEPARATED zones a check-in may happen in. Empty = '
+                    "trust event_generator's dwell_zones.",
     )
 
     # ── Static transforms ──────────────────────────────────────────────────────
@@ -442,6 +502,20 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
+    # ── Docking controller ─────────────────────────────────────────────────────
+    # Idle until behavior_node's `dock` mission calls /dock/start. Needs the Jetson
+    # dock detector (/detections) for the visual back-in — that runs on the Jetson,
+    # not here. See dock_node/CLAUDE-less package: dock_test.launch.py for standalone.
+    dock_node = Node(
+        package='dock_node',
+        executable='dock_node',
+        name='dock_node',
+        output='screen',
+        emulate_tty=True,
+        parameters=[os.path.join(
+            get_package_share_directory('dock_node'), 'config', 'dock_params.yaml')],
+    )
+
     # ── Auto initial pose ──────────────────────────────────────────────────────
     # Publishes the robot's known starting position (office doorway) at t=10s,
     # after slam_toolbox activates (t=8s). Published 5 times so slam_toolbox
@@ -519,6 +593,19 @@ def generate_launch_description():
             'speaker_device_index':       LaunchConfiguration('speaker_device_index'),
             'tcp_mic_port':               LaunchConfiguration('tcp_mic_port'),
             'memory_enabled':             LaunchConfiguration('memory_enabled'),
+            'presence_timeout':           LaunchConfiguration('presence_timeout'),
+            'check_in_enabled':           LaunchConfiguration('check_in_enabled'),
+            'check_in_min_dwell':         LaunchConfiguration('check_in_min_dwell'),
+            'check_in_min_battery':       LaunchConfiguration('check_in_min_battery'),
+            # Force STRING type: 'HH:MM' like '21:00' is otherwise read by YAML as a
+            # base-60 int (21*60=1260), and the node declares these as strings → crash.
+            'check_in_quiet_start':       ParameterValue(LaunchConfiguration('check_in_quiet_start'), value_type=str),
+            'check_in_quiet_end':         ParameterValue(LaunchConfiguration('check_in_quiet_end'), value_type=str),
+            'check_in_global_cooldown':   LaunchConfiguration('check_in_global_cooldown'),
+            'check_in_no_cooldown':       LaunchConfiguration('check_in_no_cooldown'),
+            'check_in_not_now_cooldown':  LaunchConfiguration('check_in_not_now_cooldown'),
+            'check_in_silence_timeout':   LaunchConfiguration('check_in_silence_timeout'),
+            'check_in_zones':             LaunchConfiguration('check_in_zones'),
         }],
     )
 
@@ -560,6 +647,17 @@ def generate_launch_description():
         tcp_mic_arg,
         memory_enabled_arg,
         memory_env_file_arg,
+        presence_timeout_arg,
+        check_in_enabled_arg,
+        check_in_min_dwell_arg,
+        check_in_min_battery_arg,
+        check_in_quiet_start_arg,
+        check_in_quiet_end_arg,
+        check_in_global_cooldown_arg,
+        check_in_no_cooldown_arg,
+        check_in_not_now_cooldown_arg,
+        check_in_silence_timeout_arg,
+        check_in_zones_arg,
         # Static TF
         LogInfo(msg='[omni_full] Starting OMNI full stack — localization mode'),
         imu_tf,
@@ -597,4 +695,5 @@ def generate_launch_description():
         foxglove_node,
         tof_viz_node,
         stall_recovery_node,
+        dock_node,
     ])

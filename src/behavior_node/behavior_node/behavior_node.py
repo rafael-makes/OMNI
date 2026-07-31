@@ -50,6 +50,7 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, Float32MultiArray, String
+from std_srvs.srv import Trigger
 from vision_msgs.msg import Detection2DArray
 
 from datetime import datetime, time as dt_time
@@ -520,6 +521,18 @@ class BehaviorNode(Node):
         # check-ins in one move.
         self._docked = False
 
+        # ── Docking mission (navigate to pre-dock pose → dock_node visual back-in) ──
+        # "Go dock yourself" drives to a SAVED pre-dock location (map: gross approach),
+        # then hands off to dock_node's tag+ToF back-in (vision: precision). Save the
+        # pre-dock pose (rear toward the dock) as `dock_location_name` with save_location.
+        self._dock_location_name = self.declare_parameter('dock_location_name', 'dock').value
+        self._docking    = False
+        self._dock_phase = None            # 'APPROACH' | 'BACKING' | None
+        self._dock_lock  = threading.Lock()
+        self._dock_start_cli  = self.create_client(Trigger, '/dock/start')
+        self._dock_cancel_cli = self.create_client(Trigger, '/dock/cancel')
+        self.create_subscription(String, '/dock/result', self._on_dock_result, 10)
+
         self._check_in_enabled = bool(self.get_parameter('check_in_enabled').value)
         # Both stay None when check-ins are disabled; every call site guards on
         # `is not None`, so the feature is genuinely absent rather than inert.
@@ -698,11 +711,10 @@ class BehaviorNode(Node):
             time.sleep(0.1)
             self._wake.start()
 
-        # DOCKING: reserved for future use. Just transition and log.
+        # DOCKING: entered by the docking mission for the visual back-in (dock_node
+        # drives via /cmd_vel_raw; self._docked is set on the /dock/result outcome).
         if new_state == 'DOCKING':
-            self.get_logger().info(
-                'DOCKING state entered — no docking logic implemented yet.'
-            )
+            self.get_logger().info('DOCKING — visual back-in in progress')
 
     # ── Conversation timeout ───────────────────────────────────────────────────
 
@@ -1229,6 +1241,10 @@ class BehaviorNode(Node):
         # abort() deliberately does not drive home — see its docstring.
         if self._check_in is not None and self._check_in.is_active():
             self._check_in.abort('wake word')
+        # A wake word also outranks a docking mission — the person is talking to OMNI
+        # now. Stop the approach drive or the visual back-in before opening a session.
+        if self._docking:
+            self._abort_docking('wake word')
         self._set_state('LISTENING')
         self._reset_conversation_timeout()
         # Detector has released the mic — start capture before opening the session
@@ -1299,6 +1315,10 @@ class BehaviorNode(Node):
         # result and helpfully dispatch a drive home into an active fault.
         if self._check_in is not None and self._check_in.is_active():
             self._check_in.abort(f'safety fault: {fault_text}')
+        # Same for a docking mission: stop the approach or the visual back-in before
+        # ERROR cancels the goal, so the mission cannot dispatch anything into a fault.
+        if self._docking:
+            self._abort_docking(f'safety fault: {fault_text}')
 
         self._set_state('ERROR')
 
@@ -1503,6 +1523,14 @@ class BehaviorNode(Node):
         self.get_logger().info(f'Navigation finished — status: {status_str}')
         self._current_goal_handle = None
 
+        # A docking mission owns its approach arrival: SUCCEEDED hands off to the
+        # visual back-in, not the generic "announce arrival" prompt below.
+        with self._dock_lock:
+            docking_approach = self._docking and self._dock_phase == 'APPROACH'
+        if docking_approach:
+            self._on_dock_approach_result(status)
+            return
+
         # A check-in owns its own arrivals: reaching the person is followed by a
         # specific opener, and getting home again is followed by silence. The
         # generic "announce your arrival" prompt below is wrong for both, so the
@@ -1575,6 +1603,121 @@ class BehaviorNode(Node):
         """Called when a cancel request completes."""
         self.get_logger().info('Nav2 goal cancellation acknowledged')
         self._current_goal_handle = None
+
+    # ── Docking mission ─────────────────────────────────────────────────────────
+    # navigate_to the saved pre-dock pose (MAP: gross approach) → dock_node visual
+    # back-in (VISION: precision). The map only has to get OMNI close enough for the
+    # rear camera to see the tag; the tag + rear ToF correct for localisation error.
+    def start_docking(self) -> str:
+        """Begin the docking mission. Called from the `dock` Gemini function (in the
+        function-handler thread pool, so the 1 s nav_is_ready() below is fine).
+        Returns an in-character line for OMNI to speak. Never raises."""
+        with self._dock_lock:
+            if self._docking:
+                return "I am already in the middle of docking, thank you."
+        with self._state_lock:
+            state = self._current_state
+        if state in ('NAVIGATING', 'EXPLORING', 'DOCKING', 'ERROR'):
+            return f"I cannot dock right now — I am currently {state.lower()}."
+
+        pose = self.resolve_location(self._dock_location_name)
+        if pose is None:
+            return (
+                "I'm afraid I don't have a dock location saved yet. Park me at the "
+                "pre-dock spot — rear toward the dock — and save it as "
+                f"'{self._dock_location_name}', then I can return to it on my own.")
+        if not self.nav_is_ready():
+            return ("I'm afraid my navigation systems are not available, so I cannot "
+                    "drive to the dock just now.")
+
+        with self._dock_lock:
+            self._docking    = True
+            self._dock_phase = 'APPROACH'
+        self._docked = False   # leaving the dock spot the moment we start driving
+        x, y, yaw_deg = pose
+        self.get_logger().info('Docking mission: driving to pre-dock pose')
+        self.start_navigation(x, y, yaw_deg, intent=('dock', self._dock_location_name))
+        return ("Very well, I shall return to my dock — driving to the approach "
+                "point now, then backing in.")
+
+    def _on_dock_approach_result(self, status: int):
+        """Nav2 result while docking is in APPROACH. On arrival, trigger the visual
+        back-in; on failure, apologise. Called from _nav_result_callback (executor)."""
+        if status == 4:                     # SUCCEEDED — at the pre-dock pose
+            with self._dock_lock:
+                self._dock_phase = 'BACKING'
+            self._set_state('DOCKING')
+            if not self._dock_start_cli.service_is_ready():
+                self.get_logger().error('dock_node /dock/start unavailable')
+                self._clear_docking()
+                self._announce_via_session(
+                    'You reached the dock approach point but the docking controller '
+                    'is not responding. Apologise briefly, in character. One sentence.')
+                return
+            self.get_logger().info('At pre-dock pose — triggering visual back-in')
+            self._dock_start_cli.call_async(Trigger.Request())
+            # the outcome arrives on /dock/result → _on_dock_result
+        elif status == 5:                   # CANCELED
+            self._clear_docking()
+            self._set_state('IDLE')
+        else:                               # ABORTED / unknown — couldn't reach it
+            self._clear_docking()
+            self._announce_via_session(
+                'You were driving to your dock but could not get there — no path, or '
+                'you got stuck. Apologise briefly, in character. One sentence only.')
+
+    def _on_dock_result(self, msg: String):
+        """dock_node terminal outcome: 'docked' | 'failed: ...' | 'cancelled'. Acted
+        on only during BACKING, so the latched startup value and strays are ignored."""
+        with self._dock_lock:
+            if not self._docking or self._dock_phase != 'BACKING':
+                return
+        result = (msg.data or '').strip()
+        self.get_logger().info(f'/dock/result: {result}')
+        if result == 'docked':
+            self._docked = True
+            self._clear_docking()
+            self._announce_via_session(
+                'You have just successfully docked. Announce it briefly and with '
+                'quiet satisfaction, in character. One sentence.')
+        elif result.startswith('failed'):
+            self._clear_docking()
+            self._announce_via_session(
+                'You tried to back onto the dock but it did not complete. Apologise '
+                'briefly, in character. One sentence only.')
+        else:                               # cancelled
+            self._clear_docking()
+            self._set_state('IDLE')
+
+    def _abort_docking(self, reason: str):
+        """Stop an in-progress docking mission (wake word / safety fault). Cancels the
+        Nav2 approach or the visual back-in per phase. Does NOT speak — the caller owns
+        what OMNI says next."""
+        with self._dock_lock:
+            if not self._docking:
+                return
+            phase = self._dock_phase
+            self._docking    = False
+            self._dock_phase = None
+        self.get_logger().info(f'Docking aborted — {reason} (phase {phase})')
+        if phase == 'APPROACH':
+            self.cancel_navigation()
+        elif phase == 'BACKING' and self._dock_cancel_cli.service_is_ready():
+            self._dock_cancel_cli.call_async(Trigger.Request())
+
+    def _clear_docking(self):
+        with self._dock_lock:
+            self._docking    = False
+            self._dock_phase = None
+
+    def _announce_via_session(self, prompt: str):
+        """Speak a one-off line by opening a Live session with it as the first thing
+        Gemini sees, landing in LISTENING so the conversation timeout closes it — the
+        same mechanism as the nav-arrival announcement. ROS-executor thread only."""
+        self._audio.start_capture()
+        self._reset_conversation_timeout()
+        self._set_state('LISTENING')
+        self._bridge.open_session(initial_prompt=prompt)
 
     # ── Zones + world state (Session 7) ─────────────────────────────────────────
 

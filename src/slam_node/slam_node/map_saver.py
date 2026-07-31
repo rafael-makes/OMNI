@@ -8,6 +8,7 @@ Usage:
   ros2 run slam_node map_saver my_map_name   # saves to ~/omni_ws/maps/<name>
 """
 
+import os
 import sys
 import rclpy
 from rclpy.node import Node
@@ -15,7 +16,14 @@ from slam_toolbox.srv import SaveMap
 from std_msgs.msg import String
 
 
-DEFAULT_MAP = '/home/pi/omni_ws/maps/omni_home_map'
+MAPS_DIR = '/home/pi/omni_ws/maps'
+DEFAULT_MAP = os.path.join(MAPS_DIR, 'omni_home_map')
+
+
+def _resolve(name: str) -> str:
+    """A bare name saves under MAPS_DIR. slam_toolbox's SaveMap throws (result
+    255) when handed a filename with no parent directory, so never pass one."""
+    return name if os.path.isabs(name) else os.path.join(MAPS_DIR, name)
 
 
 class MapSaverNode(Node):
@@ -45,7 +53,7 @@ class MapSaverNode(Node):
 
 
 def main():
-    map_name = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MAP
+    map_name = _resolve(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_MAP
     rclpy.init()
     node = MapSaverNode(map_name)
     ok = node.save()

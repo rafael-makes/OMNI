@@ -124,6 +124,19 @@ class WakeWordDetector:
         self._running = False
         self._log.info('Wake word detector stopped')
 
+    def is_running(self) -> bool:
+        """True while the detector thread owns ALSA device 0.
+
+        Callers that are about to open the mic must ask THIS rather than infer it
+        from the robot state. "IDLE means the detector is running" is only true
+        by convention, and the convention has holes: presence-disarm stops it
+        while still in IDLE, and navigation started from IDLE leaves it running
+        all the way through NAVIGATING. Getting that inference wrong opens the
+        capture stream on a device the detector still holds, which surfaces as
+        ALSA error -9985 rather than as anything that says "wake word".
+        """
+        return self._running
+
     # ── Setup ──────────────────────────────────────────────────────────────────
 
     def _try_load_oww(self) -> bool:

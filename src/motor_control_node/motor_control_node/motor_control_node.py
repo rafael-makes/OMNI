@@ -43,7 +43,7 @@ class MotorControlNode(Node):
         # can't send commands the hardware can't track (max hardware ≈ 1.0 m/s).
         # Conservative defaults for first-drive; raise in the launch file once tuned.
         self.declare_parameter('max_linear_speed',   0.5)   # m/s
-        self.declare_parameter('max_angular_speed',  2.0)   # rad/s — Pico firmware MIN_PWM=85, floor ~0.30 m/s
+        self.declare_parameter('max_angular_speed',  2.0)   # rad/s — Pico firmware MIN_PWM=50 → floor ~0.16 m/s / ~1.1 rad/s (measured 2026-07-26; at motor stall point, can't go lower)
         # publish_tf: set false when robot_localization EKF takes over odom→base_link
         self.declare_parameter('publish_tf', True)
 

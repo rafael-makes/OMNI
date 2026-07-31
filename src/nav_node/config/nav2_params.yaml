@@ -178,12 +178,21 @@ controller_server:
       # 0.3 m/s ≈ 1 km/h — comfortable for indoor navigation without tipping
       max_vel_x: 0.35
 
-      # min_vel_x: negative value allows reversing.
-      # -0.15 m/s gives DWB a backup option when forward paths are blocked.
-      # MIN_PWM floor still applies — motor_control_node clips anything below
-      # its deadband, so very slow reverse commands may not move the robot,
-      # but allowing negative values lets DWB choose to back up in tight spots.
-      min_vel_x: -0.15
+      # min_vel_x: most-negative x velocity = the fastest DWB may reverse.
+      # -0.15 -> -0.25 (2026-07-30). At -0.15 Nav2 could NOT reverse this robot at
+      # all, for two compounding reasons:
+      #   1. 0.15 < the MEASURED 0.16 m/s drivetrain floor, so the firmware deadband
+      #      clipped any such command to zero — the wheels never turned.
+      #   2. 0.15 < min_speed_xy (0.18), and DWB's isValidSpeed() rejects a sample
+      #      whose |v_xy| is below min_speed_xy unless |theta| >= min_speed_theta.
+      #      So every PURE-reverse candidate was discarded before it was scored.
+      # Net effect: reversing was impossible, so the only motion DWB could offer was
+      # rotate-then-drive-forward. With rotation also blocked (an obstacle inside the
+      # 0.43 m footprint sweep radius) it had nothing left: "No valid trajectories out
+      # of 84!" -> ABORTED. This matters because the dock sits directly BEHIND the
+      # standoff: backing straight up is the correct manoeuvre, not turning around.
+      # -0.25 gives reverse a usable 0.18-0.25 m/s band, clear of both limits.
+      min_vel_x: -0.25
 
       # max_vel_y: OMNI is NOT holonomic (cannot strafe), so y vel = 0
       max_vel_y: 0.0
@@ -197,9 +206,20 @@ controller_server:
       # max_speed_xy: upper bound on combined xy speed (redundant safety limit)
       max_speed_xy: 0.35
 
-      # min_speed_xy: must match Pico MIN_PWM=85 floor (~0.30 m/s).
-      # DWB sampling below this produces zero physical motion — wasted samples.
-      min_speed_xy: 0.32
+      # min_speed_xy: the translation floor — below this the motors do not turn.
+      # 0.32 -> 0.18 (2026-07-30). The old 0.32 came from a STALE "MIN_PWM=85 ->
+      # ~0.30 m/s" note; the firmware is actually MIN_PWM=50 and the floor was
+      # MEASURED on hardware at 0.16 m/s (see feedback_drivetrain_speed_floor).
+      # Note min_speed_theta below was already corrected to the MIN_PWM=50 maths —
+      # this line was simply missed, so the two disagreed about the same firmware.
+      #
+      # Why it mattered: with max_vel_x 0.35, a 0.32 floor left DWB a 0.03 m/s
+      # sampling band. When the obstacle critic rejected those few trajectories
+      # (e.g. approaching a goal near a wall) there was nothing left to fall back
+      # on, so the controller failed and bt_navigator ABORTED — with a perfectly
+      # valid global plan. 0.18 keeps a real margin over the 0.16 floor and gives
+      # DWB a 0.18-0.35 band, ~6x the room to find a valid trajectory.
+      min_speed_xy: 0.18
 
       # min_speed_theta: MIN_PWM=50 → each wheel ~0.163 m/s → angular floor
       # = 0.163 / (track/2) = 0.163 / 0.1525 = 1.07 rad/s. 1.1 gives margin.

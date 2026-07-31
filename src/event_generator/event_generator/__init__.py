@@ -8,6 +8,7 @@ convention as ``world_state`` and ``omni_memory``.
 from .generator import EventGenerator
 from .models import (
     PERSON_APPEARED,
+    PERSON_DWELLING,
     PERSON_LEFT,
     UNKNOWN_PERSON_DETECTED,
     Event,
@@ -19,6 +20,7 @@ __all__ = [
     "EventGenerator",
     "Event",
     "PERSON_APPEARED",
+    "PERSON_DWELLING",
     "PERSON_LEFT",
     "UNKNOWN_PERSON_DETECTED",
     "is_named",

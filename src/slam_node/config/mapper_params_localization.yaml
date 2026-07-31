@@ -22,19 +22,40 @@ slam_toolbox:
 
     # ── Map persistence ──────────────────────────────────────────────────────
     # Serialize the pose graph to disk every N seconds (0 = disabled)
-    map_file_name: /home/pi/omni_ws/maps/omni_home_map
+    # NOTE: overridden by launch (`map_file:=`), which is how the map is actually
+    # chosen. Kept in sync anyway so a bare run of this config loads the CURRENT map.
+    map_file_name: /home/pi/omni_ws/maps/omni_home_map_v2
+    # REQUIRED. slam_toolbox's localization mode refuses to configure without ONE of
+    # map_start_pose / map_start_at_dock:
+    #   "ERROR: Map starting pose not specified. Set either map_start_pose or
+    #    map_start_at_dock."  -> configure fails, THE MAP NEVER LOADS (no "Load From
+    #    File" line, /map comes up empty, Foxglove shows nothing, costmap resizes to
+    #    a stub instead of the map's real dimensions).
+    # Do NOT remove it because of the benign WARN it produces at startup
+    # ("Starting localization at first node (dock) is correctly not supported") —
+    # that only means it will not seat itself at the graph's first node, so it waits
+    # for an /initialpose instead. Which is exactly our workflow (Foxglove 2D Pose
+    # Estimate). Removed it once on that reading, 2026-07-30, and broke map loading.
     map_start_at_dock: true
 
     # ── Scan matching ────────────────────────────────────────────────────────
     # LD19: 10 Hz, 360°, ~5m range indoors
     debug_logging: false
-    throttle_scans: 1               # process every scan
+    # throttle_scans 1->2 (2026-07-30): the Pi 5 has 4 cores shared with Nav2's two
+    # costmaps, behavior_node/Gemini and the rest. Matching all 10 scans/s starved
+    # slam_toolbox — the logs were a wall of "Message Filter dropping message:
+    # queue full". 5 Hz of pose updates is ample at OMNI's speeds (floor 0.16 m/s).
+    throttle_scans: 2
     transform_publish_period: 0.05  # 20 Hz TF publish
     map_update_interval: 5.0        # rebuild occupancy grid every 5s
     resolution: 0.025               # 2.5cm/cell — matches mapping resolution
     max_laser_range: 10.0           # LD19 max range is ~12m; 10m is safe indoors
-    minimum_travel_distance: 0.05   # update after 5cm movement
-    minimum_travel_heading: 0.1     # update after ~6° rotation
+    # Raised 0.05->0.12 / 0.1->0.15 (2026-07-30): at 5cm the odometry noise of a
+    # STATIONARY robot kept triggering fresh scan matches, so a parked OMNI would
+    # re-match constantly and could snap to a different fit. Don't re-localise
+    # until it has actually gone somewhere.
+    minimum_travel_distance: 0.12   # update after 12cm movement
+    minimum_travel_heading: 0.15    # update after ~9° rotation
     scan_buffer_size: 10
     scan_buffer_maximum_scan_distance: 10.0
 
@@ -42,9 +63,15 @@ slam_toolbox:
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5   # max range for adding scan links
 
-    # Loop closure
-    do_loop_closing: true
-    loop_search_space_dimension: 8.0
+    # Loop closure — OFF in localization mode (2026-07-30).
+    # This was the teleport mechanism. Loop closure searches an 8m radius for a
+    # matching scan and, on a hit, RE-OPTIMISES THE POSE GRAPH — which moves the
+    # robot's estimate even when the robot has not moved at all. That is a feature
+    # while MAPPING (it closes the loop and squares the map) and a bug while
+    # LOCALIZING against a finished map: here the graph is supposed to be fixed,
+    # and the only job is to find where we are in it. Keep this false in this file;
+    # mapper_params_online_async.yaml (mapping) still has it ON, which is correct.
+    do_loop_closing: false
     loop_search_maximum_distance: 0.3
     loop_match_minimum_response_coarse: 0.35
     loop_match_maximum_variance_coarse: 3.0
@@ -52,12 +79,22 @@ slam_toolbox:
     loop_match_maximum_variance_fine: 0.5
 
     # ── Correlation parameters ────────────────────────────────────────────────
-    # Search window size at coarse/fine passes — larger is slower but more robust
-    # 1.5m dimension = ±0.75m search window; handles clicks ~0.5m off true pose
+    # Search window size at coarse/fine passes — larger is slower but more robust.
+    # 1.5m dimension = ±0.75m search window; handles a Foxglove pose click ~0.5m
+    # off the true pose. KEPT at 1.5 — that tolerance is what makes manual
+    # re-localisation practical.
     correlation_search_space_dimension: 1.5
-    correlation_search_space_resolution: 0.01
+    # resolution 0.01 -> 0.025 (2026-07-30). THE expensive one: a 1.5m window at
+    # 1cm is a 150x150 = 22,500-cell correlation grid per match, every match.
+    # At 2.5cm it is 60x60 = 3,600 cells — 6.25x cheaper for NO loss of accuracy,
+    # because the map itself is 2.5cm/cell and cannot represent anything finer.
+    # Searching finer than the map resolution buys precision that does not exist.
+    correlation_search_space_resolution: 0.025
     correlation_search_space_smear_deviation: 0.1
 
+    # (loop_search_* only matter when do_loop_closing is true — left for reference.
+    # The duplicate loop_search_space_dimension that used to sit here was removed:
+    # it was declared twice, and YAML silently keeps the last one.)
     loop_search_space_dimension: 8.0
     loop_search_space_resolution: 0.05
     loop_search_space_smear_deviation: 0.03
