@@ -516,37 +516,53 @@ def generate_launch_description():
             get_package_share_directory('dock_node'), 'config', 'dock_params.yaml')],
     )
 
-    # ── Auto initial pose ──────────────────────────────────────────────────────
-    # Publishes the robot's known starting position (office doorway) at t=10s,
-    # after slam_toolbox activates (t=8s). Published 5 times so slam_toolbox
-    # scan-matches reliably before Nav2 starts at t=12s.
-    # Coordinates captured 2026-06-19 with Display frame=map in Foxglove.
-    # Update x/y/z(orient)/w if the robot's home position changes.
-    auto_initialpose = TimerAction(
+    # ── Boot self-localization ─────────────────────────────────────────────────
+    # slam_toolbox localization mode waits for an /initialpose; it does not self-
+    # locate. At t=10s (after SLAM activates at t=8s, before Nav2 at t=12s) run
+    # boot_self_localize, which decides where OMNI is and seeds /initialpose:
+    #   DOCKED (dock tag id 0 + rear ToF at docking distance) -> the saved,
+    #     drift-free DOCKED pose (floors.yaml dock_pose).
+    #   NOT DOCKED -> the persisted last-known pose (pose_writer saved it last run);
+    #     slam_toolbox's ±0.75 m correlation window scan-matches it to truth.
+    #   NEITHER -> publishes nothing; a manual Foxglove 2D Pose Estimate is the
+    #     fallback ONLY in the genuinely-unknown case, not every boot.
+    # The old hardcoded (-3.4144, 3.5072) pose is gone — it was captured on the
+    # OLD map (omni_home_map, Jun 19) and is wrong on omni_home_map_v2.
+    # The floor comes from the resolved map_file (the floor resolver already picked
+    # the map by AprilTag/barometer above).
+    self_localize_action = TimerAction(
         period=10.0,
         actions=[
-            LogInfo(msg='[omni_full] t=10s — publishing initial pose at home position'),
+            LogInfo(msg='[omni_full] t=10s — boot self-localization (docked pose / '
+                        'persisted pose / manual fallback)'),
             ExecuteProcess(
                 cmd=[
-                    'ros2', 'topic', 'pub', '--times', '5',
-                    '/initialpose',
-                    'geometry_msgs/msg/PoseWithCovarianceStamped',
-                    (
-                        '{'
-                        'header: {frame_id: map}, '
-                        'pose: {pose: {'
-                        'position: {x: -3.4144, y: 3.5072, z: 0.0}, '
-                        'orientation: {x: 0.0, y: 0.0, z: -0.02476, w: 0.99969}'
-                        '}, covariance: ['
-                        '0.25,0,0,0,0,0, 0,0.25,0,0,0,0, 0,0,0,0,0,0, '
-                        '0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0.069'
-                        ']}'
-                        '}'
-                    ),
+                    'ros2', 'run', 'baro_node', 'boot_self_localize',
+                    '--map', LaunchConfiguration('map_file'),
+                    '--dock-range', '0.30',   # docked ToF measured 0.18-0.23 m; 0.20 was too tight (2026-08-01)
+                    '--sense-time', '3.0',
+                    '--republish', '5',
                 ],
                 output='screen',
             ),
         ],
+    )
+
+    # Persists map->base_link periodically so the NEXT boot can self-localize
+    # without a manual pose. Placed after the floor resolver so it reads the
+    # resolved map_file (the frame is per-floor). Self-delays writing until
+    # localization has converged (start_delay). See baro_node/pose_writer.py.
+    pose_writer_node = Node(
+        package='baro_node',
+        executable='pose_writer',
+        name='pose_writer',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'map_file':     LaunchConfiguration('map_file'),
+            'write_period': 5.0,
+            'start_delay':  25.0,   # > Nav2 start (t=12s) + a margin to converge
+        }],
     )
 
     # ── Nav2 stack (delayed) ───────────────────────────────────────────────────
@@ -624,6 +640,19 @@ def generate_launch_description():
         }],
     )
 
+    # ── Pre-clean stale FastDDS SHM locks ────────────────────────────────────────
+    # Every relaunch leaves /dev/shm/fastrtps_* segments behind; over a session they
+    # pile up until fresh `ros2` CLI processes can no longer join DDS discovery (empty
+    # topic echo / hz / tf2_echo, "topic not published yet") — the running stack is
+    # fine, but introspection goes blind. Wipe them before any node starts. Runs via a
+    # shell so the glob expands; harmless when there's nothing to remove. Safe here
+    # because a prior stack must be down before this launch runs.
+    clean_shm = ExecuteProcess(
+        cmd=['bash', '-c',
+             'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true'],
+        output='screen',
+    )
+
     # ── Assembly ───────────────────────────────────────────────────────────────
 
     return LaunchDescription([
@@ -658,6 +687,9 @@ def generate_launch_description():
         check_in_not_now_cooldown_arg,
         check_in_silence_timeout_arg,
         check_in_zones_arg,
+        # Pre-clean stale FastDDS SHM locks before anything starts (keeps ros2 CLI
+        # introspection working across relaunches). See note above.
+        clean_shm,
         # Static TF
         LogInfo(msg='[omni_full] Starting OMNI full stack — localization mode'),
         imu_tf,
@@ -683,8 +715,10 @@ def generate_launch_description():
         baro_node,
         # SLAM localization (configure@3s, activate@8s — internal timers)
         slam_include,
-        # Initial pose (t=10s — after SLAM active, before Nav2 starts)
-        auto_initialpose,
+        # Boot self-localization (t=10s — after SLAM active, before Nav2 starts)
+        self_localize_action,
+        # Persist pose for the next boot's self-localization (self-delayed writes)
+        pose_writer_node,
         # Nav2 (t=12s — waits for SLAM to be active)
         nav_delayed,
         # Brain (t=0 — wake word active immediately)

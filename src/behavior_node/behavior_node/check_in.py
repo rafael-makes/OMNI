@@ -374,21 +374,40 @@ class CheckInBehavior:
             self._dock_fallback()
 
     def _dock_fallback(self) -> None:
-        """Returning failed. Never end a check-in stranded mid-room.
+        """Returning failed. Never end a check-in stranded mid-room — dock instead.
 
-        NOTE: there is no docking routine to call yet — the DOCKING state is a
-        placeholder in behavior_node ("no docking logic implemented yet") and
-        `baro_floor_resolver`/AprilTag docking is not wired to a behaviour. So
-        this currently logs loudly and stands down rather than pretending to
-        dock. When the docking work lands, call it HERE — this is the spot, and
-        the session brief's "if return_pose was the dock, re-dock properly"
-        belongs here too.
+        The return goal aborted (or would not dispatch), so the robot is stopped
+        but the node is still nominally NAVIGATING from the return leg. Clear that
+        stale state before handing off, because start_docking() refuses while the
+        node believes it is navigating. This is the one place the check-in touches
+        node state directly; it is a cleanup of state the check-in's own drive set,
+        not new goal-building (which still lives in behavior_node).
+
+        The docking mission owns everything from here — driving to the pre-dock
+        pose, the visual back-in, and announcing the outcome on /dock/result. So
+        the check-in simply finishes once docking is under way.
         """
+        node = self._node
+        start_docking = getattr(node, "start_docking", None)
+        if callable(start_docking):
+            try:
+                # Drop the stale NAVIGATING left by the failed return leg.
+                node._set_state("IDLE")
+                msg = start_docking()
+                self._log().info(
+                    f"check-in: return failed — handing off to docking ({msg})")
+                self._publish("dock_fallback", detail="return failed, docking")
+                self._finish("return failed — docking")
+                return
+            except Exception as exc:  # noqa: BLE001 — must never kill the node
+                self._log().warn(f"check-in: dock fallback failed to start: {exc}")
+
+        # No docking routine available (or it errored) — stand down honestly
+        # rather than pretending to dock.
         self._log().warn(
-            "check-in: could not return to the start pose, and there is no "
-            "docking routine to fall back to yet — standing down where I am. "
-            "Wire the dock call into CheckInBehavior._dock_fallback().")
-        self._publish("stranded", detail="return failed, no dock routine")
+            "check-in: could not return to the start pose and could not start "
+            "docking — standing down where I am.")
+        self._publish("stranded", detail="return failed, dock unavailable")
         self._finish("return failed")
 
     # ── nav plumbing ─────────────────────────────────────────────────────────

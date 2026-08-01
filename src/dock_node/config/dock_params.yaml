@@ -1,8 +1,15 @@
 dock_node:
   ros__parameters:
     target_tag_id: 0          # main-floor dock tag (id 1 = basement)
-    image_width: 800          # rear cam YUYV 800x600 (matches dock detector)
-    image_height: 600
+    # MUST match the actual /detections source frame: ex is computed as
+    # (centre.x - image_width/2)/(image_width/2), so a wrong width silently
+    # miscalibrates alignment. The dock now runs off the SHARED rear_camera feed
+    # (omni-vision.service, publish_raw_image → apriltag on /camera/rear/image_raw)
+    # which is 640x480 MJPG. Was 800x600 (the old dedicated YUYV path); the one
+    # successful dock never rotated (ex small → straight to REVERSE) so the 800
+    # never bit, but it would have on any dock needing alignment.
+    image_width: 640          # shared rear_camera feed (640x480 MJPG @ ~5 Hz)
+    image_height: 480
 
     # tolerances (ex = normalized pixel h-error in [-1, 1])
     align_tol: 0.15           # |ex| within this = aligned enough to reverse
@@ -19,13 +26,39 @@ dock_node:
     reverse_speed: 0.18       # m/s — above the ~0.16 m/s translation floor
 
     # ranges (m) — stop_range MUST stay above safety_node's 0.075 proximity fault
-    stop_range: 0.13          # ~2.5cm margin above 0.075 after the reverse overshoot
+    # Raised 0.13 -> 0.20 (2026-07-31, new dock): the wall tag rides UP out of the
+    # rear cam's frame as OMNI approaches, so it can only stay visible down to
+    # ~0.17 m. That is the docked rest position for this dock. 0.20 stops the
+    # back-in there (rests ~0.17 after coast) instead of driving to ~0.10 m and
+    # losing the tag. Still far above the 0.075 proximity fault. The ToF square-up
+    # (not the tag) owns the final cm, so tag-loss below 0.17 would be safe anyway.
+    stop_range: 0.20
 
     # final square-up: near the wall, pulse-rotate to equalise the two rear ToF
     square_engage_range: 0.25 # begin squaring when the nearest rear ToF is within this
     square_tol: 0.02          # |left-right| below this (m) = square enough
     # CALIBRATE LIVE: if the square-up turns the WRONG way, flip this (may differ from steer_sign)
     square_sign: 1.0
+
+    # ORIENT: before searching, pulse-rotate to the standoff heading the docking mission
+    # publishes on /dock/orient_target (Nav2 delivers OMNI to the standoff POSITION at an
+    # arbitrary heading, so the rear cam may not face the tag — see project_dock_node).
+    # Uses map->base_link yaw as feedback. Ends early the instant the tag comes into view,
+    # so orient_tol is only the fallback endpoint. A plain /dock/start (no orient_target
+    # published) skips ORIENT entirely.
+    orient_tol: 0.12          # rad (~7°) — |heading - target| within this = oriented
+    t_orient_max: 20.0        # s cap on the orient turn before falling back to a blind search
+
+    # UNDOCK (/dock/undock): drive straight FORWARD off the dock so Nav2 can plan from a
+    # clear pose — the docked start sits inside Nav2's robot_radius of the wall, so Nav2
+    # refuses to plan out. Also the maneuver to pull off charger contacts (future). Closed
+    # loop on map->base_link distance, safety-gated via /cmd_vel_raw.
+    undock_distance: 0.40     # m forward off the dock (rear ~0.19 -> ~0.59, clear of the 0.22 radius)
+    undock_speed: 0.18        # m/s forward, above the ~0.16 translation floor
+    t_undock_max: 12.0        # s cap on the undock drive
+    # docked_threshold: rear ToF ≤ this => /dock/docked=true (live "on the dock" signal the
+    # brain uses for greeting/check-in suppression AND to undock before navigating away).
+    docked_threshold: 0.28    # m — above the ~0.18-0.23 docked rest, below the ~0.6 standoff
 
     # timing (s)
     # tag_timeout 0.3 -> 0.6 (2026-07-30). The rear cam is now SHARED with

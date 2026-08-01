@@ -205,3 +205,60 @@ def test_stop_range_above_safety_proximity():
 def test_pulse_speed_above_rotation_floor():
     # a pulse must exceed the ~1.1 rad/s in-place rotation floor or the motors won't move
     assert DockConfig().pulse_speed > 1.1
+
+
+# ── orient ──────────────────────────────────────────────────────────────────
+def test_start_with_orient_target_begins_in_orient():
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    assert c.phase is Phase.ORIENT
+
+
+def test_start_without_orient_target_is_unchanged():
+    # backward compatible: no orient_target -> old ALIGN/SEARCH behavior
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False))
+    assert c.phase is Phase.SEARCH
+    c2, _ = _ctrl()
+    c2.start(0.0, TagObs(seen=True, ex=0.2))
+    assert c2.phase is Phase.ALIGN
+
+
+def test_orient_pulses_toward_target_both_ways():
+    # target CCW of current heading (+err) -> +yaw; the reverse -> -yaw. No steer_sign.
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.0, heading=0.0)
+    assert cmd.phase is Phase.ORIENT and cmd.angular_z > 0.0
+    c2, _ = _ctrl()
+    c2.start(0.0, TagObs(seen=False), orient_target=-1.0, heading=0.0)
+    cmd2 = c2.update(TagObs(seen=False), RearRange(), 0.0, heading=0.0)
+    assert cmd2.angular_z < 0.0
+
+
+def test_orient_hands_to_align_when_tag_appears():
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    cmd = c.update(TagObs(seen=True, ex=0.2), RearRange(), 0.1, heading=0.3)
+    assert cmd.phase is Phase.ALIGN   # stops turning the moment the tag is in view
+
+
+def test_orient_reaches_target_without_tag_falls_to_search():
+    c, _ = _ctrl(orient_tol=0.1)
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.1, heading=1.0)  # err ~0
+    assert cmd.phase is Phase.SEARCH
+
+
+def test_orient_without_heading_feedback_falls_to_search():
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.1, heading=None)
+    assert cmd.phase is Phase.SEARCH
+
+
+def test_orient_timeout_falls_to_search():
+    c, _ = _ctrl(t_orient_max=5.0)
+    c.start(0.0, TagObs(seen=False), orient_target=3.0, heading=0.0)
+    cmd = c.update(TagObs(seen=False), RearRange(), 6.0, heading=0.5)
+    assert cmd.phase is Phase.SEARCH

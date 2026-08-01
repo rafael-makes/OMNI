@@ -23,6 +23,8 @@ setup(
             'baro_calibrate = baro_node.calibrate:main',
             'baro_select_map = baro_node.select_map:main',
             'baro_floor_resolver = baro_node.floor_resolver:main',
+            'pose_writer = baro_node.pose_writer:main',
+            'boot_self_localize = baro_node.boot_self_localize:main',
         ],
     },
 )

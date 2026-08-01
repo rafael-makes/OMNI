@@ -31,6 +31,7 @@ speed with a hand on the e-stop.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -38,11 +39,17 @@ from typing import Optional
 
 class Phase(str, Enum):
     IDLE = "IDLE"
+    ORIENT = "ORIENT"   # pulse-rotate to a known heading so the tag is in view
     SEARCH = "SEARCH"
     ALIGN = "ALIGN"
     REVERSE = "REVERSE"
     DONE = "DONE"
     FAILED = "FAILED"
+
+
+def _wrap(a: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 
 @dataclass
@@ -89,6 +96,12 @@ class DockConfig:
     square_engage_range: float = 0.25  # begin squaring when the nearest rear ToF is within this
     square_tol: float = 0.02         # |left-right| below this (m) = square enough
     square_sign: float = 1.0         # +1/-1; ToF-delta→yaw sign, calibrated live (may differ from steer_sign)
+    # ORIENT: pulse-rotate to a caller-supplied heading BEFORE searching, so the rear
+    # camera is pointed at the tag on arrival (Nav2 delivers OMNI to the standoff
+    # position at an arbitrary heading — see project_dock_node). Ends early the moment
+    # the tag comes into view, so orient_tol is only the fallback endpoint.
+    orient_tol: float = 0.12         # rad (~7°) — |heading - target| within this = done
+    t_orient_max: float = 20.0
     # timing (s) — generous because pulsing is slow
     tag_lost_grace: float = 0.6      # tolerate this long a tag dropout before reacting
     t_search_max: float = 20.0
@@ -128,11 +141,25 @@ class DockController:
         self._search_dir = 1.0
         self._search_in_leg = 0
         self._search_leg_len = 2
+        # ORIENT target heading (rad, in the same frame the caller feeds as `heading`)
+        self._orient_target: Optional[float] = None
 
-    def start(self, now: float, tag: Optional[TagObs] = None) -> None:
+    def start(self, now: float, tag: Optional[TagObs] = None,
+              orient_target: Optional[float] = None,
+              heading: Optional[float] = None) -> None:
+        """Begin a docking attempt.
+
+        orient_target/heading (both required to orient): pulse-rotate to the
+        orient_target heading FIRST, so the rear camera faces the tag before
+        searching. Without them, behaves exactly as before (ALIGN if the tag is
+        already seen, else SEARCH).
+        """
         self._t_start = now
         self._pulse_reset()
-        if tag and tag.seen:
+        self._orient_target = orient_target
+        if orient_target is not None and heading is not None:
+            self._enter(Phase.ORIENT, now)
+        elif tag and tag.seen:
             self._t_last_seen = now
             self._enter(Phase.ALIGN, now)
         else:
@@ -184,7 +211,8 @@ class DockController:
         return 0.0
 
     # ── main update ───────────────────────────────────────────────────────────��─
-    def update(self, tag: TagObs, rear: RearRange, now: float) -> DockCommand:
+    def update(self, tag: TagObs, rear: RearRange, now: float,
+               heading: Optional[float] = None) -> DockCommand:
         cfg = self.cfg
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.FAILED):
             return DockCommand(phase=self.phase,
@@ -198,6 +226,8 @@ class DockController:
         if now - self._t_start > cfg.t_overall_max:
             return self._fail(now, "overall docking timeout")
 
+        if self.phase is Phase.ORIENT:
+            return self._orient(tag, heading, now)
         if self.phase is Phase.SEARCH:
             return self._search(tag, now)
         if self.phase is Phase.ALIGN:
@@ -207,6 +237,39 @@ class DockController:
         return self._fail(now, f"unexpected phase {self.phase}")
 
     # ── phases ────────────────────────────────────────────────────────────────
+    def _orient(self, tag: TagObs, heading: Optional[float], now: float) -> DockCommand:
+        cfg = self.cfg
+        # Tag came into view mid-turn — hand straight to ALIGN, don't overshoot.
+        if tag.seen:
+            self._pulse_reset()
+            self._enter(Phase.ALIGN, now)
+            return DockCommand(phase=Phase.ALIGN, message="tag acquired during orient")
+        if now - self._t_phase > cfg.t_orient_max:
+            self._pulse_reset()
+            self._enter(Phase.SEARCH, now)
+            return DockCommand(phase=Phase.SEARCH, message="orient timeout — searching")
+        if heading is None or self._orient_target is None:
+            # No heading feedback (TF gap) — cannot orient; fall back to a blind sweep.
+            self._pulse_reset()
+            self._enter(Phase.SEARCH, now)
+            return DockCommand(phase=Phase.SEARCH, message="no heading — searching")
+        err = _wrap(self._orient_target - heading)
+        # finish an in-progress pulse before re-deciding (decisions only when settled)
+        if self._pulse_active():
+            return DockCommand(angular_z=self._pulse_continue(now), phase=Phase.ORIENT,
+                               message=f"orient err={math.degrees(err):+.0f}deg")
+        if abs(err) <= cfg.orient_tol:
+            # Reached the target heading but the tag still isn't visible — search from
+            # here (rare: the standoff heading should show the tag).
+            self._pulse_reset()
+            self._enter(Phase.SEARCH, now)
+            return DockCommand(phase=Phase.SEARCH, message="oriented, no tag — searching")
+        # +err (target CCW of current heading) → +yaw (CCW). This is a robot/odom-frame
+        # rotation, so there is NO steer_sign here — that sign is for camera-PIXEL error.
+        yaw = self._pulse_start(_sign(err), now)
+        return DockCommand(angular_z=yaw, phase=Phase.ORIENT,
+                           message=f"orient err={math.degrees(err):+.0f}deg")
+
     def _search(self, tag: TagObs, now: float) -> DockCommand:
         cfg = self.cfg
         if tag.seen:

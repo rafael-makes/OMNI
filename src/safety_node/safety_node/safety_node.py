@@ -263,6 +263,16 @@ class SafetyNode(Node):
         # in a set so fault_proximity only clears when ALL sensors are clear.
         try:
             topic = msg.header.frame_id  # tof_* frame names identify the sensor
+            # Ignore INVALID readings. A VL53L0X glitch (common as the battery
+            # sags) reports a range OUTSIDE [min_range, max_range] — often ~0.0.
+            # Acting on it trips a FALSE proximity fault and wedges that frame_id
+            # into _tof_close, which may never receive a matching in-range "clear"
+            # → the fault latches until a node restart. Only real, in-range
+            # readings may set or clear proximity. Same validity check dock_node
+            # and navdiag already use. Open space still reads max_range (in-range),
+            # so a legitimately-clear sensor continues to clear normally.
+            if not (msg.min_range <= msg.range <= msg.max_range):
+                return
             if msg.range < self._min_proximity:
                 if topic not in self._tof_close:
                     self._tof_close.add(topic)
@@ -288,18 +298,34 @@ class SafetyNode(Node):
                 self.get_logger().info('stall recovery finished — resuming /cmd_vel gating')
 
     def _clear_fault_cb(self, msg: String):
-        # Manual fault reset for latching faults.
-        # Accepted payloads: "stall", "estop", "all"
+        # Manual fault reset. Latching faults (stall, estop) require this. The
+        # auto-clearing ones (proximity, watchdog) normally resolve themselves,
+        # but proximity can WEDGE if a stale frame_id is stuck in _tof_close
+        # (e.g. a glitch, pre the validity filter above), so it needs a manual
+        # escape hatch too — "proximity"/"all" reset the set. If the condition is
+        # genuinely still present, the next sensor/loop tick simply re-faults, so
+        # this can never clear a real hazard.
+        # Accepted payloads: "stall", "estop", "proximity", "watchdog", "all"
         try:
             cmd = msg.data.strip().lower()
+            known = ('stall', 'estop', 'proximity', 'watchdog', 'all')
             if cmd in ('stall', 'all'):
                 self.fault_stall = False
                 self.get_logger().info('fault_stall cleared by /safety/clear_fault')
             if cmd in ('estop', 'all'):
                 self.fault_estop = False
                 self.get_logger().info('fault_estop cleared by /safety/clear_fault')
-            if cmd not in ('stall', 'estop', 'all'):
-                self.get_logger().warn(f'clear_fault: unknown command "{cmd}" — use "stall", "estop", or "all"')
+            if cmd in ('proximity', 'all'):
+                self._tof_close.clear()
+                self.fault_proximity = False
+                self.get_logger().info('fault_proximity cleared by /safety/clear_fault')
+            if cmd in ('watchdog', 'all'):
+                self.fault_watchdog = False
+                self.get_logger().info('fault_watchdog cleared by /safety/clear_fault')
+            if cmd not in known:
+                self.get_logger().warn(
+                    f'clear_fault: unknown command "{cmd}" — use '
+                    f'"stall", "estop", "proximity", "watchdog", or "all"')
         except Exception as e:
             self.get_logger().warn(f'clear_fault callback error: {e}')
 

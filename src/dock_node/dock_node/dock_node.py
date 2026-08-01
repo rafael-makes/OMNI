@@ -25,15 +25,17 @@ Design notes:
     crawl speed, hand on e-stop.
 """
 
+import math
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, QoSProfile, qos_profile_sensor_data)
+import tf2_ros
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Range
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float64, String
 from std_srvs.srv import Trigger
 from apriltag_msgs.msg import AprilTagDetectionArray
 
@@ -61,6 +63,8 @@ class DockNode(Node):
             square_engage_range = p('square_engage_range', 0.25).value,
             square_tol          = p('square_tol', 0.02).value,
             square_sign         = float(p('square_sign', 1.0).value),
+            orient_tol          = p('orient_tol', 0.12).value,
+            t_orient_max        = p('t_orient_max', 20.0).value,
             tag_lost_grace      = p('tag_lost_grace', 0.6).value,
             t_search_max        = p('t_search_max', 20.0).value,
             t_align_max         = p('t_align_max', 30.0).value,
@@ -71,8 +75,18 @@ class DockNode(Node):
         self._cfg = cfg
         self._tag_timeout = p('tag_timeout', 0.3).value
         self._rear_fresh = p('rear_fresh', 0.3).value
+        # Undock: drive straight FORWARD off the dock. Nav2 can't plan out (the docked
+        # start pose is inside robot_radius of the wall), and this is also the maneuver
+        # to pull forward off charger contacts. Closed-loop on map->base_link distance.
+        self._undock_distance = p('undock_distance', 0.40).value
+        self._undock_speed = p('undock_speed', 0.18).value   # forward, above the 0.16 floor
+        self._t_undock_max = p('t_undock_max', 12.0).value
+        self._docked_threshold = p('docked_threshold', 0.28).value  # rear ToF ≤ this = "docked"
         self._ctrl = DockController(cfg)
         self._active = False
+        self._undocking = False
+        self._undock_start = None
+        self._undock_t0 = 0.0
 
         self._last_tag = TagObs()
         self._last_tag_t = 0.0
@@ -84,6 +98,7 @@ class DockNode(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._docked_pub = self.create_publisher(Bool, '/dock/docked', latched)
         self._result_pub = self.create_publisher(String, '/dock/result', latched)
+        self._undock_result_pub = self.create_publisher(String, '/dock/undock_result', latched)
 
         self.create_subscription(AprilTagDetectionArray, '/detections',
                                  self._on_detections, 10)
@@ -96,6 +111,18 @@ class DockNode(Node):
 
         self.create_service(Trigger, '/dock/start', self._srv_start)
         self.create_service(Trigger, '/dock/cancel', self._srv_cancel)
+        self.create_service(Trigger, '/dock/undock', self._srv_undock)
+
+        # Heading source for the ORIENT phase (map->base_link yaw). Nav2 delivers
+        # OMNI to the standoff at an arbitrary heading, so before searching we turn
+        # to the standoff heading the mission publishes on /dock/orient_target.
+        self._tf_buf = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
+        self._orient_target_deg = None
+        self._orient_consumed = True   # one-shot; only a fresh publish enables orient
+        latched_in = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Float64, '/dock/orient_target',
+                                 self._on_orient_target, latched_in)
 
         self._timer = self.create_timer(1.0 / 15.0, self._tick)
         self._publish_docked(False)
@@ -133,6 +160,21 @@ class DockNode(Node):
         else:
             self._rear_right = stamp
 
+    def _on_orient_target(self, msg: Float64):
+        # The mission publishes the standoff heading (deg, map frame) before docking.
+        self._orient_target_deg = float(msg.data)
+        self._orient_consumed = False
+
+    def _current_heading(self):
+        """map->base_link yaw (rad), or None if TF cannot answer."""
+        try:
+            tf = self._tf_buf.lookup_transform('map', 'base_link', rclpy.time.Time())
+        except Exception:  # noqa: BLE001 — no TF yet is normal
+            return None
+        q = tf.transform.rotation
+        return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                          1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
     # ── services ───────────────────────────────────────────────────────────────
     def _srv_start(self, req, resp):
         if self._active:
@@ -140,7 +182,20 @@ class DockNode(Node):
             resp.message = 'already docking'
             return resp
         now = time.monotonic()
-        self._ctrl.start(now, self._current_tag(now))
+        heading = self._current_heading()
+        orient_target = None
+        if (not self._orient_consumed and self._orient_target_deg is not None
+                and heading is not None):
+            orient_target = math.radians(self._orient_target_deg)
+            self.get_logger().info(
+                f'orient: turning to {self._orient_target_deg:.1f}° before searching '
+                f'(current heading {math.degrees(heading):.1f}°)')
+        elif not self._orient_consumed and heading is None:
+            self.get_logger().warn('orient requested but no map->base_link TF — '
+                                   'searching without pre-orient')
+        self._orient_consumed = True   # one-shot per publish; manual /dock/start won't orient
+        self._ctrl.start(now, self._current_tag(now),
+                         orient_target=orient_target, heading=heading)
         self._active = True
         self._publish_docked(False)
         self.get_logger().info('docking started')
@@ -149,19 +204,49 @@ class DockNode(Node):
         return resp
 
     def _srv_cancel(self, req, resp):
+        if self._undocking:
+            self._finish_undock(False, 'cancelled')
         self._stop_and_idle('cancelled by service')
         resp.success = True
         resp.message = 'cancelled'
         return resp
 
+    def _srv_undock(self, req, resp):
+        """Drive straight forward off the dock so Nav2 can plan from a clear pose
+        (and, later, to pull off charger contacts). Outcome on /dock/undock_result."""
+        if self._active or self._undocking:
+            resp.success = False
+            resp.message = 'busy'
+            return resp
+        pos = self._current_position()
+        if pos is None:
+            resp.success = False
+            resp.message = 'no map->base_link TF — cannot undock'
+            return resp
+        self._undock_start = pos
+        self._undock_t0 = time.monotonic()
+        self._undocking = True
+        self.get_logger().info(
+            f'undocking — driving forward {self._undock_distance:.2f} m off the dock')
+        resp.success = True
+        resp.message = 'undocking started'
+        return resp
+
     # ── control loop ─────────────────────────────────────────────────────────
     def _tick(self):
+        # Publish the LIVE docked state (rear ToF) every tick, so the brain knows
+        # whether OMNI is physically on the dock — for greeting/check-in suppression
+        # AND to trigger an undock before navigating away.
+        self._publish_docked(self._rear_is_docked())
+        if self._undocking:
+            self._tick_undock()
+            return
         if not self._active:
             return
         now = time.monotonic()
         tag = self._current_tag(now)
         rear = self._current_rear(now)
-        cmd = self._ctrl.update(tag, rear, now)
+        cmd = self._ctrl.update(tag, rear, now, heading=self._current_heading())
         self._publish_status(cmd, tag, rear)
         if cmd.done or cmd.failed:
             self._finish(cmd)
@@ -183,6 +268,46 @@ class DockNode(Node):
             left=lv if (now - lt) <= self._rear_fresh else None,
             right=rv if (now - rt) <= self._rear_fresh else None,
         )
+
+    # ── undock ─────────────────────────────────────────────────────────────────
+    def _tick_undock(self):
+        now = time.monotonic()
+        pos = self._current_position()
+        if pos is None:
+            self._finish_undock(False, 'lost map->base_link TF during undock')
+            return
+        dist = math.hypot(pos[0] - self._undock_start[0], pos[1] - self._undock_start[1])
+        if dist >= self._undock_distance:
+            self._finish_undock(True, f'undocked {dist:.2f} m')
+            return
+        if now - self._undock_t0 > self._t_undock_max:
+            self._finish_undock(False, f'undock timeout at {dist:.2f} m')
+            return
+        tw = Twist()
+        tw.linear.x = float(self._undock_speed)   # forward, away from the wall/dock
+        self._cmd_pub.publish(tw)
+
+    def _finish_undock(self, ok: bool, msg: str):
+        self._undocking = False
+        self._cmd_pub.publish(Twist())   # explicit stop
+        self._undock_result_pub.publish(
+            String(data='undocked' if ok else f'failed: {msg}'))
+        if ok:
+            self.get_logger().info(f'UNDOCKED — {msg}')
+        else:
+            self.get_logger().warn(f'undock FAILED — {msg}')
+
+    def _rear_is_docked(self) -> bool:
+        rmin = self._current_rear(time.monotonic()).valid_min()
+        return rmin is not None and rmin <= self._docked_threshold
+
+    def _current_position(self):
+        """(x, y) of base_link in the map frame, or None if TF cannot answer."""
+        try:
+            tf = self._tf_buf.lookup_transform('map', 'base_link', rclpy.time.Time())
+        except Exception:  # noqa: BLE001
+            return None
+        return (tf.transform.translation.x, tf.transform.translation.y)
 
     def _finish(self, cmd: DockCommand):
         self._cmd_pub.publish(Twist())   # explicit stop

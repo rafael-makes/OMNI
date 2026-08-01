@@ -44,12 +44,12 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import DurabilityPolicy, QoSPresetProfiles, QoSProfile
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Bool, Float32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 from std_srvs.srv import Trigger
 from vision_msgs.msg import Detection2DArray
 
@@ -528,10 +528,28 @@ class BehaviorNode(Node):
         self._dock_location_name = self.declare_parameter('dock_location_name', 'dock').value
         self._docking    = False
         self._dock_phase = None            # 'APPROACH' | 'BACKING' | None
+        self._dock_nav_retried = False     # one-shot retry of a transient approach abort
         self._dock_lock  = threading.Lock()
         self._dock_start_cli  = self.create_client(Trigger, '/dock/start')
         self._dock_cancel_cli = self.create_client(Trigger, '/dock/cancel')
         self.create_subscription(String, '/dock/result', self._on_dock_result, 10)
+        # Standoff heading → dock_node, so it turns to face the tag before searching
+        # (Nav2 arrives heading-free). Latched to match dock_node's TRANSIENT_LOCAL sub.
+        _dock_latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._dock_orient_pub = self.create_publisher(
+            Float64, '/dock/orient_target', _dock_latched)
+        # Undock: Nav2 can't plan out of the dock (start pose inside robot_radius of the
+        # wall), so drive forward off it first via dock_node, then navigate.
+        self._dock_undock_cli = self.create_client(Trigger, '/dock/undock')
+        self.create_subscription(String, '/dock/undock_result',
+                                 self._on_undock_result, 10)
+        # Live docked state from dock_node (rear ToF) — the real "on the dock" signal
+        # (see CLAUDE.md "no docked signal exists yet"). Drives self._docked for
+        # greeting/check-in suppression AND the undock-before-nav trigger.
+        self.create_subscription(Bool, '/dock/docked', self._on_dock_docked, _dock_latched)
+        self._undock_lock  = threading.Lock()
+        self._undocking    = False
+        self._pending_nav  = None      # (x, y, yaw, intent) deferred behind an undock
 
         self._check_in_enabled = bool(self.get_parameter('check_in_enabled').value)
         # Both stay None when check-ins are disabled; every call site guards on
@@ -1633,8 +1651,17 @@ class BehaviorNode(Node):
         with self._dock_lock:
             self._docking    = True
             self._dock_phase = 'APPROACH'
-        self._docked = False   # leaving the dock spot the moment we start driving
+            self._dock_nav_retried = False
+        # NOTE: self._docked is driven by dock_node's live /dock/docked (rear ToF) — do
+        # NOT clear it here, or start_navigation below won't know to undock first.
         x, y, yaw_deg = pose
+        # Tell dock_node the standoff heading (map frame) so it turns to face the tag
+        # before searching — Nav2 delivers OMNI to the standoff POSITION heading-free.
+        # Latched + published now, well before the visual back-in reads it at /dock/start.
+        try:
+            self._dock_orient_pub.publish(Float64(data=float(yaw_deg)))
+        except Exception as exc:  # noqa: BLE001 — never let this kill the mission
+            self.get_logger().warn(f'could not publish dock orient target: {exc}')
         self.get_logger().info('Docking mission: driving to pre-dock pose')
         self.start_navigation(x, y, yaw_deg, intent=('dock', self._dock_location_name))
         return ("Very well, I shall return to my dock — driving to the approach "
@@ -1661,10 +1688,31 @@ class BehaviorNode(Node):
             self._clear_docking()
             self._set_state('IDLE')
         else:                               # ABORTED / unknown — couldn't reach it
+            # Nav2's FIRST goal after a boot/teleop can abort transiently (costmap/
+            # DDS still settling — observed live 2026-08-01, an immediate retry then
+            # succeeded). So retry the approach ONCE before giving up. The nav server
+            # was ready moments ago, so skip the blocking nav_is_ready() here (this
+            # runs on the single-threaded executor). Phase stays APPROACH, so the
+            # next result routes back through here; a second abort exhausts the retry.
+            with self._dock_lock:
+                retry = self._docking and not self._dock_nav_retried
+                if retry:
+                    self._dock_nav_retried = True
+            pose = self.resolve_location(self._dock_location_name) if retry else None
+            if retry and pose is not None:
+                self.get_logger().warn(
+                    'Docking approach aborted — retrying the drive once (a first nav '
+                    'goal after boot/teleop can abort transiently).')
+                x, y, yaw_deg = pose
+                self.start_navigation(x, y, yaw_deg,
+                                      intent=('dock', self._dock_location_name))
+                return
             self._clear_docking()
             self._announce_via_session(
-                'You were driving to your dock but could not get there — no path, or '
-                'you got stuck. Apologise briefly, in character. One sentence only.')
+                'You tried to drive to your dock but could not find a clear path and '
+                'stopped. You do NOT know what is blocking the route — do NOT guess, '
+                'invent, or name any object. Say only that you could not find a clear '
+                'path to the dock right now. One sentence, in character.')
 
     def _on_dock_result(self, msg: String):
         """dock_node terminal outcome: 'docked' | 'failed: ...' | 'cancelled'. Acted
@@ -1699,6 +1747,14 @@ class BehaviorNode(Node):
             phase = self._dock_phase
             self._docking    = False
             self._dock_phase = None
+        # If the approach is still deferred behind an undock (driving off the dock),
+        # cancel that drive and drop the pending goal. /dock/cancel stops the undock.
+        with self._undock_lock:
+            was_undocking = self._undocking
+            self._undocking = False
+            self._pending_nav = None
+        if was_undocking and self._dock_cancel_cli.service_is_ready():
+            self._dock_cancel_cli.call_async(Trigger.Request())
         self.get_logger().info(f'Docking aborted — {reason} (phase {phase})')
         if phase == 'APPROACH':
             self.cancel_navigation()
@@ -1709,6 +1765,38 @@ class BehaviorNode(Node):
         with self._dock_lock:
             self._docking    = False
             self._dock_phase = None
+
+    def _on_dock_docked(self, msg: Bool):
+        """Live docked state from dock_node (rear ToF). The authoritative 'on the dock'
+        signal — feeds greeting/check-in suppression and the undock-before-nav trigger."""
+        self._docked = bool(msg.data)
+
+    def _on_undock_result(self, msg: String):
+        """dock_node finished driving off the dock. On success, dispatch the nav goal
+        that was deferred in start_navigation; on failure, stand down honestly."""
+        result = (msg.data or '').strip()
+        with self._undock_lock:
+            if not self._undocking:
+                return
+            self._undocking = False
+            pending = self._pending_nav
+            self._pending_nav = None
+        if result == 'undocked':
+            self._docked = False
+            self.get_logger().info('Undocked — dispatching the deferred navigation goal.')
+            if pending is not None:
+                x, y, yaw_deg, intent = pending
+                self.start_navigation(x, y, yaw_deg, intent=intent)
+        else:
+            self.get_logger().warn(f'Undock failed ({result}) — cannot leave the dock.')
+            with self._dock_lock:
+                was_docking = self._docking
+            if was_docking:
+                self._clear_docking()
+            self._set_state('IDLE')
+            self._announce_via_session(
+                'You tried to move off your dock but could not. Say briefly and in '
+                'character that you are unable to leave the dock right now. One sentence.')
 
     def _announce_via_session(self, prompt: str):
         """Speak a one-off line by opening a Live session with it as the first thing
@@ -1792,6 +1880,21 @@ class BehaviorNode(Node):
         announcement can name the destination instead of saying 'the
         destination'. None keeps the generic prompt (e.g. the check-in drives
         through here but owns its own arrival via _nav_result_callback)."""
+        # If OMNI is on the dock, Nav2 cannot plan out (the docked start pose is inside
+        # robot_radius of the wall). Undock first (drive forward off the dock via
+        # dock_node), then dispatch this goal from _on_undock_result. This branch is
+        # DORMANT unless docked, so ordinary navigation is unchanged.
+        with self._undock_lock:
+            if self._undocking:
+                self._pending_nav = (x, y, yaw_deg, intent)   # newer goal supersedes
+                return
+            if self._docked and self._dock_undock_cli.service_is_ready():
+                self._pending_nav = (x, y, yaw_deg, intent)
+                self._undocking = True
+                self.get_logger().info('On the dock — undocking before navigating.')
+                self._dock_undock_cli.call_async(Trigger.Request())
+                return
+
         self._nav_intent  = intent         # consumed + cleared in _nav_result_callback
         self._nav_started = time.monotonic()
         goal_msg      = NavigateToPose.Goal()

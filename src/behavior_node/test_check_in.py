@@ -530,10 +530,10 @@ def test_successful_return_finishes_the_mission():
     assert not behavior.is_active()
 
 
-def test_failed_return_is_reported_loudly_not_silently():
-    """There is no docking routine to fall back to yet, so the requirement
-    "never end stranded" is currently met by saying so, not by pretending."""
-    node, _, behavior = make()
+def test_failed_return_stands_down_loudly_when_no_docking():
+    """With no docking routine on the node, "never end stranded" is met by
+    saying so loudly, not by pretending — never silently."""
+    node, _, behavior = make()   # FakeNode has no start_docking
     fly_to_approach(node, behavior)
     behavior.on_nav_result(SUCCEEDED)
     behavior.on_conversation_end()
@@ -542,7 +542,35 @@ def test_failed_return_is_reported_loudly_not_silently():
     assert not behavior.is_active()
     log = node._logger.text()
     assert "could not return" in log
-    assert "_dock_fallback" in log      # points at the exact spot to wire it
+    assert "standing down" in log
+
+
+def test_failed_return_hands_off_to_docking():
+    """When the node CAN dock, a failed return docks instead of stranding: the
+    stale NAVIGATING left by the return leg is cleared, then docking starts."""
+
+    class DockingNode(FakeNode):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.docking_started = 0
+
+        def _set_state(self, s):
+            self.state = s
+
+        def start_docking(self):
+            self.docking_started += 1
+            return "Very well, I shall return to my dock."
+
+    node, _, behavior = make(node=DockingNode())
+    fly_to_approach(node, behavior)
+    behavior.on_nav_result(SUCCEEDED)
+    behavior.on_conversation_end()
+    assert wait_for(lambda: behavior.state == RETURN)
+    behavior.on_nav_result(ABORTED)
+    assert not behavior.is_active()
+    assert node.docking_started == 1
+    assert node.state == "IDLE"          # stale NAVIGATING cleared before handoff
+    assert "handing off to docking" in node._logger.text()
 
 
 def test_nav_results_are_ignored_when_no_mission_is_running():
