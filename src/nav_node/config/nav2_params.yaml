@@ -540,7 +540,13 @@ local_costmap:
         # primary; oak_depth is the OAK-D Lite depth->LaserScan converted on the
         # Jetson (topic /oak/scan, frame oak_rgb_camera_optical_frame, reachable via
         # base_link->oak published by the Jetson driver). Both mark+clear independently.
-        observation_sources: scan oak_depth
+        # OAK is DISABLED here (2026-08-02). Even tuned to 1.5m marking / 2m raytrace,
+        # phantom stereo hits piled up faster than they cleared, trapping OMNI in
+        # place with fake obstacles ringing him. The oak_depth block below is kept
+        # for later tuning — flip this line to `scan oak_depth` to re-enable, but
+        # first tune the depth-to-scan converter on the Jetson (height slice,
+        # min-confidence filter) so phantoms are filtered at the SOURCE, not here.
+        observation_sources: scan
         scan:
           topic: /scan
           max_obstacle_height: 2.0
