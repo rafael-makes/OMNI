@@ -19,8 +19,17 @@ dock_node:
     # at the motors' physical floor; firmware can't lower it, measured 2026-07-26). So we
     # rotate in bursts above the floor, then stop and look. See feedback_drivetrain_speed_floor.
     pulse_speed: 1.2          # rad/s per pulse — MUST exceed the ~1.1 rad/s rotation floor
-    pulse_dur: 0.12           # s of rotation per pulse (a few degrees; tune on hardware)
+    pulse_dur: 0.12           # s of rotation per pulse — PRECISE (~8°); used by ALIGN, REVERSE-
+                              # correct, square-up. Small so ALIGN doesn't overshoot align_tol.
     settle_dur: 0.25          # s stopped between pulses (settle + a fresh detection frame)
+    # BIGGER pulses for the FIND-THE-TAG phases (SEARCH + ORIENT). These cover big angles
+    # (SEARCH: widening sweeps up to full circle; ORIENT: up to ~180° to standoff heading).
+    # Precision doesn't matter (they hand to ALIGN the moment the tag is in view / target is
+    # within orient_tol), so bigger bites = fewer timeouts. Observed 2026-08-02: 8°/pulse
+    # only swept ~50° in the 20 s SEARCH budget, and pulses too close to the motor stall
+    # floor sometimes didn't move the robot the expected amount.
+    search_pulse_speed: 1.5   # rad/s — a bit above stall (1.1) for a solid, reliable turn
+    search_pulse_dur: 0.20    # s → ~17°/pulse, roughly 2× the precise pulse
 
     # translation
     reverse_speed: 0.18       # m/s — above the ~0.16 m/s translation floor

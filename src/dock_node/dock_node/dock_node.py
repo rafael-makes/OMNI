@@ -58,6 +58,8 @@ class DockNode(Node):
             pulse_speed         = p('pulse_speed', 1.2).value,
             pulse_dur           = p('pulse_dur', 0.12).value,
             settle_dur          = p('settle_dur', 0.25).value,
+            search_pulse_speed  = p('search_pulse_speed', 1.5).value,
+            search_pulse_dur    = p('search_pulse_dur', 0.20).value,
             reverse_speed       = p('reverse_speed', 0.18).value,
             stop_range          = p('stop_range', 0.13).value,
             square_engage_range = p('square_engage_range', 0.25).value,

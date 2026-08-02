@@ -1,4 +1,5 @@
 """Offline tests for the pulsed docking control law (robot OFF)."""
+import math
 
 from dock_node.dock_controller import (
     DockConfig, DockController, Phase, RearRange, TagObs)
@@ -205,6 +206,55 @@ def test_stop_range_above_safety_proximity():
 def test_pulse_speed_above_rotation_floor():
     # a pulse must exceed the ~1.1 rad/s in-place rotation floor or the motors won't move
     assert DockConfig().pulse_speed > 1.1
+
+
+def test_search_pulse_is_bigger_than_align_pulse():
+    # SEARCH/ORIENT need to cover ground fast (previously timed out because each pulse
+    # was only ~8°). BOTH speed and duration should be >= align's precise pulse.
+    cfg = DockConfig()
+    assert cfg.search_pulse_speed > 1.1                     # above stall floor
+    assert cfg.search_pulse_speed >= cfg.pulse_speed
+    assert cfg.search_pulse_dur   >= cfg.pulse_dur
+    # per-pulse angle for SEARCH should be visibly bigger
+    align_deg  = math.degrees(cfg.pulse_speed        * cfg.pulse_dur)
+    search_deg = math.degrees(cfg.search_pulse_speed * cfg.search_pulse_dur)
+    assert search_deg > align_deg * 1.5
+
+
+def test_search_uses_big_pulse_not_align_pulse():
+    # SEARCH should call _pulse_start with the search speed, not the default.
+    c, cfg = _ctrl(pulse_speed=1.0, search_pulse_speed=1.8)
+    c.start(0.0, TagObs(seen=False))
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.0)
+    assert cmd.phase is Phase.SEARCH
+    assert abs(cmd.angular_z) == 1.8   # search speed, NOT the align speed
+
+
+def test_align_still_uses_precise_pulse_not_search_pulse():
+    # ALIGN precision hasn't regressed — it must not accidentally use the big pulse.
+    c, cfg = _ctrl(pulse_speed=1.0, search_pulse_speed=1.8)
+    c.start(0.0, TagObs(seen=True, ex=0.5))
+    cmd = c.update(TagObs(seen=True, ex=0.5), RearRange(), 0.0)
+    assert cmd.phase is Phase.ALIGN
+    assert abs(cmd.angular_z) == 1.0   # align speed, NOT the search speed
+
+
+def test_orient_uses_big_pulse_not_align_pulse():
+    c, cfg = _ctrl(pulse_speed=1.0, search_pulse_speed=1.8)
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.0, heading=0.0)
+    assert cmd.phase is Phase.ORIENT
+    assert abs(cmd.angular_z) == 1.8
+
+
+def test_pulse_stores_its_own_speed_and_duration():
+    # A pulse started with speed X must FINISH with speed X even if a subsequent
+    # caller uses a different speed (no cross-contamination via cfg.pulse_speed reads).
+    c, cfg = _ctrl(pulse_speed=1.0, search_pulse_speed=1.8, pulse_dur=0.1)
+    c.start(0.0, TagObs(seen=False))
+    c.update(TagObs(seen=False), RearRange(), 0.0)         # SEARCH starts a 1.8 pulse
+    mid = c.update(TagObs(seen=False), RearRange(), 0.05)  # still pulsing
+    assert abs(mid.angular_z) == 1.8   # stored speed, not cfg.pulse_speed
 
 
 # ── orient ──────────────────────────────────────────────────────────────────

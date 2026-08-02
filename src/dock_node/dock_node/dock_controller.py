@@ -86,8 +86,15 @@ class DockConfig:
     reverse_correct_tol: float = 0.30  # |ex| beyond this during REVERSE → stop & pulse-correct
     # pulsed rotation (bang-bang — the drivetrain can't rotate slowly, see module docstring)
     pulse_speed: float = 1.2         # rad/s per pulse; MUST exceed the ~1.1 rad/s rotation floor
-    pulse_dur: float = 0.12          # s of rotation per pulse (a few degrees)
+    pulse_dur: float = 0.12          # s of rotation per pulse (a few degrees) — PRECISE, used by
+                                     # ALIGN (centering tag), REVERSE-correct, square-up. ~8°/pulse.
     settle_dur: float = 0.25         # s stopped between pulses — lets motion settle + a fresh frame
+    # BIGGER pulses for the FIND-the-tag phases (SEARCH, ORIENT). ALIGN wants precision so it uses
+    # the small pulse above; SEARCH/ORIENT want to cover ground quickly and time out otherwise
+    # (observed 2026-08-02: tiny 8° pulses meant SEARCH only covered ~50° in the 20 s budget,
+    # and pulses near the motors' stall floor sometimes don't move the robot the full amount).
+    search_pulse_speed: float = 1.5  # rad/s — a bit above the 1.1 stall floor for a solid turn
+    search_pulse_dur: float = 0.20   # s → ~17°/pulse, ~2× the precise pulse
     # translation
     reverse_speed: float = 0.18      # m/s; above the ~0.16 m/s translation floor
     # ranges (m)
@@ -186,30 +193,37 @@ class DockController:
         self._search_leg_len = 2
 
     # ── pulsed rotation ─────────────────────────────────────────────────────────
-    # A pulse: rotate at pulse_speed for pulse_dur, then hold still for settle_dur,
-    # then go idle so the phase can read a fresh (settled) ex and decide again.
+    # A pulse: rotate at `speed` for `dur`, then hold still for settle_dur, then
+    # go idle so the phase can read a fresh (settled) observation and decide again.
+    # `speed`/`dur` are stored on the pulse so different phases can pulse differently
+    # (SEARCH/ORIENT use bigger bites; ALIGN uses precise ones).
     def _pulse_reset(self) -> None:
         self._pulse_mode = 'idle'
+        self._pulse_speed = self.cfg.pulse_speed
+        self._pulse_dur_cur = self.cfg.pulse_dur
 
     def _pulse_active(self) -> bool:
         return self._pulse_mode != 'idle'
 
-    def _pulse_start(self, direction: float, now: float) -> float:
+    def _pulse_start(self, direction: float, now: float,
+                     speed: Optional[float] = None,
+                     duration: Optional[float] = None) -> float:
         self._pulse_mode = 'pulsing'
         self._pulse_t = now
         self._pulse_dir = _sign(direction)
-        return self._pulse_dir * self.cfg.pulse_speed
+        self._pulse_speed = self.cfg.pulse_speed if speed is None else speed
+        self._pulse_dur_cur = self.cfg.pulse_dur if duration is None else duration
+        return self._pulse_dir * self._pulse_speed
 
     def _pulse_continue(self, now: float) -> float:
-        cfg = self.cfg
         if self._pulse_mode == 'pulsing':
-            if now - self._pulse_t < cfg.pulse_dur:
-                return self._pulse_dir * cfg.pulse_speed
+            if now - self._pulse_t < self._pulse_dur_cur:
+                return self._pulse_dir * self._pulse_speed
             self._pulse_mode = 'settling'
             self._pulse_t = now
             return 0.0
         # settling
-        if now - self._pulse_t < cfg.settle_dur:
+        if now - self._pulse_t < self.cfg.settle_dur:
             return 0.0
         self._pulse_mode = 'idle'
         return 0.0
@@ -277,7 +291,11 @@ class DockController:
             return DockCommand(phase=Phase.SEARCH, message="oriented, no tag — searching")
         # +err (target CCW of current heading) → +yaw (CCW). This is a robot/odom-frame
         # rotation, so there is NO steer_sign here — that sign is for camera-PIXEL error.
-        yaw = self._pulse_start(_sign(err), now)
+        # Use the BIG search pulse — ORIENT covers big angles (up to 180°), precision
+        # matters less than not timing out (orient_tol is much bigger than one pulse).
+        yaw = self._pulse_start(_sign(err), now,
+                                speed=cfg.search_pulse_speed,
+                                duration=cfg.search_pulse_dur)
         return DockCommand(angular_z=yaw, phase=Phase.ORIENT,
                            message=f"orient err={math.degrees(err):+.0f}deg")
 
@@ -306,7 +324,12 @@ class DockController:
             self._search_in_leg = 0
             self._search_leg_len += 2
             self._search_dir = -self._search_dir
-        yaw = self._pulse_start(self._search_dir * cfg.steer_sign, now)
+        # Big pulse — SEARCH is a coverage problem, precision doesn't matter (it
+        # switches to ALIGN the moment the tag is in view). Small pulses used to only
+        # cover ~50° in the 20 s budget (observed 2026-08-02).
+        yaw = self._pulse_start(self._search_dir * cfg.steer_sign, now,
+                                speed=cfg.search_pulse_speed,
+                                duration=cfg.search_pulse_dur)
         return DockCommand(angular_z=yaw, phase=Phase.SEARCH,
                            message=f"searching (sweep {'+' if self._search_dir > 0 else '-'})")
 
