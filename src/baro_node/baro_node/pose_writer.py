@@ -29,7 +29,8 @@ import rclpy
 from rclpy.node import Node
 import tf2_ros
 
-from baro_node.pose_store import floor_for_map, write_last_pose
+from baro_node.pose_store import (
+    floor_for_map, is_pose_jump, read_last_pose, write_last_pose)
 
 
 def _yaw_deg(q):
@@ -48,6 +49,13 @@ class PoseWriter(Node):
         self._start_delay  = float(p('start_delay', 20.0).value)
         self._map_frame    = str(p('map_frame', 'map').value)
         self._base_frame   = str(p('base_frame', 'base_link').value)
+        # Sanity guard: refuse to persist a pose that JUMPS from the previous
+        # persisted value by more than this. A slam re-localization jump (e.g.
+        # from a mislocalized boot before the operator corrected it, or a bad
+        # scan-match to a symmetric spot) can otherwise poison last_pose.yaml
+        # and every future boot inherits the bad prior. Observed live 2026-08-02.
+        self._max_jump_m   = float(p('max_jump_m', 1.0).value)
+        self._max_jump_deg = float(p('max_jump_deg', 45.0).value)
 
         self._floor = floor_for_map(self._map_file)
         if self._floor is None:
@@ -81,25 +89,47 @@ class PoseWriter(Node):
         pose = self._current_pose()
         if pose is None:
             return
+        # Sanity guard against poisoning last_pose with a jumped/mislocalized value.
+        # Compare to whatever is CURRENTLY on disk (persisted baseline) rather than
+        # our own last-written — so a suspicious localization that persists over
+        # many ticks can't slowly ratchet the file to a wrong pose.
+        prev, _ = read_last_pose(self._floor)
+        if prev is not None and self._is_jump(prev, pose):
+            self.get_logger().warn(
+                f'pose_writer: refusing to persist a jumped pose '
+                f'({prev[0]:.2f},{prev[1]:.2f},{prev[2]:.0f}°) → '
+                f'({pose[0]:.2f},{pose[1]:.2f},{pose[2]:.0f}°) — '
+                f'looks like a mislocalization; correct in Foxglove and I will '
+                f'save the new pose on the next tick.')
+            return
         self._last_pose = pose
         try:
             write_last_pose(self._floor, pose)
         except Exception as exc:  # noqa: BLE001 — persistence must never kill the node
             self.get_logger().warn(f'pose_writer: write failed: {exc}')
 
+    def _is_jump(self, prev, pose):
+        return is_pose_jump(prev, pose, self._max_jump_m, self._max_jump_deg)
+
     def final_write(self):
         """Best-effort last write on a clean shutdown."""
         if self._floor is None:
             return
         pose = self._current_pose() or self._last_pose
-        if pose is not None:
-            try:
-                write_last_pose(self._floor, pose)
-                self.get_logger().info(
-                    f'pose_writer: final pose saved '
-                    f'({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.1f}°).')
-            except Exception:  # noqa: BLE001
-                pass
+        if pose is None:
+            return
+        prev, _ = read_last_pose(self._floor)
+        if prev is not None and self._is_jump(prev, pose):
+            self.get_logger().warn(
+                f'pose_writer: shutdown pose looks jumped — not persisting.')
+            return
+        try:
+            write_last_pose(self._floor, pose)
+            self.get_logger().info(
+                f'pose_writer: final pose saved '
+                f'({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.1f}°).')
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main():

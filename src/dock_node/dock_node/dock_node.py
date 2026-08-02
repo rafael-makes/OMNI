@@ -182,17 +182,41 @@ class DockNode(Node):
             resp.message = 'already docking'
             return resp
         now = time.monotonic()
-        heading = self._current_heading()
+        # TF can be transiently unavailable right when /dock/start fires (rare, but
+        # observed 2026-08-02 — OMNI arrived heading-wrong and fell to a blind SEARCH
+        # instead of ORIENTing, because a single lookup happened to return None). Try
+        # a few times over ~0.5s before giving up — the tick loop already tolerates
+        # None heading mid-run, this is just to catch a settling lookup at kickoff.
+        heading = None
+        for _ in range(5):
+            heading = self._current_heading()
+            if heading is not None:
+                break
+            time.sleep(0.1)
         orient_target = None
-        if (not self._orient_consumed and self._orient_target_deg is not None
-                and heading is not None):
+        want_orient = (not self._orient_consumed
+                       and self._orient_target_deg is not None)
+        if want_orient and heading is not None:
             orient_target = math.radians(self._orient_target_deg)
             self.get_logger().info(
                 f'orient: turning to {self._orient_target_deg:.1f}° before searching '
                 f'(current heading {math.degrees(heading):.1f}°)')
-        elif not self._orient_consumed and heading is None:
-            self.get_logger().warn('orient requested but no map->base_link TF — '
-                                   'searching without pre-orient')
+        elif want_orient and heading is None:
+            # Enter ORIENT anyway — the phase's own tick tolerates a brief TF gap
+            # and only falls to SEARCH after t_orient_max. Much better than starting
+            # a blind SEARCH when the caller explicitly said which way to turn.
+            orient_target = math.radians(self._orient_target_deg)
+            self.get_logger().warn(
+                f'orient: TF gap at kickoff, entering ORIENT on '
+                f'/dock/orient_target={self._orient_target_deg:.1f}° and will pick '
+                f'up heading as it comes back')
+        elif self._orient_target_deg is None:
+            self.get_logger().info(
+                'no /dock/orient_target published — searching without pre-orient')
+        else:
+            self.get_logger().info(
+                'orient_target already consumed (no fresh publish this attempt) — '
+                'searching without pre-orient')
         self._orient_consumed = True   # one-shot per publish; manual /dock/start won't orient
         self._ctrl.start(now, self._current_tag(now),
                          orient_target=orient_target, heading=heading)

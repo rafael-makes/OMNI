@@ -250,11 +250,24 @@ def test_orient_reaches_target_without_tag_falls_to_search():
     assert cmd.phase is Phase.SEARCH
 
 
-def test_orient_without_heading_feedback_falls_to_search():
+def test_orient_holds_when_heading_temporarily_unavailable():
+    # A TF gap must NOT insta-fail to blind SEARCH — hold still, wait for TF
+    # to come back. Permanent gap is caught by t_orient_max.
     c, _ = _ctrl()
     c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=0.0)
     cmd = c.update(TagObs(seen=False), RearRange(), 0.1, heading=None)
-    assert cmd.phase is Phase.SEARCH
+    assert cmd.phase is Phase.ORIENT
+    assert cmd.angular_z == 0.0
+    # And once TF is back, it resumes turning normally.
+    cmd = c.update(TagObs(seen=False), RearRange(), 0.5, heading=0.0)
+    assert cmd.phase is Phase.ORIENT and cmd.angular_z > 0.0
+
+
+def test_orient_entered_even_without_initial_heading():
+    # start() enters ORIENT purely on orient_target — the phase tolerates the gap.
+    c, _ = _ctrl()
+    c.start(0.0, TagObs(seen=False), orient_target=1.0, heading=None)
+    assert c.phase is Phase.ORIENT
 
 
 def test_orient_timeout_falls_to_search():

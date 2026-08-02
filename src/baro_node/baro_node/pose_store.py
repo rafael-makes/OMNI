@@ -22,10 +22,23 @@ off (test_pose_store.py):
 Pose format everywhere: [x, y, yaw_deg] — the SAME triple save_location uses in
 omni_config.yaml, so it reads the same to a human.
 """
+import math
 import os
 import time
 
 import yaml
+
+
+def is_pose_jump(prev, pose, max_m: float, max_deg: float) -> bool:
+    """True if `pose` (x, y, yaw_deg) is farther than max_m OR max_deg from `prev`.
+
+    Sanity guard so pose_writer never persists a mislocalized/jumped pose over the
+    good one (2026-08-02 corruption). Yaw wraps at ±180° so 179° → -179° reads as
+    a 2° change, not 358°.
+    """
+    dist = math.hypot(pose[0] - prev[0], pose[1] - prev[1])
+    dyaw = abs(((pose[2] - prev[2]) + 180.0) % 360.0 - 180.0)
+    return dist > max_m or dyaw > max_deg
 
 from baro_node.floors import FLOORS_PATH, load_floors, save_floors
 

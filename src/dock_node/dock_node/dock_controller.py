@@ -157,7 +157,11 @@ class DockController:
         self._t_start = now
         self._pulse_reset()
         self._orient_target = orient_target
-        if orient_target is not None and heading is not None:
+        # If we have a target heading, ORIENT — even if `heading` is None at kickoff
+        # (transient TF gap). The phase's own tick tolerates a brief gap and only falls
+        # to SEARCH after t_orient_max. Falling straight to blind SEARCH when the caller
+        # said which way to turn is exactly the failure mode observed 2026-08-02.
+        if orient_target is not None:
             self._enter(Phase.ORIENT, now)
         elif tag and tag.seen:
             self._t_last_seen = now
@@ -248,11 +252,18 @@ class DockController:
             self._pulse_reset()
             self._enter(Phase.SEARCH, now)
             return DockCommand(phase=Phase.SEARCH, message="orient timeout — searching")
-        if heading is None or self._orient_target is None:
-            # No heading feedback (TF gap) — cannot orient; fall back to a blind sweep.
+        if self._orient_target is None:
+            # No target — can't orient. (Shouldn't happen: start() only enters ORIENT
+            # when orient_target is set.)
             self._pulse_reset()
             self._enter(Phase.SEARCH, now)
-            return DockCommand(phase=Phase.SEARCH, message="no heading — searching")
+            return DockCommand(phase=Phase.SEARCH, message="no orient target — searching")
+        if heading is None:
+            # TF gap — hold still (no pulse) and try again next tick. t_orient_max
+            # above catches a permanent gap and falls through to SEARCH honestly.
+            self._pulse_reset()
+            return DockCommand(linear_x=0.0, angular_z=0.0, phase=Phase.ORIENT,
+                               message="orient waiting for TF")
         err = _wrap(self._orient_target - heading)
         # finish an in-progress pulse before re-deciding (decisions only when settled)
         if self._pulse_active():
