@@ -44,7 +44,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSPresetProfiles, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSPresetProfiles, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
@@ -547,6 +547,23 @@ class BehaviorNode(Node):
         # (see CLAUDE.md "no docked signal exists yet"). Drives self._docked for
         # greeting/check-in suppression AND the undock-before-nav trigger.
         self.create_subscription(Bool, '/dock/docked', self._on_dock_docked, _dock_latched)
+        # Foxglove/RViz "2D Goal Pose" publishes /goal_pose, but nothing in this stack
+        # converts it to a nav goal (OMNI's nav is action-based via voice). Bridge it
+        # here so a clicked goal drives OMNI through the SAME undock-aware path.
+        # QoS: BEST_EFFORT so it matches ANY publisher — Foxglove publishes /goal_pose
+        # BEST_EFFORT (verified 2026-08-01: a RELIABLE sub silently dropped it, a
+        # RELIABLE CLI pub worked), and a BEST_EFFORT sub also accepts a RELIABLE
+        # RViz/CLI goal. Depth 1 — only the latest clicked goal matters.
+        _goal_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(PoseStamped, '/goal_pose', self._on_goal_pose, _goal_qos)
+        # Foxglove's "Publish 2D pose" defaults to /move_base_simple/goal (the ROS1
+        # name); RViz uses /goal_pose. Accept BOTH so either tool works out of the box.
+        self.create_subscription(
+            PoseStamped, '/move_base_simple/goal', self._on_goal_pose, _goal_qos)
         self._undock_lock  = threading.Lock()
         self._undocking    = False
         self._pending_nav  = None      # (x, y, yaw, intent) deferred behind an undock
@@ -1561,6 +1578,11 @@ class BehaviorNode(Node):
         started = self._nav_started
         self._nav_intent  = None
         self._nav_started = None
+        if intent and intent[0] == 'silent':
+            # Foxglove/RViz goal — arrive without announcing (no Gemini chatter/cost).
+            self.get_logger().info(f'Nav (silent /goal_pose) finished — status {status}')
+            self._set_state('IDLE')
+            return
         if intent and intent[0] == 'place':
             dest = f'the {intent[1]}'
         elif intent and intent[0] == 'person':
@@ -1867,6 +1889,23 @@ class BehaviorNode(Node):
             yaw = float(loc[2]) if len(loc) > 2 else 0.0
             return (float(loc[0]), float(loc[1]), yaw)
         return self._zones.nav_pose(name)   # None if the zone is unknown
+
+    def _on_goal_pose(self, msg: PoseStamped):
+        """A goal clicked in Foxglove/RViz (2D Goal Pose -> /goal_pose). Route it through
+        start_navigation, so it undocks first if OMNI is on the dock. Arrival is silent —
+        it's a dev tool, no Gemini announcement/cost."""
+        with self._dock_lock:
+            if self._docking:
+                self.get_logger().info('/goal_pose ignored — docking mission in progress')
+                return
+        q = msg.pose.orientation
+        yaw_deg = math.degrees(math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+        x, y = msg.pose.position.x, msg.pose.position.y
+        self.get_logger().info(
+            f'/goal_pose (Foxglove/RViz) -> navigating to x={x:.2f} y={y:.2f} '
+            f'yaw={yaw_deg:.0f}°')
+        self.start_navigation(x, y, yaw_deg, intent=('silent', 'goal_pose'))
 
     def start_navigation(self, x: float, y: float, yaw_deg: float,
                          *, intent=None) -> None:

@@ -68,6 +68,17 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
 
+    # ── Pre-clean stale FastDDS SHM locks (BEFORE anything starts) ───────────────
+    # Every relaunch leaves /dev/shm/fastrtps_* segments behind; over a session they
+    # pile up until fresh `ros2` CLI processes can't join DDS discovery. Done here,
+    # SYNCHRONOUSLY at description-build time, so it completes before ANY node spawns.
+    # (An ExecuteProcess in the action list does NOT block the others — it would race
+    # node startup and delete segments nodes are mid-creating, breaking slam/DDS.)
+    subprocess.run(
+        ['bash', '-c',
+         'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true'],
+        check=False)
+
     # ── Package share directories ──────────────────────────────────────────────
     behavior_pkg = get_package_share_directory('behavior_node')
     slam_pkg     = get_package_share_directory('slam_node')
@@ -640,19 +651,6 @@ def generate_launch_description():
         }],
     )
 
-    # ── Pre-clean stale FastDDS SHM locks ────────────────────────────────────────
-    # Every relaunch leaves /dev/shm/fastrtps_* segments behind; over a session they
-    # pile up until fresh `ros2` CLI processes can no longer join DDS discovery (empty
-    # topic echo / hz / tf2_echo, "topic not published yet") — the running stack is
-    # fine, but introspection goes blind. Wipe them before any node starts. Runs via a
-    # shell so the glob expands; harmless when there's nothing to remove. Safe here
-    # because a prior stack must be down before this launch runs.
-    clean_shm = ExecuteProcess(
-        cmd=['bash', '-c',
-             'rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true'],
-        output='screen',
-    )
-
     # ── Assembly ───────────────────────────────────────────────────────────────
 
     return LaunchDescription([
@@ -687,9 +685,8 @@ def generate_launch_description():
         check_in_not_now_cooldown_arg,
         check_in_silence_timeout_arg,
         check_in_zones_arg,
-        # Pre-clean stale FastDDS SHM locks before anything starts (keeps ros2 CLI
-        # introspection working across relaunches). See note above.
-        clean_shm,
+        # (SHM pre-clean runs synchronously at the top of generate_launch_description,
+        #  before any node spawns — see note there.)
         # Static TF
         LogInfo(msg='[omni_full] Starting OMNI full stack — localization mode'),
         imu_tf,
