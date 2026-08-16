@@ -74,13 +74,15 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'mic_device_index',
-            default_value='0',
-            description='sounddevice input device index for the local USB microphone',
+            default_value='reSpeaker',
+            description='Mic device: sounddevice index OR name substring '
+                        '(default "reSpeaker" = XVF3800).',
         ),
         DeclareLaunchArgument(
             'speaker_device_index',
-            default_value='0',
-            description='sounddevice output device index for the USB speaker',
+            default_value='USB PnP',
+            description='Speaker device: sounddevice index OR name substring '
+                        '(default "USB PnP" = JMTek dongle).',
         ),
         DeclareLaunchArgument(
             'tcp_mic_port',

@@ -122,8 +122,11 @@ class BehaviorNode(Node):
         self.declare_parameter('conversation_timeout', 30.0)
         self.declare_parameter('idle_return_timeout', 30.0)
         self.declare_parameter('presence_timeout',    10.0)
-        self.declare_parameter('mic_device_index',    0)
-        self.declare_parameter('speaker_device_index', 0)
+        # Accept either a numeric sounddevice index OR a case-insensitive name
+        # substring (e.g. 'reSpeaker', 'PnP'). Names survive USB index reshuffles
+        # across reboots/replugs; see _resolve_audio_device().
+        self.declare_parameter('mic_device_index',    '0')
+        self.declare_parameter('speaker_device_index', '0')
         self.declare_parameter('tcp_mic_port',        0)
         # ── Persistent memory (Step 5) — soft dependency on the omni_memory node ─
         self.declare_parameter('memory_enabled',         True)
@@ -245,8 +248,10 @@ class BehaviorNode(Node):
         ww_model        = self.get_parameter('wake_word_model').value
         ww_threshold    = self.get_parameter('wake_word_threshold').value
         ww_suppress     = self.get_parameter('wake_word_startup_suppress').value
-        mic_dev         = self.get_parameter('mic_device_index').value
-        spk_dev         = self.get_parameter('speaker_device_index').value
+        mic_dev         = self._resolve_audio_device(
+            self.get_parameter('mic_device_index').value, want_input=True)
+        spk_dev         = self._resolve_audio_device(
+            self.get_parameter('speaker_device_index').value, want_input=False)
         tcp_mic_port    = self.get_parameter('tcp_mic_port').value
         self._conv_timeout     = self.get_parameter('conversation_timeout').value
         self._presence_timeout = self.get_parameter('presence_timeout').value
@@ -664,6 +669,44 @@ class BehaviorNode(Node):
             f'BehaviorNode ready — state=IDLE, wake word model={ww_model}, '
             f'conversation timeout={self._conv_timeout}s'
         )
+
+    # ── Audio device resolution ────────────────────────────────────────────────
+
+    def _resolve_audio_device(self, value, want_input: bool):
+        """Resolve a device param to a sounddevice index.
+
+        `value` may be a numeric index ('0', 1) or a case-insensitive name
+        substring ('reSpeaker', 'PnP'). Names are matched against sounddevice's
+        device list, restricted to the needed direction (input vs output), so
+        the right physical device is selected even if USB indices shuffle across
+        reboots/replugs. Returns an int index, or None (system default) if a name
+        cannot be matched — logged loudly so the failure is visible.
+        """
+        s = str(value).strip()
+        if s == '':
+            return None
+        if s.lstrip('-').isdigit():
+            return int(s)
+        try:
+            import sounddevice as sd
+            want = s.lower()
+            for i, dev in enumerate(sd.query_devices()):
+                chans = dev['max_input_channels'] if want_input else dev['max_output_channels']
+                if want in dev['name'].lower() and chans > 0:
+                    self.get_logger().info(
+                        f"Audio device {s!r} resolved to index {i}: {dev['name']!r} "
+                        f"({'in' if want_input else 'out'}={chans})"
+                    )
+                    return i
+            self.get_logger().error(
+                f"Audio device name {s!r} not found among sounddevice "
+                f"{'inputs' if want_input else 'outputs'} — using system default"
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"Audio device resolution for {s!r} failed ({exc}) — using system default"
+            )
+        return None
 
     # ── State machine ──────────────────────────────────────────────────────────
 
